@@ -197,37 +197,11 @@ function BlenderSyncManager:startLiveSyncing()
 	end
 end
 
-function BlenderSyncManager:startPeriodicRefresh()
-	-- Start a separate coroutine for periodic armature refresh
-	if self.periodicRefreshCoroutine then
-		coroutine.close(self.periodicRefreshCoroutine)
-	end
-	
-	self.periodicRefreshCoroutine = coroutine.create(function()
-		while State.isServerConnected:get() do
-			task.wait(10) -- Refresh every 10 seconds when connected
-			if State.isServerConnected:get() then
-				print("Periodic armature refresh...")
-				self:updateAvailableArmatures()
-			end
-		end
-	end)
-	
-	if self.periodicRefreshCoroutine then
-		task.spawn(self.periodicRefreshCoroutine)
-	end
-end
 
 function BlenderSyncManager:cleanupServerConnection()
 	State.isServerConnected:set(false)
 	State.serverStatus:set("Disconnected")
 	self:stopLiveSyncing() -- Stop live sync when disconnecting
-	
-	-- Stop periodic refresh
-	if self.periodicRefreshCoroutine then
-		coroutine.close(self.periodicRefreshCoroutine :: thread)
-		self.periodicRefreshCoroutine = nil
-	end
 	
 	-- Any other network cleanup can go here
 end
@@ -242,8 +216,6 @@ function BlenderSyncManager:toggleServerConnection()
 			self:cleanupServerConnection()
 		else
 			print("Successfully connected to Blender server")
-			-- Start periodic refresh even without live sync
-			self:startPeriodicRefresh()
 		end
 	else
 		self:cleanupServerConnection()
@@ -258,12 +230,6 @@ end
 function BlenderSyncManager:cleanup()
 	self:stopLiveSyncing()
 	self:cleanupServerConnection()
-	
-	-- Stop periodic refresh
-	if self.periodicRefreshCoroutine then
-		coroutine.close(self.periodicRefreshCoroutine :: thread)
-		self.periodicRefreshCoroutine = nil
-	end
 end
 
 return BlenderSyncManager

@@ -264,23 +264,37 @@ function MoreTab.create(services: any)
 			Collapsed = false,
 			LayoutOrder = 5,
 			[Children] = {
-				Label{
+				Fusion.New("Frame")({
+					Size = UDim2.new(1, 0, 0, 64),
+					BackgroundTransparency = 1,
 					LayoutOrder = 1,
+					[Children] = {
+						Fusion.New("ImageLabel")({
+							Size = UDim2.new(0, 64, 0, 64),
+							Position = UDim2.new(0.5, 0, 0.5, 0),
+							AnchorPoint = Vector2.new(0.5, 0.5),
+							BackgroundTransparency = 1,
+							Image = "rbxassetid://92189642379919",
+						}),
+					},
+				}),
+				Label{
+					LayoutOrder = 2,
 					Text = "To use this plugin, you need to have the Blender addon installed."
 				},
 				TextInput{
-					LayoutOrder = 2,
-					Text = "https://github.com/CAUTlONED/Blender-Animations-addon",
+					LayoutOrder = 3,
+					Text = "https://github.com/Cautioned/Blender-Animations-Plugin",
 				},
 				
 				Label{
-					LayoutOrder = 4,
+					LayoutOrder = 5,
 					Text = "This plugin will always be free, to support development use any of the below links."
 				},
 				VerticalCollapsibleSection {
 					Collapsed = true,
 					Text = "Support Development",
-					LayoutOrder = 5,
+					LayoutOrder = 6,
 					OnCollapsedChanged = function(isExpanded: boolean)
 						if isExpanded then
 							-- Load the thank you text when section is expanded

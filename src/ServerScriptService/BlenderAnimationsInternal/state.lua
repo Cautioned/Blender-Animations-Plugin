@@ -95,7 +95,10 @@ local State = {
     showDebugInfo = Value(true),
     
     -- Toolbar button image
-    toolbarButtonImage = Value("rbxassetid://116041192227009")
+    toolbarButtonImage = Value("rbxassetid://116041192227009"),
+    
+    -- Help widget
+    helpWidgetEnabled = Value(false)
 }
 
 State.displayWarnings = Computed(function()

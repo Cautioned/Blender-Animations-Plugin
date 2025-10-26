@@ -40,6 +40,9 @@ local StudioComponents = Components:FindFirstChild("StudioComponents")
 
 local ScrollFrame = require(StudioComponents.ScrollFrame)
 local Button = require(StudioComponents.Button)
+local Label = require(StudioComponents.Label)
+local TextInput = require(StudioComponents.TextInput)
+local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
 
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local themeProvider = require(StudioComponentsUtil.themeProvider)
@@ -185,6 +188,7 @@ do -- Creates the plugin
 	})
 
 	State.widgetsEnabled = Value(false)
+	State.helpWidgetEnabled = Value(false)
 	
 	-- Update image based on current theme using themeProvider like PlaybackControls
 	local function updateToolbarImage()
@@ -209,6 +213,18 @@ do -- Creates the plugin
 
 		[OnEvent("Click")] = function()
 			(State.widgetsEnabled :: any):set(not (State.widgetsEnabled :: any):get())
+		end,
+	})
+	
+	local helpButton = ToolbarButton({
+		Toolbar = pluginToolbar,
+		ClickableWhenViewportHidden = true,
+		Name = "wth?",
+		ToolTip = "Open Help Widget",
+		Image = "rbxassetid://112326668147130",
+
+		[OnEvent("Click")] = function()
+			(State.helpWidgetEnabled :: any):set(not (State.helpWidgetEnabled :: any):get())
 		end,
 	})
 	
@@ -260,6 +276,17 @@ do -- Creates the plugin
 						State.selectionConnection = nil
 					end
 					cleanupAll()
+				end
+				return nil
+			end) :: any
+	)
+	
+	-- Handle help widget enabled/disabled
+	table.insert(
+		State.observers,
+		(Observer(State.helpWidgetEnabled :: any) :: any):onChange(function(isEnabled: boolean)
+				if helpButton and helpButton.Parent then
+					helpButton:SetActive(isEnabled)
 				end
 				return nil
 			end) :: any
@@ -538,7 +565,7 @@ do -- Creates the plugin
 		})
 	end
 
-	-- Create the widget with tab content
+	-- Create the main widget with tab content
 	pluginWidget(Computed(function()
 		local tab = State.activeTab:get()
 		if tab == "Player" then
@@ -554,6 +581,63 @@ do -- Creates the plugin
 		end
 		return {}
 	end))
+	
+	-- Create the help widget
+	local _helpWidget = Widget({
+		Id = game:GetService("HttpService"):GenerateGUID(),
+		Name = "bro wth happened?",
+		InitialDockTo = Enum.InitialDockState.Float,
+		InitialEnabled = false,
+		ForceInitialEnabled = false,
+		FloatingSize = Vector2.new(400, 500),
+		MinimumSize = Vector2.new(400, 500),
+		Enabled = State.helpWidgetEnabled,
+		[OnChange("Enabled")] = function(isEnabled)
+			(State.helpWidgetEnabled :: any):set(isEnabled)
+		end,
+		[Children] = {
+			New("UIPadding")({
+				PaddingLeft = UDim.new(0, 4),
+				PaddingRight = UDim.new(0, 16),
+				PaddingTop = UDim.new(0, 16),
+				PaddingBottom = UDim.new(0, 16),
+			}),
+			New("UIListLayout")({
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 8),
+			}),
+			VerticalCollapsibleSection({
+				Text = "MAJOR UPDATE AVAILABLE!",
+				Collapsed = false,
+				LayoutOrder = 2,
+				[Children] = {
+					New("Frame")({
+						Size = UDim2.new(1, 0, 0, 64),
+						BackgroundTransparency = 1,
+						LayoutOrder = 1,
+						[Children] = {
+							New("ImageLabel")({
+								Size = UDim2.new(0, 64, 0, 64),
+								Position = UDim2.new(0.5, 0, 0.5, 0),
+								AnchorPoint = Vector2.new(0.5, 0.5),
+								BackgroundTransparency = 1,
+								Image = "rbxassetid://92189642379919",
+							}),
+						},
+					}),
+					Label({
+						LayoutOrder = 1,
+						Text = "Please download the new Blender addon from GitHub to use this plugin. There has been a major update as you can probably tell. It is way more stable, fixes nearly all of the previous bugs, and has a lot of new features you will enjoy. This addon will continue to be free forever. I strongly recommend you update, and I hope you like the new logo. If you still wish to use clipboard and file export, you can still do so by enabling them in the More tab. Also the new addon supports up to Blender 5.0+, godspeed my fellow animators. \n\n —Cautioned",
+						TextWrapped = true,
+					}),
+					TextInput({
+						LayoutOrder = 2,
+						Text = "https://github.com/Cautioned/Blender-Animations-Plugin/releases",
+					}),
+				},
+			}),
+		},
+	})
 end
 
 -- Always listen for selection changes

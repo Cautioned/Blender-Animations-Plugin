@@ -9,7 +9,7 @@ maintainer = "Cautioned"
 type = "add-on"
 
 # Supported Blender versions
-blender_version_min = "2.80.0"
+blender_version_min = "4.2.0"
 
 # License information
 license = [
