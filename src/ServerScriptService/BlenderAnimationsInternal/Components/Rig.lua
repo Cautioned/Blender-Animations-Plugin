@@ -1,0 +1,382 @@
+--!strict
+--!optimize 2
+
+local Rig = {}
+Rig.__index = Rig
+
+local RigPart = require(script.Parent.RigPart)
+
+type self = {
+	model: Model,
+	root: RigPart.RigPart?,
+	animTime: number,
+	loop: boolean,
+	priority: Enum.AnimationPriority,
+	keyframeNames: { { t: number, name: string } },
+	bones: { [string]: RigPart.RigPart },
+	isDeformRig: boolean,
+	boneHierarchy: { [string]: string? },
+	_jointCache: { [Instance]: { Motor6D } },
+}
+
+function Rig.new(model: Model)
+	local self: self = {
+		model = model,
+		root = nil,
+		animTime = 10,
+		loop = true,
+		priority = Enum.AnimationPriority.Action,
+		keyframeNames = {}, -- table with values each in the format: {t = number, name = string}
+		bones = {}, -- Initialize bones property
+		isDeformRig = false, -- Flag to indicate if this is a deform bone rig
+		boneHierarchy = {}, -- Store bone parent relationships
+		_jointCache = {},
+	}
+	setmetatable(self, Rig)
+
+	-- Single traversal to gather all necessary descendants
+	local allBones = {}
+	local allJoints = {}
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("Bone") then
+			table.insert(allBones, descendant)
+		elseif descendant:IsA("Motor6D") then
+			table.insert(allJoints, descendant)
+		end
+	end
+
+	self.isDeformRig = #allBones > 0
+
+	-- Pre-build the joint cache for fast lookups
+	self._jointCache = {}
+	for _, joint in ipairs(allJoints) do
+		local p0, p1 = joint.Part0, joint.Part1
+		if p0 then
+			if not self._jointCache[p0] then
+				self._jointCache[p0] = {}
+			end
+			table.insert(self._jointCache[p0], joint)
+		end
+		if p1 then
+			if not self._jointCache[p1] then
+				self._jointCache[p1] = {}
+			end
+			table.insert(self._jointCache[p1], joint)
+		end
+	end
+
+	-- Always build the Motor6D hierarchy first, if a root exists.
+	if model.PrimaryPart then
+		self.root = RigPart.new(self, model.PrimaryPart, nil, self.isDeformRig)
+	else
+		warn("Model has no PrimaryPart for traditional rig setup. Rig root will be nil.")
+		self.root = nil
+	end
+
+	-- If it's a deform rig, find all bones and add them to the rig.
+	-- This assumes bones are parented to parts that are already in the rig.
+	if self.isDeformRig then
+		self:buildBoneHierarchy(allBones)
+	end
+
+	return self
+end
+
+
+
+
+
+function Rig:buildBoneHierarchy(allBones)
+	-- Find all bones in the model and create RigParts for them.
+	-- This now ADDS to the rig rather than creating it from scratch.
+    -- intentionally unused local kept for readability when editing
+    local _bones = self.bones
+
+	-- Populate bones array with RigPart objects for each bone
+	for _, bone in ipairs(allBones) do
+		-- Find the parent RigPart (which should be a BasePart that's already in the rig)
+		local parentPart = self:FindRigPart(bone.Parent.Name)
+
+		if parentPart then
+			-- Create a new RigPart for the bone and add it to the parent's children
+            local rigPart = RigPart.new(self, bone, parentPart, true)
+            table.insert(parentPart.children, rigPart)
+            self.bones[bone.Name] = rigPart
+		else
+			warn("Could not find parent rig part for bone:", bone.Name, "Parent:", bone.Parent.Name)
+		end
+	end
+end
+
+
+
+function Rig:GetRigParts()
+	local parts = {}
+	local root = self.root
+
+	local function finder(part)
+		for _, child in pairs(part.children) do
+			parts[#parts + 1] = child
+			finder(child)
+		end
+	end
+
+	if root then
+		finder(root)
+	end
+
+	return parts
+end
+
+function Rig:FindRigPart(name)
+	return self.bones[name]
+end
+
+function Rig:ClearPoses()
+	for _, rigPart in pairs(self:GetRigParts()) do
+		rigPart.poses = {}
+	end
+end
+
+function Rig:LoadAnimation(data)
+	-- Validate animation data structure
+	if not data then
+		error("Animation data is nil")
+	end
+
+	if type(data) ~= "table" then
+		error("Animation data is not a table, got: " .. type(data))
+	end
+
+	if not data.kfs or type(data.kfs) ~= "table" then
+		error("Animation data missing keyframes array (data.kfs)")
+	end
+
+	if not data.t or type(data.t) ~= "number" then
+		error("Animation data missing duration (data.t)")
+	end
+
+	self:ClearPoses()
+
+	local rigParts = self:GetRigParts()
+	
+	local isDeformRig = self.isDeformRig
+
+	self.animTime = data.t
+
+	-- Check if this is a deform rig animation
+	if data.is_deform_rig then
+		self.isDeformRig = true
+		isDeformRig = true
+
+		-- If we have bone hierarchy data, update our hierarchy
+		if data.bone_hierarchy then
+			self.boneHierarchy = data.bone_hierarchy
+
+			-- Ensure our RigPart hierarchy matches the bone hierarchy
+			for boneName, parentName in pairs(data.bone_hierarchy) do
+				local bonePart = self:FindRigPart(boneName)
+				if bonePart then
+					bonePart.isDeformBone = true
+
+					-- Set parent relationship if parent exists
+					if parentName then
+						local parentPart = self:FindRigPart(parentName)
+						if parentPart then
+							-- Remove from current parent's children
+							if bonePart.parent then
+								for i, child in pairs(bonePart.parent.children) do
+									if child == bonePart then
+										table.remove(bonePart.parent.children, i)
+										break
+									end
+								end
+							end
+
+							-- Add to new parent's children
+							bonePart.parent = parentPart
+							table.insert(parentPart.children, bonePart)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for _, kfdef in pairs(data.kfs) do
+		-- Validate keyframe data
+		if not kfdef.t or type(kfdef.t) ~= "number" then
+			warn("Skipping keyframe with invalid time value")
+			continue
+		end
+
+		if not kfdef.kf or type(kfdef.kf) ~= "table" then
+			warn("Skipping keyframe with invalid pose data at time " .. kfdef.t)
+			continue
+		end
+
+		for _, rigPart in pairs(rigParts) do
+			local partName = rigPart.part.Name
+			local poseData = kfdef.kf[partName]
+			
+            if poseData then
+				local cfc
+				local easingStyle = "Linear" -- Default
+				local easingDirection = "In" -- Default
+
+                -- Accept multiple formats:
+                -- 1) New array: [ [components], "EasingStyle"?, "EasingDirection"? ]
+                -- 2) New object: { components = {...}, easingStyle? = "", easingDirection? = "" }
+                -- 3) Legacy: {components...} flat list
+                if type(poseData) == "table" then
+                    if type(poseData[1]) == "table" then
+                        -- array form with nested components
+                        cfc = poseData[1]
+                        if poseData[2] ~= nil then easingStyle = poseData[2] end
+                        if poseData[3] ~= nil then easingDirection = poseData[3] end
+                    elseif poseData.components ~= nil then
+                        -- object/dict form
+                        cfc = poseData.components
+                        if poseData.easingStyle ~= nil then easingStyle = poseData.easingStyle end
+                        if poseData.easingDirection ~= nil then easingDirection = poseData.easingDirection end
+                    else
+                        -- legacy: assume flat list
+                        cfc = poseData
+                    end
+				else
+					-- Fallback for old format (just cframe components)
+					cfc = poseData
+				end
+
+				-- Validate CFrame data
+				if type(cfc) ~= "table" or #cfc < 12 then
+					warn("Invalid CFrame data for part " .. partName .. " at time " .. kfdef.t)
+					continue
+				end
+
+				-- Ensure all CFrame values are numbers
+				for i = 1, 12 do
+					if type(cfc[i]) ~= "number" then
+						warn("Non-numeric value in CFrame for part " .. partName .. " at time " .. kfdef.t)
+						cfc[i] = tonumber(cfc[i]) or 0
+					end
+				end
+
+				-- Check if this is a deform bone marker
+				local isDeformBone = false
+				if kfdef.kf[partName .. "_deform"] or (isDeformRig and rigPart.part:IsA("Bone")) then
+					isDeformBone = true
+					rigPart.isDeformBone = true
+				end
+
+				-- normalize each rotation vector
+				for axis = 0, 2 do
+					local normvec = Vector3.new(cfc[4 + axis], cfc[7 + axis], cfc[10 + axis]).Unit
+					cfc[4 + axis], cfc[7 + axis], cfc[10 + axis] = normvec.X, normvec.Y, normvec.Z
+				end
+
+				rigPart:AddPose(kfdef.t, CFrame.new(unpack(cfc)), isDeformBone, easingStyle, easingDirection)
+			end
+		end
+	end
+end
+
+function Rig:ToRobloxAnimation()
+	if not self.root then
+		return nil
+	end
+	local kfs = Instance.new("KeyframeSequence")
+	kfs.Loop = self.loop
+	kfs.Priority = self.priority
+	local humanoid = self.model:FindFirstChildOfClass("Humanoid")
+	if humanoid then -- otherwise just use default/is anim controller/...
+		kfs.AuthoredHipHeight = humanoid.HipHeight
+	end
+
+	local allRigParts = self:GetRigParts()
+	if self.root then
+		table.insert(allRigParts, 1, self.root) -- Add root to the beginning of the list to check.
+	end
+
+	local keyframeNames = self.keyframeNames or {}
+	table.sort(keyframeNames, function(a, b)
+		return a.time < b.time
+	end) -- Ensure names are sorted by time
+
+	-- Collect all unique time points from poses and named events
+	local timePoints = { [0] = true } -- Always have a keyframe at t=0
+	for _, rigPart in pairs(allRigParts) do
+		for poseT, _ in pairs(rigPart.poses) do
+			timePoints[poseT] = true
+		end
+	end
+	for _, kfName in pairs(keyframeNames) do
+		timePoints[kfName.time] = true
+	end
+
+	local sortedTimes = {}
+	for t in pairs(timePoints) do
+		table.insert(sortedTimes, t)
+	end
+	table.sort(sortedTimes)
+
+	local nextKfNameIdx = 1
+
+	for _, t in ipairs(sortedTimes) do
+		-- Serialize t
+		local kf = Instance.new("Keyframe")
+		kf.Time = t
+		kf.Parent = kfs
+
+		-- This loop handles multiple named keyframes at the exact same time point
+		while keyframeNames[nextKfNameIdx] and keyframeNames[nextKfNameIdx].time <= t do
+			if keyframeNames[nextKfNameIdx].time == t then
+				kf.Name = keyframeNames[nextKfNameIdx].name
+			end
+			nextKfNameIdx = nextKfNameIdx + 1
+		end
+
+		local pose = self.root:PoseToRobloxAnimation(t)
+		if pose then
+			pose.Parent = kf
+		end
+	end
+
+	return kfs
+end
+
+function Rig:EncodeRig()
+	-- Actually encoded the rig itself
+	if not self.root then
+		return nil
+	end
+	return self.root:Encode({})
+end
+
+function Rig:RebuildAsDeformRig()
+	if self.isDeformRig then
+		return
+	end
+
+	print("Rebuilding rig as a deform bone rig...")
+	self.isDeformRig = true
+	if self.model.PrimaryPart then
+		self.root = RigPart.new(self, self.model.PrimaryPart, nil, true)
+	else
+		warn("Cannot rebuild as deform rig: Model has no PrimaryPart.")
+		self.root = nil
+	end
+	self.bones = {}
+	if self.root then -- Only call AddParts if root is not nil
+		self:AddParts(self.root)
+	end
+end
+
+function Rig:AddParts(part)
+	for _, child in pairs(part.children) do
+		table.insert(self.bones, child)
+		self:AddParts(child)
+	end
+end
+
+return Rig
