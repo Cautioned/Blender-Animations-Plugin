@@ -12,9 +12,10 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 
 1. Install the Blender addon in blender's preferences (download zip) https://github.com/cautioned/blender-animations-plugin/releases
 2. Install the Roblox addon: https://create.roblox.com/store/asset/16708835782/
-2. Enable the plugin in Blender's preferences
-3. Start the Blender server on port 31337 (default)
-4. Connect to the server using the Blender Sync tab on the Roblox Plugin.
+2. Enable the addon in Blender's preferences
+3. The addon is found in the 3D view toolbar press 'N' then click the 'Rbx Animations' tab
+4. Start the Blender server on port 31337 (default), or your port of choice. 
+5. Connect to the server using the Blender Sync tab on the Roblox Plugin.
 
 ## Usage
 
