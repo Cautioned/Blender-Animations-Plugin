@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+# Roblox Animations Blender Addon Manifest
+id = "roblox_animations_importer_exporter"
+version = "2.0.0"
+name = "Roblox Animations Importer/Exporter"
+tagline = "Import Roblox rigs and export animations with live sync"
+maintainer = "Cautioned"
+type = "add-on"
+
+# Supported Blender versions
+blender_version_min = "2.80.0"
+
+# License information
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+# Tags for categorization
+tags = ["Animation", "Import-Export", "Rigging"]
+
+# Permissions required by the addon
+[permissions]
+network = "Live sync animation data with Roblox Studio"
+files = "Import/export Roblox rig models and animation files"
+clipboard = "Optionally used for import/export"

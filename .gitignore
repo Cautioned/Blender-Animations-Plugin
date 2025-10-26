@@ -55,8 +55,6 @@ build/
 *.temp
 
 # Configuration files (keep essential ones)
-*.toml
-*.json
 *.lock
 
 # IDE specific
