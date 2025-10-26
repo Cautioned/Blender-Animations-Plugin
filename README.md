@@ -66,6 +66,7 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 ## Support
 
 - **Issues**: Report bugs and request features on [GitHub Issues](https://github.com/cautioned/blender-animations-plugin/issues)
+- **Discord**: Join the discord server for help: [JOIN HERE](https://discord.gg/qNB3EhxYYp)6
 
 ---
 
