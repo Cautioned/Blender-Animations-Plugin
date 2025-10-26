@@ -19,18 +19,22 @@ local Checkbox = require(StudioComponents.Checkbox)
 local Label = require(StudioComponents.Label)
 local MainButton = require(StudioComponents.MainButton)
 local TextInput = require(StudioComponents.TextInput)
+local Dropdown = require(StudioComponents.Dropdown)
 local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
 
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local themeProvider = require(StudioComponentsUtil.themeProvider)
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
+local PlaybackControls = require(script.Parent.Parent.Components.PlaybackControls)
 
 local BlenderSyncTab = {}
 
 function BlenderSyncTab.create(services: any)
 	local activeHint = Value("")
 	local legacyImportHint = Value("")
+	local saveUploadHint = Value("")
+
 
 	return {
 		VerticalCollapsibleSection({
@@ -333,6 +337,55 @@ function BlenderSyncTab.create(services: any)
 					Visible = true,
 					TextTransparency = 0,
 				}),
+				PlaybackControls.createPlaybackSection(services, 14),
+				Label({
+					Text = "Animation Name",
+					LayoutOrder = 15,
+				}),
+				TextInput({
+					PlaceholderText = "KeyframeSequence",
+					Text = State.animationName,
+					LayoutOrder = 16,
+					[OnChange("Text")] = function(newText)
+						if newText == "" then
+							State.animationName = "KeyframeSequence"
+						else
+							State.animationName = newText
+						end
+					end,
+				}),
+				Checkbox({
+					Value = State.uniqueNames,
+					Text = "Keep Names Unique",
+					LayoutOrder = 17,
+					OnChange = function(uniqueState: boolean): nil
+						State.uniqueNames:set(uniqueState)
+						return nil
+					end,
+				}),
+				Label({
+					Text = "Animation Priority",
+					LayoutOrder = 18,
+				}),
+				Dropdown({
+					Size = UDim2.new(1, 0, 0, 25),
+					LayoutOrder = 19,
+					Value = State.selectedPriority,
+					Options = State.animationPriorityOptions :: any,
+					OnSelected = function(newItem: any): nil
+						State.selectedPriority:set(newItem) -- Update the state based on selection
+						return nil
+					end,
+				}),
+				SharedComponents.AnimatedHintLabel({
+					Text = saveUploadHint,
+					LayoutOrder = 20,
+					ClipsDescendants = true,
+					Size = UDim2.new(1, 0, 0, 0),
+					TextWrapped = true,
+					Visible = true,
+					TextTransparency = 0,
+				}),
 			},
 		}),
 		VerticalCollapsibleSection({
@@ -390,6 +443,7 @@ function BlenderSyncTab.create(services: any)
 						legacyImportHint:set("")
 					end,
 				}) :: any,
+				
 				MainButton({
 					Text = "Import Animation from File(s)",
 					Size = UDim2.new(1, 0, 0, 30),

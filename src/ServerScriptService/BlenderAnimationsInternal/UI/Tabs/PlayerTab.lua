@@ -240,7 +240,7 @@ function PlayerTab.create(services: any)
 				}),
 				TextInput({
 					PlaceholderText = "KeyframeSequence",
-					Text = "",
+					Text = State.animationName,
 					LayoutOrder = 1,
 					[OnChange("Text")] = function(newText)
 						if newText == "" then

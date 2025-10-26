@@ -35,7 +35,7 @@ function RiggingTab.create(services: any)
 			LayoutOrder = 1,
 			[Children] = {
 				Button({
-					Text = "Sync Bones",
+					Text = "Sync Bones (experimental)",
 					Size = UDim2.new(1, 0, 0, 30),
 					Enabled = Computed(function()
 						return State.activeRigExists:get()

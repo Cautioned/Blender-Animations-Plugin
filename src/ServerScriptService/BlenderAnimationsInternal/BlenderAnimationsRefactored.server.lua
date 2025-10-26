@@ -219,7 +219,7 @@ do -- Creates the plugin
 	local helpButton = ToolbarButton({
 		Toolbar = pluginToolbar,
 		ClickableWhenViewportHidden = true,
-		Name = "wth?",
+		Name = "READ!!!",
 		ToolTip = "Open Help Widget",
 		Image = "rbxassetid://112326668147130",
 
@@ -585,7 +585,7 @@ do -- Creates the plugin
 	-- Create the help widget
 	local _helpWidget = Widget({
 		Id = game:GetService("HttpService"):GenerateGUID(),
-		Name = "bro wth happened?",
+		Name = "IMPORTANT READ ME!!!",
 		InitialDockTo = Enum.InitialDockState.Float,
 		InitialEnabled = false,
 		ForceInitialEnabled = false,
@@ -627,12 +627,20 @@ do -- Creates the plugin
 					}),
 					Label({
 						LayoutOrder = 1,
-						Text = "Please download the new Blender addon from GitHub to use this plugin. There has been a major update as you can probably tell. It is way more stable, fixes nearly all of the previous bugs, and has a lot of new features you will enjoy. This addon will continue to be free forever. I strongly recommend you update, and I hope you like the new logo. If you still wish to use clipboard and file export, you can still do so by enabling them in the More tab. Also the new addon supports up to Blender 5.0+, godspeed my fellow animators. \n\n —Cautioned",
+						Text = "Please download the new Blender addon from Blender or Github to use this plugin. There has been a major update as you can probably tell. It is way more stable, fixes nearly all of the previous bugs, and has a lot of new features you will enjoy. This addon will continue to be free forever. I strongly recommend you update, and I hope you like the new logo. If you still wish to use clipboard and file export, you can still do so by enabling them in the More tab, HOWEVER the Server Sync has additional features that you would really miss out on. Also the new addon supports up to Blender 5.0+, godspeed my fellow animators. \n\n —Cautioned",
 						TextWrapped = true,
 					}),
 					TextInput({
 						LayoutOrder = 2,
+						Text = "https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/",
+					}),
+					TextInput({
+						LayoutOrder = 3,
 						Text = "https://github.com/Cautioned/Blender-Animations-Plugin/releases",
+					}),
+					TextInput({
+						LayoutOrder = 4,
+						Text = "Copy and paste the URL into your browser to download the addon.",
 					}),
 				},
 			}),

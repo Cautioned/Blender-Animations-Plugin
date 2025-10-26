@@ -88,11 +88,11 @@ function PlaybackControls.createPlaybackScrubber(services: any)
 	})
 end
 
-function PlaybackControls.createPlaybackSection(services: any)
+function PlaybackControls.createPlaybackSection(services: any, layoutOrder: number?)
 	return VerticalCollapsibleSection({
 		Text = "Playback",
 		Collapsed = false,
-		LayoutOrder = 2,
+		LayoutOrder = layoutOrder or 2,
 		[Children] = {
 			PlaybackControls.createPlaybackScrubber(services),
 			New("Frame")({
