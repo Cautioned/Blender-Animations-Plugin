@@ -144,11 +144,11 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col.operator("object.rbxanims_bake", text="Bake (Clipboard)", icon='EXPORT')
         col.operator("object.rbxanims_bake_file", text="Bake to File", icon='FILE')
 
-        # Add the force deform serialization checkbox for testing
-        dev_box = inner_box.box()
-        # Add test button to setup section so it's always visible
-        dev_box.separator()
-        dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
+        # # Add the force deform serialization checkbox for testing
+        # dev_box = inner_box.box()
+        # # Add test button to setup section so it's always visible
+        # dev_box.separator()
+        # dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
         # dev_box.label(text="Developer Options", icon='SCRIPT')
         # dev_box.prop(scene, "force_deform_bone_serialization", text="Force Deform Serialization")
 
