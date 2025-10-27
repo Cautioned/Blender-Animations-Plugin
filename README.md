@@ -4,13 +4,13 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 
 ## Installation
 
-1. Download the latest release from the [Releases](https://github.com/cautioned/blender-animations-plugin/releases) page
+1. Download the latest release from [Blender Extensions](https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/) or [Releases](https://github.com/cautioned/blender-animations-plugin/releases) page
 2. Install the plugin on Roblox Studio: [Get Here](https://create.roblox.com/store/asset/16708835782/Blender-Animations-ultimate-edition)
 3. Set up the Blender addon (see Blender Setup below)
 
 ## Blender Setup
 
-1. Install the Blender addon in blender's preferences (download zip) https://github.com/cautioned/blender-animations-plugin/releases
+1. Install the Blender addon in blender's preferences (download zip) [Blender Extensions](https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/) or [Releases](https://github.com/cautioned/blender-animations-plugin/releases) page
 2. Install the Roblox addon: https://create.roblox.com/store/asset/16708835782/
 2. Enable the addon in Blender's preferences
 3. The addon is found in the 3D view toolbar press 'N' then click the 'Rbx Animations' tab
