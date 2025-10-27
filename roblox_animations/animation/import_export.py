@@ -59,7 +59,8 @@ def copy_anim_state(target, source):
 def prepare_for_kf_map():
     """Prepare target rig for keyframe mapping by clearing animation data"""
     # clear anim data from target rig
-    armature_name = bpy.context.scene.rbx_anim_armature
+    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+    armature_name = settings.rbx_anim_armature if settings else None
     bpy.data.objects[armature_name].animation_data_clear()
 
     # select all pose bones in the target rig (simply generate kfs for everything)

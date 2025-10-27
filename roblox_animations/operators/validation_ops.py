@@ -82,7 +82,8 @@ def _draw_motionpath_violations():
         pass
 
     # build or refresh bone color cache for active armature
-    arm_name = bpy.context.scene.rbx_anim_armature
+    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+    arm_name = settings.rbx_anim_armature if settings else None
     global _armature_name_for_cache
     if arm_name != _armature_name_for_cache or not _bone_color_cache:
         _bone_color_cache.clear()
@@ -143,7 +144,8 @@ def _draw_motionpath_keyframes():
         points_by_bone.setdefault(bone_name, []).append(loc)
 
     for bone_name, pts in points_by_bone.items():
-        arm_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        arm_name = settings.rbx_anim_armature if settings else None
         arm = bpy.data.objects.get(arm_name)
         pbone = arm.pose.bones.get(bone_name) if arm else None
         color = (1.0, 1.0, 1.0, 1.0)
@@ -301,7 +303,9 @@ def _collect_bone_world_head(armature_obj: "bpy.types.Object", evaluated_obj: "b
     """return world-space head positions for relevant bones on the evaluated armature."""
     positions: Dict[str, Vector] = {}
     # determine which bones to include
-    is_deform = is_deform_bone_rig(armature_obj) or bpy.context.scene.force_deform_bone_serialization
+    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+    force_deform = getattr(settings, "force_deform_bone_serialization", False)
+    is_deform = is_deform_bone_rig(armature_obj) or force_deform
 
     world_mat = evaluated_obj.matrix_world
     for pbone in evaluated_obj.pose.bones:
@@ -326,7 +330,8 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
 
     @classmethod
     def poll(cls, context):
-        arm_name = context.scene.rbx_anim_armature
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        arm_name = settings.rbx_anim_armature if settings else None
         obj = bpy.data.objects.get(arm_name)
         return bool(obj and obj.type == "ARMATURE")
 
@@ -334,7 +339,8 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         global _violation_segments, _violation_draw_handler, _violation_label_draw_handler, _keyframe_points, _keyframe_points_draw_handler
 
         scene = context.scene
-        arm_name = scene.rbx_anim_armature
+        settings = getattr(scene, "rbx_anim_settings", None)
+        arm_name = settings.rbx_anim_armature if settings else None
         armature = bpy.data.objects.get(arm_name)
         if not armature or armature.type != "ARMATURE":
             self.report({"ERROR"}, "no valid armature selected")
@@ -342,10 +348,13 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
 
         depsgraph = context.evaluated_depsgraph_get()
         fps = get_scene_fps()
-        max_studs = getattr(scene, "rbx_max_studs_per_frame", ANIM_MAX_DELTA) or ANIM_MAX_DELTA
+        max_studs = getattr(settings, "rbx_max_studs_per_frame", ANIM_MAX_DELTA) or ANIM_MAX_DELTA
 
-        is_deform = is_deform_bone_rig(armature) or scene.force_deform_bone_serialization
-        scale = scene.rbx_deform_rig_scale if is_deform else 1.0
+        force_deform = getattr(settings, "force_deform_bone_serialization", False)
+        deform_scale = getattr(settings, "rbx_deform_rig_scale", 1.0)
+
+        is_deform = is_deform_bone_rig(armature) or force_deform
+        scale = deform_scale if is_deform else 1.0
         if scale == 0:
             scale = 1.0
 
@@ -445,7 +454,9 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
                 _draw_motionpath_keyframes, (), "WINDOW", "POST_VIEW"
             )
 
-        scene.rbx_show_motionpath_validation = True
+        settings = getattr(scene, "rbx_anim_settings", None)
+        if settings:
+            setattr(settings, "rbx_show_motionpath_validation", True)
         
         # Summary report
         total_warnings = len(all_warnings)
@@ -498,7 +509,9 @@ class OBJECT_OT_ClearMotionPathValidation(Operator):
                 pass
             _keyframe_points_draw_handler = None
 
-        context.scene.rbx_show_motionpath_validation = False
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        if settings:
+            setattr(settings, "rbx_show_motionpath_validation", False)
         self.report({"INFO"}, "validation overlay cleared")
         return {"FINISHED"}
 

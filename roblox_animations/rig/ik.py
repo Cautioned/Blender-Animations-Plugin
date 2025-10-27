@@ -73,23 +73,25 @@ def create_ik_config(
 
     ik_pole_name: Optional[str] = None
     if create_pose_bone:
-        # clamp the effective chain depth to available parents
-        effective_depth = min(chain_count, len(tail_bone.parent_recursive))
-        pos_low = tail_bone.tail
-        pos_high = tail_bone.parent_recursive[effective_depth - 1].head if effective_depth > 0 else tail_bone.head
+        # gather the actual chain bones up to chain_count
+        chain_bones = [tail_bone]
+        current = tail_bone.parent
+        while current and len(chain_bones) < chain_count:
+            chain_bones.append(current)
+            current = current.parent
+
+        effective_depth = len(chain_bones)
+        pos_low = chain_bones[0].tail
+        pos_high = chain_bones[-1].head if effective_depth > 0 else chain_bones[0].head
         dist = (pos_low - pos_high).length
 
-        # find basal bone for orientation
-        basal = tail_bone
-        for _ in range(1, effective_depth + 1):
-            if basal.parent:
-                basal = basal.parent
-
+        basal = chain_bones[-1] if effective_depth > 0 else tail_bone
         basal_mat = basal.bone.matrix_local
 
         ik_pole = amt.edit_bones.new(ik_name_pole)
-        ik_pole.head = basal_mat @ Vector((0, 0, -0.25 * dist))
-        ik_pole.tail = basal_mat @ Vector((0, 0, -0.25 * dist - 0.3))
+        pole_offset = Vector((0, 0, -0.25 * dist))
+        ik_pole.head = basal_mat @ pole_offset
+        ik_pole.tail = basal_mat @ (pole_offset + Vector((0, 0, -0.3)))
         ik_pole.bbone_x *= 0.5
         ik_pole.bbone_z *= 0.5
         ik_pole_name = ik_pole.name

@@ -181,7 +181,8 @@ def serialize_deform_animation_state(
         world_transform = world_transform_cached
 
     if scale_factor_cached is None:
-        scale_factor = bpy.context.scene.rbx_deform_rig_scale
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        scale_factor = getattr(settings, "rbx_deform_rig_scale", 1.0)
         if scale_factor == 0:
             scale_factor = 1.0
     else:
@@ -409,13 +410,16 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         not ("transform" in bone.bone and "transform1" in bone.bone and "nicetransform" in bone.bone)
         for bone in ao_eval.pose.bones
     )
-    is_skinned_rig = is_deform_bone_rig(ao) or ctx.scene.force_deform_bone_serialization
+    settings = getattr(ctx.scene, "rbx_anim_settings", None)
+    force_deform = getattr(settings, "force_deform_bone_serialization", False)
+    is_skinned_rig = is_deform_bone_rig(ao) or force_deform
     run_deform_path = is_skinned_rig or has_new_bones
     
     # Cache static transforms once per serialize call
     back_trans_cached = get_transform_to_blender().inverted()
     world_transform_cached = back_trans_cached @ ao.matrix_world
-    scale_factor_cached = ctx.scene.rbx_deform_rig_scale
+    settings = getattr(ctx.scene, "rbx_anim_settings", None)
+    scale_factor_cached = getattr(settings, "rbx_deform_rig_scale", 1.0)
     if scale_factor_cached == 0:
         scale_factor_cached = 1.0
 
@@ -548,38 +552,21 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
                 if frame_start <= frame <= frame_end:
                     keyframe_times.add(frame)
 
-                # If a keyframe uses BEZIER interpolation, we need to bake all the
+                # If a keyframe uses curved interpolation, we need to bake all the
                 # frames between it and the next keyframe to accurately capture the curve.
-                # only densify bezier segments that actually curve (deviate from linear)
-                if kp.interpolation == 'BEZIER' and i + 1 < len(fcurve.keyframe_points):
+                # only densify segments that actually curve (deviate from linear)
+                curved_interpolations = {'BEZIER'}
+                if kp.interpolation in curved_interpolations and i + 1 < len(fcurve.keyframe_points):
                     next_kp = fcurve.keyframe_points[i + 1]
                     start_bezier_frame = int(kp.co.x + 0.5)
                     end_bezier_frame = int(next_kp.co.x + 0.5)
 
-                    # only densify if the bezier segment actually curves
+                    # only densify if the segment actually curves
                     if end_bezier_frame - start_bezier_frame > 1:
                         try:
-                            # first gate: require explicit non-auto handle types (user edited)
-                            hr_type = getattr(kp, "handle_right_type", "AUTO")
-                            hl_type_next = getattr(next_kp, "handle_left_type", "AUTO")
-                            user_adjusted_handles = (
-                                hr_type not in {"AUTO", "AUTO_CLAMPED"} or
-                                hl_type_next not in {"AUTO", "AUTO_CLAMPED"}
-                            )
-
-                            is_curved = False
-                            if user_adjusted_handles:
-                                is_curved = True
-                            else:
-                                # secondary check: strong deviation at midpoint
-                                mid_frame = (start_bezier_frame + end_bezier_frame) / 2.0
-                                y0 = kp.co.y
-                                y1 = next_kp.co.y
-                                t = (mid_frame - start_bezier_frame) / (end_bezier_frame - start_bezier_frame)
-                                y_linear = y0 + (y1 - y0) * t
-                                y_bezier = fcurve.evaluate(mid_frame)
-                                if abs(y_bezier - y_linear) > 1e-3:
-                                    is_curved = True
+                            # For BEZIER: always densify to ensure full fidelity
+                            # Bezier curves can have subtle curves that are important
+                            is_curved = (kp.interpolation == 'BEZIER')
 
                             # only densify if the curve is actually curved
                             if is_curved:
@@ -603,7 +590,58 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         # hybrid policy:
         # - with constraints: evaluate every frame; per-bone emission stays sparse except constrained bones
         # - without constraints: evaluate only sparse keyframes (plus bezier fills collected above)
+        full_range = getattr(settings, "rbx_full_range_bake", True)
+
+        def _uses_cyclic(fc):
+            try:
+                return any(mod.type == 'CYCLES' for mod in getattr(fc, "modifiers", []))
+            except Exception:
+                return False
+
+        fcurves_with_cycles = [fc for fc in all_fcurves if _uses_cyclic(fc)]
+
         if has_constraints_local:
+            all_frames_to_bake = list(range(frame_start, frame_end + 1))
+        elif fcurves_with_cycles:
+            # For cyclic animations, collect ALL keyframes from ALL fcurves
+            # (not just cyclic ones) to handle cases where different axes have different timings
+            cycle_source_frames = set()
+            for fc in all_fcurves:  # collect from all fcurves, not just cyclic ones
+                try:
+                    for kp in fc.keyframe_points:
+                        frame = int(round(kp.co.x))
+                        if frame_start <= frame <= frame_end:
+                            cycle_source_frames.add(frame)
+                except Exception:
+                    continue
+
+            # Start with just the original keyframes and frame_end
+            extended_frames = set(keyframe_times)
+            extended_frames.add(frame_end)
+            
+            # Generate cycle extensions to cover the full scene range
+            if cycle_source_frames:
+                cycle_source_frames = sorted(cycle_source_frames)
+                if len(cycle_source_frames) >= 2:
+                    cycle_len = cycle_source_frames[-1] - cycle_source_frames[0]
+                    if cycle_len > 0:
+                        # Calculate how many cycles we need to cover the full range
+                        first_cycle_frame = cycle_source_frames[0]
+                        cycles_needed = ((frame_end - first_cycle_frame) // cycle_len) + 1
+                        
+                        # Generate all cycle extensions
+                        for cycle_idx in range(cycles_needed):
+                            offset = cycle_idx * cycle_len
+                            for base_frame in cycle_source_frames:
+                                new_frame = base_frame + offset
+                                if frame_start <= new_frame <= frame_end:
+                                    extended_frames.add(new_frame)
+                        
+
+            all_frames_to_bake = sorted(extended_frames)
+            # Update keyframe_times to include all extended frames for proper sparse key detection
+            keyframe_times.update(extended_frames)
+        elif full_range:
             all_frames_to_bake = list(range(frame_start, frame_end + 1))
         else:
             all_frames_to_bake = sorted(list(keyframe_times))

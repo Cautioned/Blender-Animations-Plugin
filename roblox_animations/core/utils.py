@@ -8,6 +8,7 @@ import time
 import re
 from mathutils import Vector, Matrix
 from .constants import (
+    get_blender_version,
     get_transform_to_blender,
     identity_cf,
     cf_round,
@@ -29,37 +30,23 @@ last_known_synced_armature = ""
 armature_anim_hashes = {}
 
 
-def get_action_fcurves(action):
-    """Get fcurves from action, compatible with both old and new blender versions."""
-    if not action:
-        return []
-    
-    # Try new slotted actions API first (Blender 4.4+)
-    if hasattr(action, 'slots') and action.slots:
-        slot = action.slots[0]
-        
-        # Try to use bpy_extras.anim_utils for proper access (Blender 4.4+)
-        try:
-            import bpy_extras.anim_utils as anim_utils
-            channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
-            if channelbag and hasattr(channelbag, 'fcurves'):
-                return channelbag.fcurves
-        except (ImportError, AttributeError):
-            pass
-        
-        # Fallback: try direct channelbag access
-        if hasattr(slot, 'channelbag') and slot.channelbag:
-            return slot.channelbag.fcurves
-        # Fallback for older versions
-        elif hasattr(slot, 'fcurves'):
-            return slot.fcurves
-        else:
-            return []
-    # Fallback to old API (Blender 4.3 and older)
-    elif hasattr(action, 'fcurves'):
-        return action.fcurves
-    else:
-        return []
+def get_action_fcurves(action, slot=None):
+    """Return the channelbag F-Curves for an action (Blender 4.4+ API)."""
+    blender_version = get_blender_version()
+    channelbag = get_action_channelbag(action, slot=slot)
+    if channelbag and hasattr(channelbag, "fcurves"):
+        return channelbag.fcurves
+
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        return legacy_fcurves
+
+    if blender_version >= (4, 4, 0):
+        raise RuntimeError(
+            "unable to access animation fcurves; Blender 4.4+ requires a valid Action slot/channelbag."
+        )
+
+    return []
 
 
 def pose_bone_selected(pose_bone):
@@ -111,49 +98,89 @@ def pose_bone_set_selected(pose_bone, value):
 
 
 def get_action_channelbag(action, slot=None):
-    """Get channelbag from action, compatible with both old and new blender versions."""
+    """Return the ensured channelbag for an action slot, with legacy fallbacks."""
     if not action:
         return None
-    
-    # Try new channelbag API first (Blender 4.4+)
-    if hasattr(action, 'slots') and action.slots:
-        if slot is None:
-            slot = action.slots[0]
-        
-        # Try to ensure a channelbag via bpy_extras.anim_utils (Blender 4.4+)
-        try:
-            import bpy_extras.anim_utils as anim_utils
-            channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
-            if channelbag is None:
-                channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
-            if channelbag:
+
+    blender_version = get_blender_version()
+    modern_action_api = blender_version >= (4, 4, 0)
+
+    slots_attr = getattr(action, "slots", None)
+    if slots_attr is not None:
+        target_slot = slot
+        if target_slot is None:
+            if slots_attr:
+                target_slot = slots_attr[0]
+            else:
+                try:
+                    target_slot = action.slots.new(id_type="OBJECT", name=f"Object.{action.name}")
+                except TypeError:
+                    target_slot = action.slots.new(id_type="OBJECT")
+                except Exception:
+                    target_slot = None
+
+        slot_errors = []
+
+        if target_slot is not None:
+            channelbag = None
+            try:
+                import bpy_extras.anim_utils as anim_utils
+            except ImportError:
+                anim_utils = None
+
+            if anim_utils is not None:
+                ensure_fn = getattr(anim_utils, "action_ensure_channelbag_for_slot", None)
+                get_fn = getattr(anim_utils, "action_get_channelbag_for_slot", None)
+                try:
+                    if ensure_fn is not None:
+                        channelbag = ensure_fn(action, target_slot)
+                    elif get_fn is not None:
+                        channelbag = get_fn(action, target_slot)
+                except (AttributeError, TypeError) as exc:
+                    slot_errors.append(exc)
+                    channelbag = None
+                except Exception as exc:  # pragma: no cover - defensive logging for unknown failures
+                    slot_errors.append(exc)
+                    channelbag = None
+
+            if channelbag is not None:
                 return channelbag
-        except (ImportError, AttributeError):
-            pass
-        
-        # Fallback: direct channelbag access if Blender already created it for us
-        if hasattr(slot, 'channelbag') and slot.channelbag:
-            return slot.channelbag
-        else:
-            return None
-    # Fallback to old API (Blender 4.3 and older)
-    elif hasattr(action, 'fcurves'):
-        # Create a mock channelbag-like object for backward compatibility
-        class MockChannelbag:
-            def __init__(self, action):
-                self.action = action
-                self.fcurves = action.fcurves
-                self.groups = action.groups if hasattr(action, 'groups') else []
-            
-            def new(self, *args, **kwargs):
-                return self.fcurves.new(*args, **kwargs)
-            
-            def find(self, *args, **kwargs):
-                return self.fcurves.find(*args, **kwargs)
-        
-        return MockChannelbag(action)
-    else:
-        return None
+
+            direct_channelbag = getattr(target_slot, "channelbag", None)
+            if direct_channelbag is not None:
+                return direct_channelbag
+
+            if hasattr(target_slot, "fcurves"):
+                class _LegacySlotChannelbag:
+                    def __init__(self, slot_obj):
+                        self.fcurves = slot_obj.fcurves
+                        self.groups = getattr(slot_obj, "groups", [])
+
+                return _LegacySlotChannelbag(target_slot)
+
+        if modern_action_api and slot_errors:
+            messages = ", ".join(sorted({type(err).__name__ + ": " + str(err) for err in slot_errors if err}))
+            raise RuntimeError(
+                "failed to access Blender action channelbag via slots API; "
+                "ensure bpy_extras.anim_utils is available and the action has a valid slot. "
+                f"(bpy {blender_version}, errors: {messages or 'no additional details'})"
+            )
+
+    if hasattr(action, "fcurves"):
+        class _LegacyActionChannelbag:
+            def __init__(self, legacy_action):
+                self.fcurves = legacy_action.fcurves
+                self.groups = getattr(legacy_action, "groups", [])
+
+        return _LegacyActionChannelbag(action)
+
+    if modern_action_api:
+        raise RuntimeError(
+            "Blender 4.4+ no longer exposes action.fcurves directly; "
+            "failed to obtain channelbag for action despite using the modern API."
+        )
+
+    return None
 
 
 def get_action_hash(action):

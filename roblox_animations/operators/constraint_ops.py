@@ -15,10 +15,13 @@ class OBJECT_OT_AutoConstraint(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.scene.rbx_anim_armature in bpy.data.objects
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        arm_name = settings.rbx_anim_armature if settings else None
+        return arm_name in bpy.data.objects
 
     def execute(self, context):
-        armature_name = context.scene.rbx_anim_armature
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         success, message = auto_constraint_parts(armature_name)
         
         if success:
@@ -41,7 +44,8 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
     
     def get_available_objects(self, context):
         """Get objects that are available for constraining (not in other _Parts collections)"""
-        armature = bpy.data.objects.get(context.scene.rbx_anim_armature)
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
         if not armature:
             return []
             
@@ -59,12 +63,14 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature = bpy.data.objects.get(context.scene.rbx_anim_armature)
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
         return armature and armature.type == 'ARMATURE'
 
     def get_parts_collection(self, context):
         """Safely get the parts collection for the currently selected armature."""
-        armature = bpy.data.objects.get(context.scene.rbx_anim_armature)
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
         if not armature:
             return None
         
@@ -75,7 +81,8 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
         self.bone_names.clear()
         self.mesh_names.clear()
         
-        armature = bpy.data.objects.get(context.scene.rbx_anim_armature)
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
         parts_collection = self.get_parts_collection(context)
 
         if not parts_collection:
@@ -129,7 +136,8 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
                 row.prop_search(self.mesh_names[i], "name", parts_collection, "objects", text="")
 
     def execute(self, context):
-        armature = bpy.data.objects.get(context.scene.rbx_anim_armature)
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
         master_collection = find_master_collection_for_object(armature)
         parts_collection = find_parts_collection_in_master(master_collection, create_if_missing=True)
 

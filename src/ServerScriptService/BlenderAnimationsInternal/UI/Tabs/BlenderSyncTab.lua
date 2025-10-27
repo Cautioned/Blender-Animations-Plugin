@@ -337,7 +337,7 @@ function BlenderSyncTab.create(services: any)
 					Visible = true,
 					TextTransparency = 0,
 				}),
-				PlaybackControls.createPlaybackSection(services, 14),
+				PlaybackControls.createPlaybackSection(services, 14) :: any,
 				Label({
 					Text = "Animation Name",
 					LayoutOrder = 15,

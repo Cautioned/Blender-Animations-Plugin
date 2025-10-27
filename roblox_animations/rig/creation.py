@@ -10,6 +10,13 @@ from ..core.constants import get_transform_to_blender
 from ..core.utils import cf_to_mat, get_unique_name, find_master_collection_for_object, find_parts_collection_in_master
 
 
+def _matrix_to_idprop(value):
+    """Convert Matrix values to list-of-lists so IDProperties accept them."""
+    if isinstance(value, Matrix):
+        return [list(row) for row in value]
+    return value
+
+
 def get_unique_collection_name(basename):
     """Generate a unique collection name to avoid conflicts."""
     if basename not in bpy.data.collections:
@@ -45,7 +52,7 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
     bone = amt.edit_bones.new(rigsubdef["jname"])
 
     mat = cf_to_mat(rigsubdef["transform"])
-    bone["transform"] = mat
+    bone["transform"] = _matrix_to_idprop(mat)
     t2b = get_transform_to_blender()
     bone_dir = (t2b @ mat).to_3x3().to_4x4() @ Vector((0, 0, 1))
 
@@ -53,9 +60,9 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
         # Rig root
         bone.head = (t2b @ mat).to_translation()
         bone.tail = (t2b @ mat) @ Vector((0, 0.01, 0))
-        bone["transform0"] = Matrix()
-        bone["transform1"] = Matrix()
-        bone["nicetransform"] = Matrix()
+        bone["transform0"] = _matrix_to_idprop(Matrix())
+        bone["transform1"] = _matrix_to_idprop(Matrix())
+        bone["nicetransform"] = _matrix_to_idprop(Matrix())
         bone.align_roll(bone_dir)
         bone.hide_select = True
         pre_mat = bone.matrix
@@ -63,8 +70,8 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
     else:
         mat0 = cf_to_mat(rigsubdef["jointtransform0"])
         mat1 = cf_to_mat(rigsubdef["jointtransform1"])
-        bone["transform0"] = mat0
-        bone["transform1"] = mat1
+        bone["transform0"] = _matrix_to_idprop(mat0)
+        bone["transform1"] = _matrix_to_idprop(mat1)
         bone["is_transformable"] = True
 
         bone.parent = parent_bone
@@ -121,7 +128,7 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
     post_mat = bone.matrix
 
     # this value stores the transform between the "proper" matrix and the "nice" matrix where bones are oriented in a more friendly way
-    bone["nicetransform"] = o_trans.inverted() @ post_mat
+    bone["nicetransform"] = _matrix_to_idprop(o_trans.inverted() @ post_mat)
 
     # link objects to bone by searching ONLY within the provided parts_collection
     for aux_name in rigsubdef["aux"]:

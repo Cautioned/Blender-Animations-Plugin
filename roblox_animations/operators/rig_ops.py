@@ -247,12 +247,22 @@ class OBJECT_OT_ToggleIKHelpers(bpy.types.Operator):
         obj = context.active_object
         arm = obj.data
         # decide desired toggle state based on first helper found
-        helper_bones = [b for b in arm.bones if b.name.endswith("-IKTarget") or b.name.endswith("-IKPole")]
-        if not helper_bones:
+        helper_bone_names = [b.name for b in arm.bones if b.name.endswith("-IKTarget") or b.name.endswith("-IKPole")]
+        pose_helpers = [obj.pose.bones.get(name) for name in helper_bone_names]
+        pose_helpers = [pb for pb in pose_helpers if pb is not None]
+
+        if not pose_helpers:
             self.report({'INFO'}, "no ik helpers found")
             return {'CANCELLED'}
-        target_hide = not any(b.hide for b in helper_bones)
-        for b in helper_bones:
-            b.hide = target_hide
+
+        target_hide = not any(getattr(pb, "hide", False) for pb in pose_helpers)
+        for pb in pose_helpers:
+            try:
+                pb.hide = target_hide
+            except AttributeError:
+                # fall back to legacy edit bone hide when pose property missing (older blender)
+                edit_bone = arm.bones.get(pb.name)
+                if edit_bone is not None:
+                    edit_bone.hide = target_hide
         self.report({'INFO'}, ("hidden" if target_hide else "shown") + " ik helpers")
         return {'FINISHED'}

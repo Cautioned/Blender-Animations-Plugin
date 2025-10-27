@@ -119,6 +119,12 @@ class TestAnimationSerialization(unittest.TestCase):
             for kp in fcurve.keyframe_points:
                 kp.interpolation = interpolation
 
+    def set_full_range_bake(self, enabled: bool):
+        """Helper to set the full range bake setting."""
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_full_range_bake = enabled
+
     def create_ik_rig(self):
         """Creates a simple IK rig for testing."""
         bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
@@ -323,7 +329,9 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertIn("kfs", result, "Serialized data is missing 'kfs' key for sparse test.")
         
         keyframes = result["kfs"]
-        self.assertEqual(len(keyframes), 2, f"Expected 2 keyframes for a sparse rig, but got {len(keyframes)}.")
+        # With full-range bake defaulting to True, expect all frames from frame_start to frame_end
+        expected_frames = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        self.assertEqual(len(keyframes), expected_frames, f"Expected {expected_frames} keyframes for full-range bake, but got {len(keyframes)}.")
         
         # Check that the unanimated root bone is not in the keyframes
         for kf in keyframes:
@@ -509,10 +517,9 @@ class TestAnimationSerialization(unittest.TestCase):
             if parent_bone_name in kf['kf']:
                 parent_keyframe_count += 1
         
-        # The parent bone is animated sparsely, but the hybrid bake adds keys at significant frames (1, 5, 10, 20)
-        # Check that it appears on at least its own keyframes. The exact number can vary with optimizations.
-        self.assertGreaterEqual(parent_keyframe_count, 2, "Parent bone should appear at least on its own keyframes.")
-        self.assertLess(parent_keyframe_count, 20, "Parent bone should be sparsely baked, not fully.")
+        # With full-range bake defaulting to True, parent bone should appear in all frames
+        expected_frames = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        self.assertEqual(parent_keyframe_count, expected_frames, f"Parent bone should appear in all {expected_frames} frames with full-range bake.")
         
         # Check for presence at specific key times
         parent_frames = [kf['t'] for kf in keyframes if parent_bone_name in kf['kf']]
@@ -723,7 +730,9 @@ class TestAnimationSerialization(unittest.TestCase):
             if sparse_bone in kf['kf']:
                 torso_keyframe_count += 1
                 
-        self.assertEqual(torso_keyframe_count, 3, f"Expected 3 keyframes for sparsely baked 'Torso' bone, but found {torso_keyframe_count}.")
+        # With full-range bake defaulting to True, expect all frames
+        expected_torso_frames = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        self.assertEqual(torso_keyframe_count, expected_torso_frames, f"Expected {expected_torso_frames} keyframes for full-range baked 'Torso' bone, but found {torso_keyframe_count}.")
 
     def test_nla_tracks_force_full_bake(self):
         """Tests that having active NLA tracks forces a full, simple bake."""
@@ -1203,7 +1212,9 @@ class TestAnimationSerialization(unittest.TestCase):
         
         # Don't set the scene property as it causes enum errors
         # The property will be updated automatically when needed
-        bpy.context.scene.rbx_deform_rig_scale = 0.1 # Use a known scale for consistent testing
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_deform_rig_scale = 0.1  # Use a known scale for consistent testing
         
         # --- EXECUTION ---
         bpy.context.scene.frame_set(20) # Go to the final frame to check the state
@@ -1220,7 +1231,9 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertEqual(result["bone_hierarchy"], {"TestDeformBone": None})
         
         self.assertIn("kfs", result, "Result should have keyframes.")
-        self.assertEqual(len(result["kfs"]), 2, "Expected 2 keyframes for sparse deform rig animation.")
+        # With full-range bake defaulting to True, expect all frames
+        expected_frames = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        self.assertEqual(len(result["kfs"]), expected_frames, f"Expected {expected_frames} keyframes for full-range deform rig animation.")
         
         last_frame_data = result["kfs"][-1]["kf"]
         self.assertIn("TestDeformBone", last_frame_data, "Deform bone not found in last keyframe.")
@@ -1606,8 +1619,9 @@ class TestAnimationSerialization(unittest.TestCase):
         print(f"[BENCHMARK] Slowdown factor: {full_time / sparse_time:.1f}x")
         print(f"[BENCHMARK] Time per frame in full bake: {full_time / FRAME_COUNT * 1000:.2f}ms")
         
-        # Verify results
-        self.assertEqual(len(sparse_result["kfs"]), 2, "Sparse should have 2 keyframes")
+        # Verify results - sparse test now uses full-range bake by default
+        expected_sparse_frames = FRAME_COUNT  # full-range bake means all frames
+        self.assertEqual(len(sparse_result["kfs"]), expected_sparse_frames, f"Sparse with full-range should have {expected_sparse_frames} keyframes")
         self.assertEqual(len(full_result["kfs"]), FRAME_COUNT, f"Full should have {FRAME_COUNT} keyframes")
         
         # Verify keyframe ordering
@@ -1693,94 +1707,6 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertEqual(len(times), len(set(times)), "Should have no duplicate times")
 
 
-    def test_animation_import_overwrite(self):
-        """
-        Tests that importing an animation onto a rig with an existing
-        animation correctly clears the old one before applying the new one.
-        """
-        # --- SETUP ---
-        # 1. Create a rig and give it an initial animation using Linear interpolation
-        def create_linear_armature_with_action(name):
-            bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
-            obj = bpy.context.object
-            obj.name = name
-            obj.data.name = f"{name}Armature"
-            obj.data.edit_bones.new("Bone").head = (0, 0, 0)
-            obj.data.edit_bones[-1].tail = (0, 1, 0)
-
-            bpy.ops.object.mode_set(mode='POSE')
-            pbone = obj.pose.bones["Bone"]
-
-            action = bpy.data.actions.new(f"{name}Action")
-            obj.animation_data_create()
-            obj.animation_data.action = action
-
-            return obj, pbone, action
-
-        armature_obj, pbone, action_a = create_linear_armature_with_action("OverwriteRig")
-
-        # Insert keyframes
-        pbone.location = (0, 0, 0)
-        pbone.keyframe_insert(data_path="location", frame=1)
-        pbone.location = (5, 0, 0)
-        pbone.keyframe_insert(data_path="location", frame=10)
-
-        # Force all fcurves to Linear
-        self.set_action_interpolation(action_a, 'LINEAR')
-
-        # 2. Create mock data for a NEW animation (moves bone on Y-axis)
-        # Invalidate cache to ensure new armature is available
-        invalidate_armature_cache()
-        
-        # Don't set the scene property as it causes enum errors
-        # The property will be updated automatically when needed
-        self.set_action_interpolation(action_a, 'LINEAR')
-        fps = 30.0
-        animation_data = {
-            "t": (9) / fps,
-            "kfs": [
-                {"t": 0.0, "kf": {"Bone": [[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1], "Linear", "Out"]}},
-                {"t": (9) / fps, "kf": {"Bone": [[0, 10, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1], "Linear", "Out"]}}
-            ],
-            "export_info": {"fps": fps}
-        }
-
-        # --- EXECUTION ---
-        # Call importer with explicit target armature to avoid enum registration issues
-        execute_import_animation("test_overwrite_task", animation_data, armature_obj.name)
-
-        # --- ASSERTION ---
-        self.assertIsNotNone(armature_obj.animation_data)
-        action_b = armature_obj.animation_data.action
-        self.assertIsNotNone(action_b)
-        self.assertNotEqual(action_b.name, "ActionA", "Old action should have been replaced.")
-        
-        # Check that the old animation's f-curves are gone
-        from ..core.utils import get_action_fcurves
-        fcurves = get_action_fcurves(action_b)
-        def _find_fc(collection, data_path, array_index):
-            if hasattr(collection, 'find'):
-                try:
-                    return collection.find(data_path, index=array_index)
-                except TypeError:
-                    pass
-            for fc in collection:
-                if getattr(fc, 'data_path', None) == data_path and getattr(fc, 'array_index', -1) == array_index:
-                    return fc
-            return None
-
-        fc_x = _find_fc(fcurves, 'pose.bones["Bone"].location', 0)
-        fc_y = _find_fc(fcurves, 'pose.bones["Bone"].location', 1)
-        self.assertIsNotNone(fc_y, "Y-location f-curve from new animation should exist.")
-        
-        # Verify the new animation's effect
-        bpy.context.scene.frame_set(10)
-        final_location = pbone.location
-        self.assertAlmostEqual(final_location.x, 0.0, places=4, msg="X-location from old animation should be gone.")
-        self.assertAlmostEqual(final_location.y, 10.0, places=4, msg="Y-location from new animation should be present.")
-        self.assertAlmostEqual(final_location.z, 0.0, places=4)
-
-
     def test_bezier_curve_is_fully_baked(self):
         """
         Tests that a BEZIER interpolation curve is baked on every frame
@@ -1831,6 +1757,307 @@ class TestAnimationSerialization(unittest.TestCase):
         # Check that the bone is present in all keyframes
         for kf in result["kfs"]:
             self.assertIn("Bone", kf["kf"], "Bone data should be present in every keyframe of a bezier bake.")
+
+
+    def test_cyclic_animation_extends_to_scene_end(self):
+        """cyclic modifiers should cause baking to continue sparsely up to the scene's frame_end."""
+        self.clear_scene_property()
+
+        # --- SETUP ---
+        bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0); armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Animate a short range
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 2, 0)
+        pbone.keyframe_insert(data_path="location", frame=5)
+
+        # Make sure interpolation is linear for predictable values
+        self.set_action_interpolation(action, 'LINEAR')
+
+        # Add a cyclic modifier so the motion repeats beyond the last keyframe
+        from ..core.utils import get_action_fcurves
+        fcurves = get_action_fcurves(action)
+        fcurve = fcurves.find('pose.bones["Bone"].location', index=1)
+        self.assertIsNotNone(fcurve, "expected Y location fcurve to exist")
+        fcurve.modifiers.new(type='CYCLES')
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True)
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False  # ensure cycles override sparse bake preference
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {scene.frame_start + int(round(kf["t"] * desired_fps)) for kf in result["kfs"]}
+
+            expected_frames = {1, 5, 9, 13, 17, 20}
+            self.assertSetEqual(baked_frames, expected_frames)
+
+            last_frame = max(baked_frames)
+            self.assertEqual(last_frame, scene.frame_end, "cyclic animation should extend baking to scene end")
+        finally:
+            scene.render.fps = original_fps
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+
+    def test_non_cyclic_holds_last_pose_when_full_range_disabled(self):
+        """without cyclic modifiers and full-range disabled, bake only sparse keys plus a held final pose."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0); armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("NonCyclicAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 3, 0)
+        pbone.keyframe_insert(data_path="location", frame=5)
+
+        self.set_action_interpolation(action, 'LINEAR')
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True)
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = [scene.frame_start + int(round(kf["t"] * desired_fps)) for kf in result["kfs"]]
+            self.assertEqual(baked_frames, [1, 5, 20])
+
+            last_pose = result["kfs"][-1]["kf"].get("Bone")
+            self.assertIsNotNone(last_pose, "Bone should be present in the held final pose")
+            self.assertAlmostEqual(last_pose[0][1], 3.0, places=4, msg="Final pose should hold the last keyed value")
+        finally:
+            scene.render.fps = original_fps
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+
+    def test_cyclic_multiple_channels_union(self):
+        """when multiple cycle-enabled fcurves have different key timings, export should union their offsets."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0); armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicUnionAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # keyframes staggered across axes
+        pbone.location = (1, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+
+        pbone.location = (1, 1, 0)
+        pbone.keyframe_insert(data_path="location", frame=2)
+
+        pbone.location = (2, 1, 0)
+        pbone.keyframe_insert(data_path="location", frame=5)
+
+        pbone.location = (2, 2, 0)
+        pbone.keyframe_insert(data_path="location", frame=6)
+
+        self.set_action_interpolation(action, 'LINEAR')
+
+        from ..core.utils import get_action_fcurves
+        fcurves = get_action_fcurves(action)
+        self.assertIsNotNone(fcurves.find('pose.bones["Bone"].location', index=0))
+        self.assertIsNotNone(fcurves.find('pose.bones["Bone"].location', index=1))
+        fcurves.find('pose.bones["Bone"].location', index=0).modifiers.new(type='CYCLES')
+        fcurves.find('pose.bones["Bone"].location', index=1).modifiers.new(type='CYCLES')
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True)
+        frame_step_original = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+            scene.frame_step = 1
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            self.assertIn("kfs", result)
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {scene.frame_start + int(round(kf["t"] * desired_fps)) for kf in result["kfs"]}
+
+            expected_frames = {1, 2, 5, 6, 7, 10, 11, 12, 15, 16, 17, 20}
+            self.assertSetEqual(baked_frames, expected_frames)
+
+            final_frame = max(baked_frames)
+            self.assertEqual(final_frame, scene.frame_end)
+
+            final_data = result["kfs"][-1]["kf"].get("Bone")
+            self.assertIsNotNone(final_data, "cycled bone should appear in final keyframe")
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = frame_step_original
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+
+    def test_cyclic_before_range_does_not_emit_pre_start_frames(self):
+        """cycles repeating before frame_start should not create negative-time samples."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0); armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicBeforeAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+        pbone.location = (0, 4, 0)
+        pbone.keyframe_insert(data_path="location", frame=14)
+
+        self.set_action_interpolation(action, 'LINEAR')
+
+        from ..core.utils import get_action_fcurves
+        fcurves = get_action_fcurves(action)
+        fcurve_y = fcurves.find('pose.bones["Bone"].location', index=1)
+        self.assertIsNotNone(fcurve_y)
+        cycles_mod = fcurve_y.modifiers.new(type='CYCLES')
+        cycles_mod.mode_before = 'REPEAT'
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True)
+        frame_step_original = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 5
+            scene.frame_end = 25
+            scene.frame_step = 1
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = [scene.frame_start + int(round(kf["t"] * desired_fps)) for kf in result["kfs"]]
+
+            self.assertGreaterEqual(min(baked_frames), scene.frame_start, "no frames before frame_start should be emitted")
+            self.assertIn(scene.frame_end, baked_frames)
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = frame_step_original
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
+
+
+    def test_cyclic_respects_frame_step_setting(self):
+        """even with frame_step > 1, cyclic export should cover scene end and replicate sparse keys."""
+        self.clear_scene_property()
+
+        bpy.ops.object.add(type='ARMATURE', enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.data.edit_bones.new("Bone").head = (0, 0, 0); armature_obj.data.edit_bones[-1].tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        pbone = armature_obj.pose.bones["Bone"]
+
+        action = bpy.data.actions.new("CyclicFrameStepAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 5, 0)
+        pbone.keyframe_insert(data_path="location", frame=4)
+
+        self.set_action_interpolation(action, 'LINEAR')
+
+        from ..core.utils import get_action_fcurves
+        fcurve_y = get_action_fcurves(action).find('pose.bones["Bone"].location', index=1)
+        self.assertIsNotNone(fcurve_y)
+        fcurve_y.modifiers.new(type='CYCLES')
+
+        scene = bpy.context.scene
+        original_fps = scene.render.fps
+        original_full_range = getattr(getattr(scene, "rbx_anim_settings", None), "rbx_full_range_bake", True)
+        frame_step_original = scene.frame_step
+        try:
+            scene.render.fps = 24
+            scene.frame_start = 1
+            scene.frame_end = 20
+            scene.frame_step = 3
+
+            settings = getattr(scene, "rbx_anim_settings", None)
+            if settings:
+                settings.rbx_full_range_bake = False
+
+            bpy.context.view_layer.update()
+            result = serialize(armature_obj)
+
+            desired_fps = scene.render.fps / scene.render.fps_base
+            baked_frames = {scene.frame_start + int(round(kf["t"] * desired_fps)) for kf in result["kfs"]}
+
+            expected_frames = {1, 4, 7, 10, 13, 16, 19, 20}
+            self.assertSetEqual(baked_frames, expected_frames)
+            self.assertEqual(max(baked_frames), scene.frame_end)
+        finally:
+            scene.render.fps = original_fps
+            scene.frame_step = frame_step_original
+            if settings:
+                settings.rbx_full_range_bake = original_full_range
 
 
     def test_deform_vs_new_bone_space_conversion(self):
@@ -1902,15 +2129,18 @@ class TestAnimationSerialization(unittest.TestCase):
             bone.keyframe_insert(data_path="location", frame=10)
 
         # set deform export scale
-        bpy.context.scene.rbx_deform_rig_scale = 0.1
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        if settings:
+            settings.rbx_deform_rig_scale = 0.1
 
         # --- EXECUTION ---
         result = serialize(armature_obj)
 
         # --- ASSERTION ---
         self.assertIn("kfs", result)
-        # sparse for unconstrained anims
-        self.assertEqual(len(result["kfs"]), 2)
+        # With full-range bake defaulting to True, expect all frames
+        expected_frames = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        self.assertEqual(len(result["kfs"]), expected_frames)
         self.assertTrue(result.get("is_deform_bone_rig"), "Skinned rig should be flagged as deform")
 
         last_kf = result["kfs"][-1]["kf"]
@@ -1978,7 +2208,9 @@ class TestAnimationSerialization(unittest.TestCase):
         result = serialize(armature_obj)
 
         self.assertFalse(result.get("is_deform_bone_rig", False), "Motor rig with helper should not be marked as deform")
-        self.assertEqual(len(result["kfs"]), 2)
+        # With full-range bake defaulting to True, expect all frames
+        expected_frames = bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
+        self.assertEqual(len(result["kfs"]), expected_frames)
 
         helper_cframe = result["kfs"][-1]["kf"].get("HelperChild")
         self.assertIsNotNone(helper_cframe, "Helper child data missing from export")

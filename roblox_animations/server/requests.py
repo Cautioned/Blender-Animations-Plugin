@@ -104,7 +104,7 @@ def execute_list_armatures(task_id):
 
         response = {
             "armatures": armatures,
-            "current": bpy.context.scene.rbx_anim_armature,
+            "current": getattr(getattr(bpy.context.scene, "rbx_anim_settings", None), "rbx_anim_armature", None),
             "fps": bpy.context.scene.render.fps,
         }
 
@@ -150,8 +150,11 @@ def execute_in_main_thread(task_id, armature_name):
         set_scene_fps(desired_fps)
 
         # Check if this is a deform bone rig or if deform bone serialization is forced
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        force_deform = getattr(settings, "force_deform_bone_serialization", False)
+
         use_deform_bone_serialization = is_deform_bone_rig(
-            ao) or bpy.context.scene.force_deform_bone_serialization
+            ao) or force_deform
         print(
             f"Server export: Using {'deform bone' if use_deform_bone_serialization else 'Motor6D'} serialization")
         print(f"Blender Addon: Starting animation export for '{armature_name}'...")
@@ -185,7 +188,8 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         if target_armature:
             armature_name = target_armature
         else:
-            armature_name = bpy.context.scene.rbx_anim_armature
+            settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+            armature_name = settings.rbx_anim_armature if settings else None
             
         if not armature_name:
             raise ValueError("No armature specified for import. Please provide target armature or select one in the scene.")
@@ -310,7 +314,8 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 
                 # --- Matrix Calculation ---
                 if is_deform_rig:
-                    scale_factor = bpy.context.scene.rbx_deform_rig_scale
+                    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+                    scale_factor = getattr(settings, "rbx_deform_rig_scale", 1.0)
                     
                     loc, rot, sca = bone_transform.decompose()
                     loc_blender = Vector((-loc.x * scale_factor, loc.y * scale_factor, -loc.z * scale_factor))
@@ -366,86 +371,37 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         for bone_name, frame_data in all_bone_data.items():
             sorted_frames = sorted(frame_data.keys())
 
-            # Try to get or create a channelbag with robust fallbacks
-            channelbag = None
-            
-            # Method 1: Try to get existing channelbag
-            try:
-                channelbag = utils.get_action_channelbag(action)
-            except Exception:
-                pass
-            
-            # Method 2: Try bpy_extras.anim_utils if available
-            if not channelbag or not hasattr(channelbag, 'fcurves'):
-                try:
-                    import bpy_extras.anim_utils as anim_utils
-                    if hasattr(anim_utils, 'action_ensure_channelbag_for_slot') and hasattr(action, 'slots') and action.slots:
-                        slot = action.slots[0]
-                        channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
-                    elif hasattr(anim_utils, 'action_get_channelbag_for_slot') and hasattr(action, 'slots') and action.slots:
-                        slot = action.slots[0]
-                        channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
-                except (ImportError, AttributeError, Exception):
-                    pass
-            
-            # Method 3: Try direct slot access
-            if not channelbag or not hasattr(channelbag, 'fcurves'):
-                if hasattr(action, 'slots') and action.slots:
-                    slot = action.slots[0]
-                    if hasattr(slot, 'channelbag') and slot.channelbag:
-                        channelbag = slot.channelbag
-            
-            # Method 4: Try layers/strips approach
-            if not channelbag or not hasattr(channelbag, 'fcurves'):
-                if hasattr(action, 'layers') and action.layers:
-                    layer = action.layers[0]
-                    if hasattr(layer, 'strips') and layer.strips:
-                        strip = layer.strips[0]
-                        if hasattr(strip, 'channelbag') and hasattr(action, 'slots') and action.slots:
-                            slot = action.slots[0]
-                            try:
-                                channelbag = strip.channelbag(slot, ensure=True)
-                            except (TypeError, AttributeError):
-                                try:
-                                    channelbag = strip.channelbag(slot)
-                                except (TypeError, AttributeError):
-                                    pass
-            
-            # Method 5: Fallback to legacy action.fcurves
-            if not channelbag or not hasattr(channelbag, 'fcurves'):
-                if hasattr(action, 'fcurves'):
-                    # Create a mock channelbag for legacy compatibility
-                    class MockChannelbag:
-                        def __init__(self, action):
-                            self.fcurves = action.fcurves
-                            self.groups = getattr(action, 'groups', [])
-                        
-                        def new(self, *args, **kwargs):
-                            return self.fcurves.new(*args, **kwargs)
-                    
-                    channelbag = MockChannelbag(action)
-            
-            # Final validation
-            if not channelbag or not hasattr(channelbag, 'fcurves'):
-                raise RuntimeError("Unable to create or access fcurves - no compatible API available")
+            channelbag = utils.get_action_channelbag(action)
+            if channelbag is None or not hasattr(channelbag, 'fcurves'):
+                legacy_fcurves = getattr(action, 'fcurves', None)
+                if legacy_fcurves is None:
+                    raise RuntimeError("Unable to access animation channelbag for import")
+
+                class _LegacyChannelbag:
+                    def __init__(self, fcurves, groups):
+                        self.fcurves = fcurves
+                        self.groups = groups
+
+                    def new(self, *args, **kwargs):
+                        return self.fcurves.new(*args, **kwargs)
+
+                channelbag = _LegacyChannelbag(legacy_fcurves, getattr(action, 'groups', []))
 
             # Create fcurves with version-appropriate parameters
             def create_fcurve(data_path, index, group_name):
                 try:
-                    # Try Blender 5.0+ signature first (ActionChannelbagFCurves)
-                    if bpy.app.version >= (5, 0, 0):
-                        return channelbag.fcurves.new(data_path, index=index)
-                    else:
-                        # Try legacy signature with group parameter
-                        group_param = 'group_name' if bpy.app.version >= (5, 0, 0) else 'action_group'
-                        return channelbag.fcurves.new(data_path, index=index, **{group_param: group_name})
+                    return channelbag.fcurves.new(data_path, index=index)
                 except TypeError:
-                    # Fallback: try without group parameter
-                    try:
-                        return channelbag.fcurves.new(data_path, index=index)
-                    except TypeError:
-                        # Final fallback: try with just data_path
-                        return channelbag.fcurves.new(data_path)
+                    group_kw = None
+                    if hasattr(channelbag.fcurves, 'new'):
+                        for candidate in ('group_name', 'action_group'):
+                            try:
+                                return channelbag.fcurves.new(
+                                    data_path, index=index, **{candidate: group_name}
+                                )
+                            except TypeError:
+                                continue
+                    return channelbag.fcurves.new(data_path, index=index)
             
             # Location
             loc_fcurves = [create_fcurve(f'pose.bones["{bone_name}"].location', i, bone_name) for i in range(3)]

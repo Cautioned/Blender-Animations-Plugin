@@ -85,10 +85,15 @@ function RigManager:rebuildBoneWeights()
 		bonesToShow = {}
 		-- To avoid a full traversal to build a parent map, we can do a post-order traversal
 		-- to determine which nodes are ancestors of an enabled node.
-		local function findEnabledAndMarkAncestors(bone)
+		local function findEnabledAndMarkAncestors(bone, depth)
+			if depth > 50 then -- Prevent stack overflow
+				warn("Bone hierarchy too deep (>50 levels), stopping traversal at:", bone.part.Name)
+				return false
+			end
+			
 			local isOrHasEnabledDescendant = bone.enabled
 			for _, child in ipairs(bone.children) do
-				if findEnabledAndMarkAncestors(child) then
+				if findEnabledAndMarkAncestors(child, depth + 1) then
 					isOrHasEnabledDescendant = true
 				end
 			end
@@ -97,12 +102,17 @@ function RigManager:rebuildBoneWeights()
 			end
 			return isOrHasEnabledDescendant
 		end
-		findEnabledAndMarkAncestors(State.activeRig.root)
+		findEnabledAndMarkAncestors(State.activeRig.root, 0)
 	end
 
 	-- Build the list for the UI with a single traversal
 	local boneList: Types.BoneWeightsList = {}
 	local function buildBoneListRecursive(parent, depth)
+		if depth > 50 then -- Prevent stack overflow
+			warn("Bone hierarchy too deep (>50 levels), stopping traversal at:", parent.part.Name)
+			return
+		end
+		
 		for _, child in ipairs(parent.children) do
 			if not hasAnimatedBones or (bonesToShow and bonesToShow[child]) then
 				table.insert(boneList, {
@@ -248,6 +258,16 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 		return
 	end
 
+	-- Check model size to prevent performance issues
+	local descendantCount = 0
+	for _ in pairs(rigModel:GetDescendants()) do
+		descendantCount = descendantCount + 1
+		if descendantCount > 5000 then -- Prevent performance issues with huge models
+			self:addWarning("Model has too many descendants (" .. descendantCount .. "). This may cause performance issues.")
+			break
+		end
+	end
+
 	-- Use extracted warning function
 	self:addRigWarnings(rigModel)
 
@@ -257,7 +277,36 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 	State.activeRigExists:set(true)
 
 	-- Use the old pattern: Rig.new(rigModel :: any) :: any
-	State.activeRig = Rig.new(rigModel :: any) :: any
+	local success, result = pcall(function()
+		-- Add timeout protection for rig creation
+		local startTime = tick()
+		local rig = Rig.new(rigModel :: any) :: any
+		local elapsed = tick() - startTime
+		
+		if elapsed > 5 then -- Warn if rig creation takes too long
+			warn("Rig creation took " .. elapsed .. " seconds. This may indicate performance issues.")
+		end
+		
+		return rig
+	end)
+	
+		if success then
+			State.activeRig = result
+		else
+			-- Check if it's a circular dependency warning
+			if string.find(tostring(result), "CIRCULAR MOTOR6D CHAIN DETECTED") then
+				local warningMsg = tostring(result)
+				self:addWarning(warningMsg)
+				print("RIG MANAGER:", warningMsg)
+			else
+				local errorMsg = "Failed to create rig: " .. tostring(result)
+				self:addWarning(errorMsg)
+				print("RIG MANAGER:", errorMsg)
+			end
+			State.activeRig = nil
+			State.activeRigExists:set(false)
+			return
+		end
 
 	-- The caller `updateActiveRigFromSelection` runs this in a `task.spawn`.
 	-- The functions below have internal cache checks to avoid re-computing.
@@ -502,6 +551,7 @@ function RigManager:syncBones(blenderSyncManager: any?): boolean
         print("Sync Bones: Successfully created " .. createdCount .. " new bone(s). Rebuilding rig...")
         -- rebuild rig to include newly created nodes
         self:setRig(State.activeRigModel)
+        
         -- restart animation to reflect changes
         self.playbackService:stopAnimationAndDisconnect()
         if State.activeAnimator then

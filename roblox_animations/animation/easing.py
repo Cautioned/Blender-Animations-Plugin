@@ -23,15 +23,25 @@ def get_easing_for_bone(action, bone_name, frame):
     # Check across all transform properties for a keyframe at this frame
     props_to_check = [
         ('location', 3), ('rotation_quaternion', 4), ('scale', 3)]
+    
+    # Find the closest keyframe to the target frame (within 0.5 frames)
+    closest_interpolation = None
+    closest_easing = None
+    closest_distance = float('inf')
+    
     for prop_name, num_indices in props_to_check:
         for i in range(num_indices):
             datapath = f'pose.bones["{bone_name}"].{prop_name}'
             fcurve = fcurves.find(datapath, index=i)
             if fcurve:
                 for kp in fcurve.keyframe_points:
-                    if abs(kp.co.x - frame) < 0.001:
-                        return kp.interpolation, kp.easing
-    return None, None
+                    distance = abs(kp.co.x - frame)
+                    if distance < 0.5 and distance < closest_distance:
+                        closest_interpolation = kp.interpolation
+                        closest_easing = kp.easing
+                        closest_distance = distance
+    
+    return closest_interpolation, closest_easing
 
 
 def map_blender_to_roblox_easing(interpolation, easing):

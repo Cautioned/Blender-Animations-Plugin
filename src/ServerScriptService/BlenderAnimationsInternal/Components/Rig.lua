@@ -65,6 +65,9 @@ function Rig.new(model: Model)
 		end
 	end
 
+	-- Check for cyclic motor6d dependencies before building hierarchy
+	self:checkCyclicMotor6D(model)
+	
 	-- Always build the Motor6D hierarchy first, if a root exists.
 	if model.PrimaryPart then
 		self.root = RigPart.new(self, model.PrimaryPart, nil, self.isDeformRig)
@@ -80,6 +83,85 @@ function Rig.new(model: Model)
 	end
 
 	return self
+end
+
+function Rig:checkCyclicMotor6D(model: Model)
+	-- Build a graph of motor6d connections
+	local motor6dGraph: { [BasePart]: { BasePart } } = {}
+	local allParts: { BasePart } = {}
+	
+	-- Collect all motor6d joints and build the graph
+	for _, descendant in ipairs(model:GetDescendants()) do
+		if descendant:IsA("Motor6D") then
+			local motor6d = descendant :: Motor6D
+			local part0 = motor6d.Part0
+			local part1 = motor6d.Part1
+			
+			if part0 and part1 then
+				if not motor6dGraph[part0] then
+					motor6dGraph[part0] = {}
+					table.insert(allParts, part0)
+				end
+				if not motor6dGraph[part1] then
+					motor6dGraph[part1] = {}
+					table.insert(allParts, part1)
+				end
+				
+				-- Add directed edge from part0 to part1
+				table.insert(motor6dGraph[part0], part1)
+			end
+		end
+	end
+	
+	-- Use DFS to detect cycles
+	local visited: { [BasePart]: boolean } = {}
+	local recStack: { [BasePart]: boolean } = {}
+	local cyclePath: { BasePart } = {}
+	
+	local function hasCycleDFS(part: BasePart): boolean
+		visited[part] = true
+		recStack[part] = true
+		table.insert(cyclePath, part)
+		
+		local neighbors = motor6dGraph[part] or {}
+		for _, neighbor in ipairs(neighbors) do
+			if not visited[neighbor] then
+				if hasCycleDFS(neighbor) then
+					return true
+				end
+			elseif recStack[neighbor] then
+				-- Found a cycle! Build the cycle description
+				local cycleDescription = {}
+				local startIndex = 1
+				for i, p in ipairs(cyclePath) do
+					if p == neighbor then
+						startIndex = i
+						break
+					end
+				end
+				
+				for i = startIndex, #cyclePath do
+					table.insert(cycleDescription, cyclePath[i].Name)
+				end
+				table.insert(cycleDescription, neighbor.Name) -- Close the cycle
+				
+				error("CIRCULAR MOTOR6D CHAIN DETECTED: " .. table.concat(cycleDescription, " -> ") .. 
+					". This creates an infinite loop that will break rigs. Fix by removing one of the motor6d connections in this chain.")
+			end
+		end
+		
+		table.remove(cyclePath) -- Remove current part from path
+		recStack[part] = false
+		return false
+	end
+	
+	-- Check each part for cycles
+	for _, part in ipairs(allParts) do
+		if not visited[part] then
+			cyclePath = {} -- Reset path for each new DFS
+			hasCycleDFS(part)
+		end
+	end
 end
 
 
@@ -114,15 +196,20 @@ function Rig:GetRigParts()
 	local parts = {}
 	local root = self.root
 
-	local function finder(part)
+	local function finder(part, depth)
+		if depth > 50 then -- Prevent stack overflow
+			warn("RigPart hierarchy too deep (>50 levels), stopping traversal at:", part.part.Name)
+			return
+		end
+		
 		for _, child in pairs(part.children) do
 			parts[#parts + 1] = child
-			finder(child)
+			finder(child, depth + 1)
 		end
 	end
 
 	if root then
-		finder(root)
+		finder(root, 0)
 	end
 
 	return parts
@@ -150,10 +237,6 @@ function Rig:LoadAnimation(data)
 
 	if not data.kfs or type(data.kfs) ~= "table" then
 		error("Animation data missing keyframes array (data.kfs)")
-	end
-
-	if not data.t or type(data.t) ~= "number" then
-		error("Animation data missing duration (data.t)")
 	end
 
 	self:ClearPoses()

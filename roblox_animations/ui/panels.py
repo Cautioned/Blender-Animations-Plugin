@@ -69,7 +69,8 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         else:
             row.operator("object.stop_server",
                          text="Stop Server", icon='PAUSE')
-        row.prop(scene, "rbx_server_port", text="")
+        settings = getattr(scene, "rbx_anim_settings", None)
+        row.prop(settings, "rbx_server_port", text="")
 
         # --- 3. ARMATURE OPERATIONS ---
         layout.separator()
@@ -83,15 +84,15 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         )
 
         armature_ops_box = layout.box()
-        
+
         if not armatures_exist:
             armature_ops_box.label(text="No Armatures in Scene", icon='INFO')
             return
 
         armature_ops_box.label(text="Armature Operations")
-        armature_ops_box.prop(scene, "rbx_anim_armature", text="Target")
+        armature_ops_box.prop(settings, "rbx_anim_armature", text="Target")
 
-        selected_armature = bpy.data.objects.get(scene.rbx_anim_armature)
+        selected_armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
 
         inner_box = armature_ops_box.box()
         inner_box.enabled = selected_armature is not None
@@ -108,7 +109,8 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             for bone in selected_armature.pose.bones
         )
         is_skinned_rig = is_deform_bone_rig(selected_armature)
-        run_deform_path = is_skinned_rig or scene.force_deform_bone_serialization or has_new_bones
+        force_deform = getattr(settings, "force_deform_bone_serialization", False)
+        run_deform_path = is_skinned_rig or force_deform or has_new_bones
 
         # --- Rigging Sub-panel ---
         rigging_box = inner_box.box()
@@ -132,14 +134,16 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         animation_box = inner_box.box()
         col = animation_box.column()
         col.label(text="Animation", icon="ACTION")
-        if run_deform_path:
-            col.prop(scene, "rbx_deform_rig_scale", text="Deform Scale")
+        if run_deform_path and settings:
+            col.prop(settings, "rbx_deform_rig_scale", text="Deform Scale")
         col.operator("object.rbxanims_importfbxanimation",
                      text="Import from .fbx")
         col.operator("object.rbxanims_mapkeyframes",
                      text="Map from Active Rig")
         col.operator("object.rbxanims_applytransform",
                      text="Apply Object Transform")
+        if settings:
+            col.prop(settings, "rbx_full_range_bake", text="Full Range Bake")
         col.separator()
         col.operator("object.rbxanims_bake", text="Bake (Clipboard)", icon='EXPORT')
         col.operator("object.rbxanims_bake_file", text="Bake to File", icon='FILE')
@@ -156,7 +160,8 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         validation_box = inner_box.box()
         validation_box.label(text="UGC Emote Validation", icon='CHECKMARK')
         row = validation_box.row(align=True)
-        row.prop(scene, "rbx_max_studs_per_frame", text="Max studs/frame")
+        if settings:
+            row.prop(settings, "rbx_max_studs_per_frame", text="Max studs/frame")
         row = validation_box.row(align=True)
         row.operator("object.rbxanims_validate_motionpaths", text="Validate Motion Paths", icon='ANIM_DATA')
         row.operator("object.rbxanims_clear_motionpaths", text="Clear", icon='TRASH')
@@ -177,6 +182,7 @@ class OBJECT_PT_RbxAnimations_Tool(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        settings = getattr(scene, "rbx_anim_settings", None)
 
         # Essentials
         layout.operator("object.rbxanims_importmodel",
@@ -191,8 +197,8 @@ class OBJECT_PT_RbxAnimations_Tool(bpy.types.Panel):
         if not armatures_exist:
             return
 
-        layout.prop(scene, "rbx_anim_armature", text="Rig")
-        selected_armature = bpy.data.objects.get(scene.rbx_anim_armature)
+        layout.prop(settings, "rbx_anim_armature", text="Rig")
+        selected_armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
 
         row = layout.row(align=True)
         row.enabled = selected_armature is not None

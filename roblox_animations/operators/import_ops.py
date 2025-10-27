@@ -27,11 +27,20 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         # Do not clear objects
         objnames_before_import = {obj.name for obj in bpy.data.objects}
-        if bpy.app.version >= (4, 0, 0):
+        if bpy.app.version >= (5, 0, 0):
             bpy.ops.wm.obj_import(
-                filepath=self.properties.filepath, use_split_groups=True)
+                filepath=self.properties.filepath,
+                use_split_groups=True,
+                forward_axis='NEGATIVE_Z',
+                up_axis='Y',
+            )
+        elif bpy.app.version >= (4, 0, 0):
+            bpy.ops.wm.obj_import(
+                filepath=self.properties.filepath,
+                use_split_groups=True,
+            )
         else:
-            bpy.ops.import_scene.obj(
+             bpy.ops.import_scene.obj(
                 filepath=self.properties.filepath, use_split_groups=True)
 
         # Get the actual newly imported OBJECTS
@@ -136,14 +145,16 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
     
     @classmethod
     def poll(cls, context):
-        armature_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         return bpy.data.objects.get(armature_name)
  
     def execute(self, context):
         from ..animation.import_export import get_mapping_error_bones, prepare_for_kf_map, copy_anim_state, apply_ao_transform
         import math
         
-        armature_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         # check active keying set
         if not bpy.context.scene.keying_sets.active:
             self.report(
@@ -212,7 +223,8 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
         
         prepare_for_kf_map()
 
-        armature_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         try:
             armature = bpy.data.objects[armature_name]
         except KeyError:

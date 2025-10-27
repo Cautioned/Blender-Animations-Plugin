@@ -45,17 +45,20 @@ def auto_constraint_parts(armature_name):
         if obj.type == 'MESH':
             # Strip .001, .002 etc from name for matching
             base_name = re.sub(r"\.\d+$", "", obj.name).lower()
-            if base_name in bone_name_map:
-                bone_name = bone_name_map[base_name]
+            bone_name = bone_name_map.get(base_name)
+            if not bone_name:
+                continue
 
             # Check for existing constraints and clear if they belong to another armature
-            for constraint in obj.constraints:
+            for constraint in list(obj.constraints):
                 if constraint.type == 'CHILD_OF' and constraint.target != armature:
                     obj.constraints.remove(constraint)
 
             # Add constraint if not already constrained to the correct bone
-            existing_constraint = next((c for c in obj.constraints if c.type ==
-                                       'CHILD_OF' and c.target == armature and c.subtarget == bone_name), None)
+            existing_constraint = next((
+                c for c in obj.constraints
+                if c.type == 'CHILD_OF' and c.target == armature and c.subtarget == bone_name
+            ), None)
             if not existing_constraint:
                 constraint = obj.constraints.new(type='CHILD_OF')
                 constraint.target = armature

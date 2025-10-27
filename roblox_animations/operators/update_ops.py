@@ -53,7 +53,11 @@ class StartServerOperator(bpy.types.Operator):
 
     def execute(self, context):
         try:
-            port = context.scene.rbx_server_port
+            settings = getattr(context.scene, "rbx_anim_settings", None)
+            port = settings.rbx_server_port if settings else None
+            if not port:
+                self.report({'ERROR'}, "Invalid server port")
+                return {'CANCELLED'}
             if start_server(port):
                 self.report({'INFO'}, f"Server started on port {port}")
                 # Force UI refresh

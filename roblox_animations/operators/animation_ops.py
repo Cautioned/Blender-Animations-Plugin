@@ -21,7 +21,8 @@ class OBJECT_OT_ApplyTransform(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         grig = bpy.data.objects.get(armature_name)
         return (
             grig
@@ -47,12 +48,14 @@ class OBJECT_OT_MapKeyframes(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        armature_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         grig = bpy.data.objects.get(armature_name)
         return grig and bpy.context.active_object and bpy.context.active_object != grig
 
     def execute(self, context):
-        armature_name = bpy.context.scene.rbx_anim_armature
+        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+        armature_name = settings.rbx_anim_armature if settings else None
         if not bpy.context.scene.keying_sets.active:
             self.report(
                 {"ERROR"}, "There is no active keying set, this is required.")
@@ -86,14 +89,17 @@ class OBJECT_OT_Bake(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         # Allow baking if there's a selected armature
-        return context.scene.rbx_anim_armature in bpy.data.objects and bpy.data.objects[context.scene.rbx_anim_armature].type == 'ARMATURE'
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        arm_name = settings.rbx_anim_armature if settings else None
+        return arm_name in bpy.data.objects and bpy.data.objects[arm_name].type == 'ARMATURE'
 
     def execute(self, context):
         try:
             desired_fps = get_scene_fps()
             set_scene_fps(desired_fps)
 
-            armature_name = context.scene.rbx_anim_armature
+            settings = getattr(context.scene, "rbx_anim_settings", None)
+            armature_name = settings.rbx_anim_armature if settings else None
             ao = bpy.data.objects[armature_name]
             
             if ao.type != 'ARMATURE':
@@ -102,8 +108,8 @@ class OBJECT_OT_Bake(bpy.types.Operator):
                 return {"CANCELLED"}
                 
             # Check if this is a deform bone rig or if deform bone serialization is forced
-            use_deform_bone_serialization = is_deform_bone_rig(
-                ao) or context.scene.force_deform_bone_serialization
+            force_deform = getattr(settings, "force_deform_bone_serialization", False)
+            use_deform_bone_serialization = is_deform_bone_rig(ao) or force_deform
             
             serialized = serialize(ao)
             if not serialized:
@@ -148,7 +154,9 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
     @classmethod
     def poll(cls, context):
         # Allow baking if there's a selected armature
-        return context.scene.rbx_anim_armature in bpy.data.objects and bpy.data.objects[context.scene.rbx_anim_armature].type == 'ARMATURE'
+        settings = getattr(context.scene, "rbx_anim_settings", None)
+        arm_name = settings.rbx_anim_armature if settings else None
+        return arm_name in bpy.data.objects and bpy.data.objects[arm_name].type == 'ARMATURE'
 
     def execute(self, context):
         try:
@@ -156,8 +164,10 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
             set_scene_fps(desired_fps)
 
             # Try to use the selected armature first
-            if context.scene.rbx_anim_armature and context.scene.rbx_anim_armature in bpy.data.objects:
-                armature = bpy.data.objects[context.scene.rbx_anim_armature]
+            settings = getattr(context.scene, "rbx_anim_settings", None)
+            arm_name = settings.rbx_anim_armature if settings else None
+            if arm_name and arm_name in bpy.data.objects:
+                armature = bpy.data.objects[arm_name]
                 # Set as active object to ensure serialize() uses it
                 bpy.context.view_layer.objects.active = armature
             else:
@@ -169,8 +179,8 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
                 return {"CANCELLED"}
             
             # Check if this is a deform bone rig or if deform bone serialization is forced
-            use_deform_bone_serialization = is_deform_bone_rig(
-                armature) or context.scene.force_deform_bone_serialization
+            force_deform = getattr(settings, "force_deform_bone_serialization", False)
+            use_deform_bone_serialization = is_deform_bone_rig(armature) or force_deform
             
             serialized = serialize(armature)
             if not serialized:

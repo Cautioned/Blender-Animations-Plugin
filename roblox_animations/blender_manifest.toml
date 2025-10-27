@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 # Roblox Animations Blender Addon Manifest
 id = "roblox_animations_importer_exporter"
-version = "2.0.0"
+version = "2.1.0"
 name = "Roblox Animations Importer/Exporter"
 tagline = "Import Roblox rigs and export animations with live sync"
 maintainer = "Cautioned"
