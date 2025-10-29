@@ -10,37 +10,31 @@ if "%~1"=="" (
 )
 
 set ADDON_NAME=roblox_animations
-set ZIP_NAME_EXTENSION=rbx_anims_%VERSION%.zip
-set ZIP_NAME_LEGACY=rbx_anims_%VERSION%_legacy.zip
+set ZIP_NAME3=rbx_anims_%VERSION%_legacy.zip
+set ZIP_NAME4=rbx_anims_%VERSION%.zip
 
-echo Building zip files without tests...
+echo Building %ZIP_NAME3% and %ZIP_NAME4% without tests...
 
-REM Remove existing zips if they exist
-if exist "%ZIP_NAME_EXTENSION%" del "%ZIP_NAME_EXTENSION%"
-if exist "%ZIP_NAME_LEGACY%" del "%ZIP_NAME_LEGACY%"
+REM Remove existing zip if it exists
+if exist "%ZIP_NAME3%" del "%ZIP_NAME3%"
+if exist "%ZIP_NAME4%" del "%ZIP_NAME4%"
 
-REM Create temporary directories
-if exist "temp_build_extension" rmdir /s /q "temp_build_extension"
-if exist "temp_build_legacy" rmdir /s /q "temp_build_legacy"
-mkdir "temp_build_extension"
-mkdir "temp_build_legacy"
+REM Create temporary directory
+if exist "temp_build" rmdir /s /q "temp_build"
+mkdir "temp_build"
 
 REM Copy addon files excluding tests and cache folders using PowerShell
-powershell -Command "$addonName = '%ADDON_NAME%'; $tempDirExt = 'temp_build_extension'; $tempDirLeg = 'temp_build_legacy'; function ShouldIncludeItem { param([string]$FullName, [string]$Name, [bool]$IsContainer) $excludedNames = @('tests', '__pycache__', '.ruff_cache', '.pytest_cache', '.mypy_cache', '.vscode', '.git', '.idea'); if ($excludedNames -contains $Name) { return $false } if ($FullName -match '[\\/]tests[\\/]' -or $FullName -match '[\\/]__pycache__[\\/]' -or $FullName -match '[\\/]\.ruff_cache[\\/]') { return $false } return $true }; Get-ChildItem -Path $addonName -Recurse | Where-Object { ShouldIncludeItem -FullName $_.FullName -Name $_.Name -IsContainer $_.PSIsContainer } | ForEach-Object { $targetPathExt = $_.FullName -replace \"^$addonName\", \"$tempDirExt\$addonName\"; $targetPathLeg = $_.FullName -replace \"^$addonName\", \"$tempDirLeg\$addonName\"; if ($_.PSIsContainer) { New-Item -ItemType Directory -Path $targetPathExt -Force | Out-Null; New-Item -ItemType Directory -Path $targetPathLeg -Force | Out-Null } else { Copy-Item $_.FullName -Destination $targetPathExt -Force; Copy-Item $_.FullName -Destination $targetPathLeg -Force } }"
+powershell -Command "$addonName = '%ADDON_NAME%'; $tempDir = 'temp_build'; function ShouldIncludeItem { param([string]$FullName, [string]$Name, [bool]$IsContainer) $excludedNames = @('tests', '__pycache__', '.ruff_cache', '.pytest_cache', '.mypy_cache', '.vscode', '.git', '.idea'); if ($excludedNames -contains $Name) { return $false } if ($FullName -match '[\\/]tests[\\/]' -or $FullName -match '[\\/]__pycache__[\\/]' -or $FullName -match '[\\/]\.ruff_cache[\\/]') { return $false } return $true }; Get-ChildItem -Path $addonName -Recurse | Where-Object { ShouldIncludeItem -FullName $_.FullName -Name $_.Name -IsContainer $_.PSIsContainer } | ForEach-Object { $targetPath = $_.FullName -replace \"^$addonName\", \"$tempDir\$addonName\"; if ($_.PSIsContainer) { New-Item -ItemType Directory -Path $targetPath -Force | Out-Null } else { Copy-Item $_.FullName -Destination $targetPath -Force } }"
 
-REM Copy manifest to extension build root (for Blender Extensions 4.2+)
-copy "%ADDON_NAME%\blender_manifest.toml" "temp_build_extension\blender_manifest.toml"
+REM Create zips for both layouts
+REM 1) Blender 3.x: keep roblox_animations as the root folder inside the zip
+powershell -Command "Set-Location 'temp_build'; Compress-Archive -Path 'roblox_animations' -DestinationPath '..\%ZIP_NAME3%'; Set-Location '..'"
 
-REM Create zip for Extensions (Blender 4.2+) - manifest at root, addon folder inside
-powershell -Command "Compress-Archive -Path 'temp_build_extension\*' -DestinationPath '%ZIP_NAME_EXTENSION%'"
-
-REM Create zip for Legacy (Blender 3.4) - just addon folder (no manifest)
-powershell -Command "Compress-Archive -Path 'temp_build_legacy\roblox_animations' -DestinationPath '%ZIP_NAME_LEGACY%'"
+REM 2) Blender 4.x+: place addon contents at the zip root (manifest at top level)
+powershell -Command "Compress-Archive -Path 'temp_build\roblox_animations\*' -DestinationPath '%ZIP_NAME4%'"
 
 REM Clean up
-rmdir /s /q "temp_build_extension"
-rmdir /s /q "temp_build_legacy"
+rmdir /s /q "temp_build"
 
-echo Built %ZIP_NAME_EXTENSION% (for Blender Extensions 4.2+ with manifest)
-echo Built %ZIP_NAME_LEGACY% (for legacy Blender 3.4 without manifest)
+echo Built %ZIP_NAME3% and %ZIP_NAME4% successfully (excluded tests and cache directories)
 pause

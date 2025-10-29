@@ -286,8 +286,13 @@ function MoreTab.create(services: any)
 				},
 				TextInput{
 					LayoutOrder = 3,
+					Text = "https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/",
+				},
+				TextInput{
+					LayoutOrder = 4,
 					Text = "https://github.com/Cautioned/Blender-Animations-Plugin",
 				},
+				
 				
 				Label{
 					LayoutOrder = 5,
