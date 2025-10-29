@@ -151,23 +151,24 @@ local function updateActiveRigFromSelection()
 					return
 				end
 
-				-- Proceed to set the rig only if it is valid and not a KeyframeSequence
-				State.animationLength:set(0)
-				State.animationData = nil
-				State.activeRigExists:set(true)
-				rigManager:clearWarnings()
-				State.loadingEnabled:set(true) -- Enable loading indicator
-				playbackService:stopAnimationAndDisconnect()
-				State.activeRig = selectedObject
-				task.spawn(function()
-					rigManager:setRig(selectedObject)
-				end)
+				if State.activeRigModel ~= selectedObject then
+					-- Proceed to set the rig only if it is valid, not a KeyframeSequence, and different from the current rig
+					State.animationLength:set(0)
+					State.animationData = nil
+					State.activeRigExists:set(true)
+					rigManager:clearWarnings()
+					State.loadingEnabled:set(true) -- Enable loading indicator
+					State.activeRig = selectedObject
+					task.spawn(function()
+						rigManager:setRig(selectedObject)
+					end)
+				end
 				selectedRig = true
 			else
 				cleanupRigSelection()
 			end
 		elseif #selection == 0 then
-			cleanupRigSelection()
+			State.lastSelectionWasKeyframeSequence = false
 		end
 	end
 end
@@ -328,9 +329,17 @@ do -- Creates the plugin
 
     -- load persisted settings (tools/settings toggles)
     local ef = plugin:GetSetting("EnableFileExport")
-    if typeof(ef) == "boolean" then State.enableFileExport:set(ef) end
+    if typeof(ef) == "boolean" then
+        State.enableFileExport:set(ef)
+    else
+        State.enableFileExport:set(true)
+    end
     local ec = plugin:GetSetting("EnableClipboardExport")
-    if typeof(ec) == "boolean" then State.enableClipboardExport:set(ec) end
+    if typeof(ec) == "boolean" then
+        State.enableClipboardExport:set(ec)
+    else
+        State.enableClipboardExport:set(true)
+    end
     local els = plugin:GetSetting("EnableLiveSync")
     if typeof(els) == "boolean" then State.enableLiveSync:set(els) end
     local ac = plugin:GetSetting("AutoConnectToBlender")

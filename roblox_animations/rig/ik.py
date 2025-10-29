@@ -9,7 +9,7 @@ import bpy
 from mathutils import Vector, Matrix
 
 
-def remove_ik_config(ao: 'bpy.types.Object', tail_bone: 'bpy.types.PoseBone') -> None:
+def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") -> None:
     """remove all ik constraints and utility bones for the given chain tail.
 
     this function removes the ik constraint from the tail bone and deletes any
@@ -20,8 +20,7 @@ def remove_ik_config(ao: 'bpy.types.Object', tail_bone: 'bpy.types.PoseBone') ->
         if constraint.target and constraint.subtarget:
             to_clear.append((constraint.target, constraint.subtarget))
         if constraint.pole_target and constraint.pole_subtarget:
-            to_clear.append(
-                (constraint.pole_target, constraint.pole_subtarget))
+            to_clear.append((constraint.pole_target, constraint.pole_subtarget))
 
         tail_bone.constraints.remove(constraint)
 
@@ -30,15 +29,14 @@ def remove_ik_config(ao: 'bpy.types.Object', tail_bone: 'bpy.types.PoseBone') ->
     bpy.ops.object.mode_set(mode="EDIT")
 
     for util_bone in to_clear:
-        util_bone[0].data.edit_bones.remove(
-            util_bone[0].data.edit_bones[util_bone[1]])
+        util_bone[0].data.edit_bones.remove(util_bone[0].data.edit_bones[util_bone[1]])
 
     bpy.ops.object.mode_set(mode="POSE")
 
 
 def create_ik_config(
-    ao: 'bpy.types.Object',
-    tail_bone: 'bpy.types.PoseBone',
+    ao: "bpy.types.Object",
+    tail_bone: "bpy.types.PoseBone",
     chain_count: int,
     create_pose_bone: bool,
     lock_tail: bool,
@@ -52,7 +50,7 @@ def create_ik_config(
 
     # ensure correct active object
     bpy.context.view_layer.objects.active = ao
-    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.object.mode_set(mode="EDIT")
 
     amt = ao.data
     ik_target_src = tail_bone if not lock_tail else (tail_bone.parent or tail_bone)
@@ -65,8 +63,7 @@ def create_ik_config(
     ik_bone = amt.edit_bones.new(ik_name)
     ik_bone.head = ik_target_src.tail
     ik_bone.tail = (
-        Matrix.Translation(ik_bone.head)
-        @ ik_target_src.matrix.to_3x3().to_4x4()
+        Matrix.Translation(ik_bone.head) @ ik_target_src.matrix.to_3x3().to_4x4()
     ) @ Vector((0, 0, -0.5))
     ik_bone.bbone_x *= 1.5
     ik_bone.bbone_z *= 1.5
@@ -96,14 +93,14 @@ def create_ik_config(
         ik_pole.bbone_z *= 0.5
         ik_pole_name = ik_pole.name
 
-    bpy.ops.object.mode_set(mode='POSE')
+    bpy.ops.object.mode_set(mode="POSE")
 
     pose_bone = ao.pose.bones.get(ik_target_bone_name)
     if not pose_bone:
         # fallback: no pose bone found
         return (ik_name, ik_pole_name)
 
-    constraint = pose_bone.constraints.new(type='IK')
+    constraint = pose_bone.constraints.new(type="IK")
     constraint.target = ao
     constraint.subtarget = ik_name
     if create_pose_bone and ik_pole_name:

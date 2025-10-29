@@ -5,9 +5,7 @@ Animation import/export utilities for mapping between different rigs.
 import bpy
 from mathutils import Matrix
 from ..core.utils import (
-    get_scene_fps,
     get_action_fcurves,
-    pose_bone_selected,
     pose_bone_set_selected,
 )
 
@@ -31,7 +29,9 @@ def copy_anim_state_bone(target, source, bone):
         )
 
     # update properties (hacky :p)
-    bpy.ops.anim.keyframe_insert()
+    bone.keyframe_insert(data_path="location")
+    bone.keyframe_insert(data_path="rotation_quaternion")
+    bone.keyframe_insert(data_path="scale")
     bpy.context.scene.frame_set(bpy.context.scene.frame_current)
 
     # now apply on children (which use the parents transform)
@@ -53,7 +53,7 @@ def copy_anim_state(target, source):
     for i in range(bpy.context.scene.frame_start, bpy.context.scene.frame_end + 1):
         bpy.context.scene.frame_set(i)
         copy_anim_state_bone(target, source, root)
-        bpy.ops.anim.keyframe_insert()
+        # Keyframes are already inserted in copy_anim_state_bone
 
 
 def prepare_for_kf_map():
@@ -99,7 +99,9 @@ def apply_ao_transform(ao):
         for i in range(bpy.context.scene.frame_start, bpy.context.scene.frame_end + 1):
             bpy.context.scene.frame_set(i)
             root.matrix = ao.matrix_world @ root_matrix_at[i]
-            bpy.ops.anim.keyframe_insert()
+            root.keyframe_insert(data_path="location")
+            root.keyframe_insert(data_path="rotation_quaternion")
+            root.keyframe_insert(data_path="scale")
 
     # clear non-pose fcurves
     fcurves = get_action_fcurves(ao.animation_data.action)

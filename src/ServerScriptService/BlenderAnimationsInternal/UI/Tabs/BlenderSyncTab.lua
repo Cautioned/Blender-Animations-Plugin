@@ -389,80 +389,56 @@ function BlenderSyncTab.create(services: any)
 			},
 		}),
 		VerticalCollapsibleSection({
-			Text = "Legacy Import",
+			Text = "Bone Toggles",
 			Collapsed = false,
-			LayoutOrder = 1,
-			[Children] = {
-				MainButton({
-					Text = "Import Animation from Clipboard",
-					Size = UDim2.new(1, 0, 0, 30),
-					Enabled = Computed(function()
-						return State.activeRigExists:get() and State.enableClipboardExport:get()
-					end),
-					Activated = function(): nil
-						services.playbackService:stopAnimationAndDisconnect()
-						local importScriptText = "Paste the animation data below this line"
+			LayoutOrder = 2,
+			Visible = State.activeRigExists,
+			[Children] = Computed(function()
+				local boneWeights = State.boneWeights:get()
+				local boneToggles = {}
 
-						services.exportManager:clearMetaParts()
-						if State.importScript then
-							State.importScript:Destroy()
-						end
-						State.importScript = Instance.new("Script", game.Workspace)
-						assert(State.importScript)
-						State.importScript.Archivable = false
-                        State.importScript.Source = "-- " .. importScriptText .. "\n"
-                        if Plugin then
-                            Plugin:OpenScript(State.importScript, 2)
-                        end
-						local tempConnection: RBXScriptConnection
-						tempConnection = State.importScript.Changed:Connect(function(prop)
-							if prop == "Source" then
-								tempConnection:Disconnect()
-								if State.importScript then
-									local animData = select(
-										3,
-										string.find(
-											State.importScript.Source,
-											"^%-%- " .. importScriptText .. "\n(.*)$"
-										)
-									)
-									State.importScript:Destroy()
-									State.importScript = nil
-									if animData then
-										services.animationManager:loadAnimDataFromText(animData, false)
+				for i, bone in ipairs(boneWeights) do
+					-- Create indented text based on depth
+					local indentText = string.rep("  ", bone.depth) .. bone.name
+					table.insert(boneToggles, Checkbox({
+						Value = bone.enabled,
+						Text = indentText,
+						LayoutOrder = i,
+						OnChange = function(enabled: boolean)
+							-- Update the bone weight
+							bone.enabled = enabled
+							State.boneWeights:set(boneWeights) -- Trigger reactivity
+
+							-- Update the rig animation if it exists
+							if State.activeRig and State.activeRig.bones then
+								-- Find the rig bone by name more reliably
+								local rigBone = State.activeRig.bones[bone.name]
+								if rigBone then
+									rigBone.enabled = enabled
+								else
+									-- Fallback: search by part name
+									for _, rb in pairs(State.activeRig.bones) do
+										if rb.part.Name == bone.name then
+											rb.enabled = enabled
+											break
+										end
 									end
 								end
+								
+								-- Reload the animation to see the effect immediately
+								if services.playbackService then
+									services.playbackService:stopAnimationAndDisconnect()
+									services.playbackService:playCurrentAnimation(State.activeAnimator)
+								end
 							end
-						end)
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						legacyImportHint:set("Opens a script editor. Paste animation data from the clipboard to import.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						legacyImportHint:set("")
-					end,
-				}) :: any,
-				
-				MainButton({
-					Text = "Import Animation from File(s)",
-					Size = UDim2.new(1, 0, 0, 30),
-					Enabled = Computed(function()
-						return State.activeRigExists:get() and State.enableFileExport:get()
-					end),
-					Activated = function(): nil
-						services.animationManager:importAnimationsBulk()
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						legacyImportHint:set("Opens a file dialog to import multiple .rbxanim files at once.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						legacyImportHint:set("")
-					end,
-				}) :: any,
-			},
+						end,
+					}))
+				end
+
+				return boneToggles
+			end),
 		}),
+		
 	}
 	
 end

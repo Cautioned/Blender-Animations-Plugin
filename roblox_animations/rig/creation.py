@@ -7,7 +7,12 @@ import re
 import bpy
 from mathutils import Vector, Matrix
 from ..core.constants import get_transform_to_blender
-from ..core.utils import cf_to_mat, get_unique_name, find_master_collection_for_object, find_parts_collection_in_master
+from ..core.utils import (
+    cf_to_mat,
+    get_unique_name,
+    find_master_collection_for_object,
+    find_parts_collection_in_master,
+)
 
 
 def _matrix_to_idprop(value):
@@ -41,7 +46,8 @@ def autoname_parts(partnames, basename, objects_to_rename):
                     object.name = partnames[index - 1]
                 else:
                     print(
-                        f"Warning: Index {index} out of range for partnames list (length: {len(partnames)})")
+                        f"Warning: Index {index} out of range for partnames list (length: {len(partnames)})"
+                    )
             except Exception as e:
                 print(f"Error renaming part {object.name}: {str(e)}")
 
@@ -89,14 +95,12 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
         if rigging_type != "RAW":  # If so, apply some transform
             if len(rigsubdef["children"]) == 1:
                 nextmat = cf_to_mat(rigsubdef["children"][0]["transform"])
-                nextmat1 = cf_to_mat(
-                    rigsubdef["children"][0]["jointtransform1"])
+                nextmat1 = cf_to_mat(rigsubdef["children"][0]["jointtransform1"])
                 next_joint_pos = (t2b @ (nextmat @ nextmat1)).to_translation()
 
                 if rigging_type == "CONNECT":  # Instantly connect
                     bone.tail = next_joint_pos
                 else:
-                    axis = "y"
                     if rigging_type == "LOCAL_AXIS_EXTEND":  # Allow non-Y too
                         invtrf = pre_mat.inverted() * next_joint_pos
                         bestdist = abs(invtrf.y)
@@ -104,9 +108,6 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
                             dist = abs(getattr(invtrf, paxis))
                             if dist > bestdist:
                                 bestdist = dist
-                                axis = paxis
-
-                    next_connect_to_parent = True
 
                     ppd_nr_dir = real_tail - bone.head
                     ppd_nr_dir.normalize()
@@ -143,9 +144,10 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
             if obj.name.startswith(aux_name):
                 found_obj = obj
                 break
-        
+
         if found_obj:
             from .constraints import link_object_to_bone_rigid
+
             link_object_to_bone_rigid(found_obj, ao, bone)
 
     # handle child bones
@@ -157,10 +159,10 @@ def create_rig(rigging_type, rig_meta_obj_name):
     """Create a complete rig from metadata"""
     # Ensure a clean slate by deselecting everything
     if bpy.ops.object.select_all.poll():
-        bpy.ops.object.select_all(action='DESELECT')
+        bpy.ops.object.select_all(action="DESELECT")
 
     # Ensure we are in object mode
-    if bpy.context.active_object and bpy.context.mode != 'OBJECT':
+    if bpy.context.active_object and bpy.context.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
 
     rig_meta_obj = bpy.data.objects.get(rig_meta_obj_name)
@@ -171,19 +173,23 @@ def create_rig(rigging_type, rig_meta_obj_name):
     # Find the master collection and parts collection for the meta object
     master_collection = find_master_collection_for_object(rig_meta_obj)
     if not master_collection:
-        raise ValueError(f"Could not find a master collection for rig meta object '{rig_meta_obj_name}'.")
+        raise ValueError(
+            f"Could not find a master collection for rig meta object '{rig_meta_obj_name}'."
+        )
         return
 
     parts_collection = find_parts_collection_in_master(master_collection)
     if not parts_collection:
-        raise ValueError(f"Could not find a 'Parts' collection inside '{master_collection.name}'.")
+        raise ValueError(
+            f"Could not find a 'Parts' collection inside '{master_collection.name}'."
+        )
         return
 
     # --- Deletion of old Armature ---
     # Find and delete any existing armature within this rig's master collection
     old_armature = None
     for obj in master_collection.objects:
-        if obj.type == 'ARMATURE':
+        if obj.type == "ARMATURE":
             old_armature = obj
             break
 
@@ -195,8 +201,7 @@ def create_rig(rigging_type, rig_meta_obj_name):
 
     meta_loaded = json.loads(rig_meta_obj["RigMeta"])
 
-    bpy.ops.object.add(type="ARMATURE", enter_editmode=True,
-                       location=(0, 0, 0))
+    bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
     ao = bpy.context.object
     ao.show_in_front = True
 
@@ -206,8 +211,8 @@ def create_rig(rigging_type, rig_meta_obj_name):
     master_collection.objects.link(ao)
 
     # Set a unique name for the armature based on the rig name
-    rig_name = meta_loaded.get('rigName', 'Rig')
-    ao.name = get_unique_name(f"{rig_name}_Armature")
+    rig_name = meta_loaded.get("rigName", "Rig")
+    ao.name = get_unique_name(f"__{rig_name}_Armature")
     amt = ao.data
     amt.name = get_unique_name(f"__{rig_name}_RigArm")
     amt.show_axes = True

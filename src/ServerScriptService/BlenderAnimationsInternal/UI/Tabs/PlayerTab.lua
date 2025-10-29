@@ -37,7 +37,7 @@ function PlayerTab.create(services: any)
 		SharedComponents.createHeaderUI(),
 		PlaybackControls.createPlaybackSection(services),
 		VerticalCollapsibleSection({
-			Text = "Import",
+			Text = "Legacy Import",
 			Collapsed = false,
 			LayoutOrder = 1,
 			Visible = Computed(function()
@@ -120,6 +120,10 @@ function PlayerTab.create(services: any)
 					TextWrapped = true,
 					Visible = true,
 					TextTransparency = 0,
+				}),
+				Label({
+					Text = "Using the Blender Sync tab is recommended for additional features, file and clipboard import will continue to be supported but may lack features in the future.",
+					LayoutOrder = 4,
 				}),
 			},
 		}),
@@ -337,18 +341,36 @@ function PlayerTab.create(services: any)
 						Text = indentText,
 						LayoutOrder = i,
 						OnChange = function(enabled: boolean)
+							print("Bone toggle changed:", bone.name, "enabled:", enabled)
 							-- Update the bone weight
 							bone.enabled = enabled
 							State.boneWeights:set(boneWeights) -- Trigger reactivity
 
 							-- Update the rig animation if it exists
 							if State.activeRig and State.activeRig.bones then
-								for _, rigBone in pairs(State.activeRig.bones) do
-									if rigBone.part.Name == bone.name then
-										rigBone.enabled = enabled
-										break
+								-- Find the rig bone by name more reliably
+								local rigBone = State.activeRig.bones[bone.name]
+								if rigBone then
+									rigBone.enabled = enabled
+									print("Updated rig bone:", bone.name, "enabled:", enabled)
+								else
+									-- Fallback: search by part name
+									for _, rb in pairs(State.activeRig.bones) do
+										if rb.part.Name == bone.name then
+											rb.enabled = enabled
+											print("Updated rig bone (fallback):", bone.name, "enabled:", enabled)
+											break
+										end
 									end
 								end
+								
+								-- Reload the animation to see the effect immediately
+								if services.playbackService then
+									services.playbackService:stopAnimationAndDisconnect()
+									services.playbackService:playCurrentAnimation(State.activeAnimator)
+								end
+							else
+								print("No active rig or bones found")
 							end
 						end,
 					}))

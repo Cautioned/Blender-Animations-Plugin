@@ -3,9 +3,11 @@ Constraint management operators for linking objects to bones.
 """
 
 import bpy
-from bpy.types import Operator
-from ..rig.constraints import auto_constraint_parts, manual_constraint_parts
-from ..core.utils import find_master_collection_for_object, find_parts_collection_in_master
+from ..rig.constraints import auto_constraint_parts
+from ..core.utils import (
+    find_master_collection_for_object,
+    find_parts_collection_in_master,
+)
 
 
 class OBJECT_OT_AutoConstraint(bpy.types.Operator):
@@ -23,78 +25,92 @@ class OBJECT_OT_AutoConstraint(bpy.types.Operator):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         armature_name = settings.rbx_anim_armature if settings else None
         success, message = auto_constraint_parts(armature_name)
-        
+
         if success:
-            self.report({'INFO'}, message)
+            self.report({"INFO"}, message)
         else:
-            self.report({'ERROR'}, message)
-            
-        return {'FINISHED' if success else 'CANCELLED'}
+            self.report({"ERROR"}, message)
+
+        return {"FINISHED" if success else "CANCELLED"}
 
 
 class OBJECT_OT_ManualConstraint(bpy.types.Operator):
     bl_idname = "object.rbxanims_manualconstraint"
     bl_label = "Manual Part Constraints"
     bl_description = "Manually constrain mesh parts to bones in a list UI. Mesh must be placed in the Parts collection to show up in the list."
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {"REGISTER", "UNDO"}
 
     # Use a simpler property structure to avoid registration issues
     bone_names: bpy.props.CollectionProperty(type=bpy.types.PropertyGroup)
     mesh_names: bpy.props.CollectionProperty(type=bpy.types.PropertyGroup)
-    
+
     def get_available_objects(self, context):
         """Get objects that are available for constraining (not in other _Parts collections)"""
         settings = getattr(context.scene, "rbx_anim_settings", None)
-        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        armature = (
+            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        )
         if not armature:
             return []
-            
+
         collection_name = f"{armature.name}_Parts"
         available_objects = []
-        
+
         for obj in context.view_layer.objects:
-            if obj.type == 'MESH':
+            if obj.type == "MESH":
                 # Skip objects that are already in other _Parts collections
-                if any(col.name.endswith('_Parts') and col.name != collection_name for col in obj.users_collection):
+                if any(
+                    col.name.endswith("_Parts") and col.name != collection_name
+                    for col in obj.users_collection
+                ):
                     continue
                 available_objects.append(obj)
-        
+
         return available_objects
 
     @classmethod
     def poll(cls, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
-        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
-        return armature and armature.type == 'ARMATURE'
+        armature = (
+            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        )
+        return armature and armature.type == "ARMATURE"
 
     def get_parts_collection(self, context):
         """Safely get the parts collection for the currently selected armature."""
         settings = getattr(context.scene, "rbx_anim_settings", None)
-        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        armature = (
+            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        )
         if not armature:
             return None
-        
+
         master_collection = find_master_collection_for_object(armature)
         return find_parts_collection_in_master(master_collection)
 
     def invoke(self, context, event):
         self.bone_names.clear()
         self.mesh_names.clear()
-        
+
         settings = getattr(context.scene, "rbx_anim_settings", None)
-        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        armature = (
+            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        )
         parts_collection = self.get_parts_collection(context)
 
         if not parts_collection:
-            self.report({'ERROR'}, "Could not find 'Parts' collection for the selected armature.")
-            return {'CANCELLED'}
-        
+            self.report(
+                {"ERROR"},
+                "Could not find 'Parts' collection for the selected armature.",
+            )
+            return {"CANCELLED"}
+
         # Create a reverse map of currently constrained objects {object_name: bone_name}
         constrained_map = {}
         for obj in parts_collection.objects:
-             if obj.type == 'MESH':
+            if obj.type == "MESH":
                 for c in obj.constraints:
-                    if c.type == 'CHILD_OF' and c.target == armature:
+                    if c.type == "CHILD_OF" and c.target == armature:
                         constrained_map[obj.name] = c.subtarget
                         break
 
@@ -102,7 +118,7 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
         for bone in armature.data.bones:
             bone_item = self.bone_names.add()
             bone_item.name = bone.name
-            
+
             mesh_item = self.mesh_names.add()
             mesh_item.name = ""
 
@@ -122,10 +138,10 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
         header.label(text="Constrained Mesh Part")
 
         box = layout.box()
-        
+
         parts_collection = self.get_parts_collection(context)
         if not parts_collection:
-            box.label(text="Parts collection not found!", icon='ERROR')
+            box.label(text="Parts collection not found!", icon="ERROR")
             return
 
         for i, bone_item in enumerate(self.bone_names):
@@ -133,17 +149,23 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
                 row = box.row()
                 row.label(text=bone_item.name)
                 # Use prop_search, but limit its search context to the rig's parts_collection
-                row.prop_search(self.mesh_names[i], "name", parts_collection, "objects", text="")
+                row.prop_search(
+                    self.mesh_names[i], "name", parts_collection, "objects", text=""
+                )
 
     def execute(self, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
-        armature = bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        armature = (
+            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+        )
         master_collection = find_master_collection_for_object(armature)
-        parts_collection = find_parts_collection_in_master(master_collection, create_if_missing=True)
+        parts_collection = find_parts_collection_in_master(
+            master_collection, create_if_missing=True
+        )
 
         if not parts_collection:
-            self.report({'ERROR'}, "Could not find 'Parts' collection to execute on.")
-            return {'CANCELLED'}
+            self.report({"ERROR"}, "Could not find 'Parts' collection to execute on.")
+            return {"CANCELLED"}
 
         # 1. Get the final desired state from the UI
         new_assignments = {}
@@ -154,26 +176,26 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
                     if mesh_obj.name not in parts_collection.objects:
                         parts_collection.objects.link(mesh_obj)
                     for col in list(mesh_obj.users_collection):
-                        if col != parts_collection and col.name.endswith('_Parts'):
+                        if col != parts_collection and col.name.endswith("_Parts"):
                             col.objects.unlink(mesh_obj)
                     new_assignments[mesh_obj] = bone_item.name
 
         # 2. Update constraints for all objects within this rig's parts collection
         for obj in parts_collection.objects:
-            if obj.type != 'MESH':
+            if obj.type != "MESH":
                 continue
 
             # First, remove any existing CHILD_OF constraint that targets this armature
             for c in obj.constraints:
-                if c.type == 'CHILD_OF' and c.target == armature:
+                if c.type == "CHILD_OF" and c.target == armature:
                     obj.constraints.remove(c)
-            
+
             # Now, if this object is in our new assignment list, add the new constraint
             if obj in new_assignments:
                 bone_name = new_assignments[obj]
-                constraint = obj.constraints.new(type='CHILD_OF')
+                constraint = obj.constraints.new(type="CHILD_OF")
                 constraint.target = armature
                 constraint.subtarget = bone_name
 
-        self.report({'INFO'}, "Constraints updated.")
-        return {'FINISHED'}
+        self.report({"INFO"}, "Constraints updated.")
+        return {"FINISHED"}

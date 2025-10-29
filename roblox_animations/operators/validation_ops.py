@@ -16,7 +16,6 @@ from typing import Dict, List, Tuple, Set
 
 from ..animation.serialization import is_deform_bone_rig
 from ..core.utils import get_scene_fps
-from mathutils import Quaternion
 import math
 
 
@@ -24,7 +23,9 @@ import math
 _violation_draw_handler = None  # lines
 _violation_label_draw_handler = None  # labels
 _keyframe_points_draw_handler = None  # keyframe markers
-_violation_segments: List[Tuple[Vector, Vector, int, str, bool, bool]] = []  # (start, end, frame, bone_name, key_prev, key_curr)
+_violation_segments: List[
+    Tuple[Vector, Vector, int, str, bool, bool]
+] = []  # (start, end, frame, bone_name, key_prev, key_curr)
 _bone_color_cache: Dict[str, Tuple[float, float, float, float]] = {}
 _armature_name_for_cache: str = ""
 _keyframe_points: List[Tuple[Vector, str, int]] = []  # (location, bone_name, frame)
@@ -36,7 +37,9 @@ ANIM_MAX_DELTA = 1.0  # studs per frame
 ANIM_FPS = 30.0  # target fps
 
 
-def _get_bone_display_color(pbone: "bpy.types.PoseBone") -> Tuple[float, float, float, float]:
+def _get_bone_display_color(
+    pbone: "bpy.types.PoseBone",
+) -> Tuple[float, float, float, float]:
     group = getattr(pbone, "bone_group", None)
     if group is not None:
         colors = getattr(group, "colors", None)
@@ -49,6 +52,7 @@ def _get_bone_display_color(pbone: "bpy.types.PoseBone") -> Tuple[float, float, 
                 pass
     # fallback deterministic color from name
     import random
+
     rnd = random.Random(hash(pbone.name) & 0xFFFFFFFF)
     r, g, b = rnd.random(), rnd.random(), rnd.random()
     return (r * 0.8 + 0.2, g * 0.8 + 0.2, b * 0.8 + 0.2, 1.0)
@@ -88,7 +92,7 @@ def _draw_motionpath_violations():
     if arm_name != _armature_name_for_cache or not _bone_color_cache:
         _bone_color_cache.clear()
         arm = bpy.data.objects.get(arm_name)
-        if arm and arm.type == 'ARMATURE':
+        if arm and arm.type == "ARMATURE":
             for pb in arm.pose.bones:
                 _bone_color_cache[pb.name] = _get_bone_display_color(pb)
         _armature_name_for_cache = arm_name
@@ -152,7 +156,12 @@ def _draw_motionpath_keyframes():
         if pbone is not None:
             bc = _get_bone_display_color(pbone)
             # slightly brighter for visibility
-            color = (min(1.0, bc[0] + 0.25), min(1.0, bc[1] + 0.25), min(1.0, bc[2] + 0.25), 1.0)
+            color = (
+                min(1.0, bc[0] + 0.25),
+                min(1.0, bc[1] + 0.25),
+                min(1.0, bc[2] + 0.25),
+                1.0,
+            )
         batch = batch_for_shader(shader, "POINTS", {"pos": pts})
         shader.bind()
         shader.uniform_float("color", color)
@@ -206,7 +215,12 @@ def _draw_motionpath_labels():
         # draw keyframe markers as bullets at endpoints
         # compute endpoints in 2d
         bc = _bone_color_cache.get(bone_name, (1.0, 0.0, 0.0, 1.0))
-        bcol = (min(1.0, bc[0] + 0.2), min(1.0, bc[1] + 0.2), min(1.0, bc[2] + 0.2), 1.0)
+        bcol = (
+            min(1.0, bc[0] + 0.2),
+            min(1.0, bc[1] + 0.2),
+            min(1.0, bc[2] + 0.2),
+            1.0,
+        )
 
         start2d = view3d_utils.location_3d_to_region_2d(region, rv3d, start)
         end2d = view3d_utils.location_3d_to_region_2d(region, rv3d, end)
@@ -251,55 +265,70 @@ def _validate_animation_duration(scene, fps: float) -> List[str]:
     """Validate animation duration against Roblox limits."""
     warnings = []
     duration = (scene.frame_end - scene.frame_start + 1) / fps
-    
+
     if duration > ANIM_MAX_DURATION:
-        warnings.append(f"Animation duration {duration:.2f}s exceeds Roblox limit of {ANIM_MAX_DURATION}s")
-    
+        warnings.append(
+            f"Animation duration {duration:.2f}s exceeds Roblox limit of {ANIM_MAX_DURATION}s"
+        )
+
     return warnings
 
 
-def _validate_bounds(positions: Dict[str, Vector], root_pos: Vector, scale: float) -> List[Tuple[str, str]]:
+def _validate_bounds(
+    positions: Dict[str, Vector], root_pos: Vector, scale: float
+) -> List[Tuple[str, str]]:
     """Validate bone positions against bounds from root."""
     violations = []
-    
+
     for bone_name, pos in positions.items():
         offset = root_pos - pos
         distance = offset.length / scale
-        
+
         if distance > ANIM_MAX_BOUNDS:
-            violations.append((bone_name, f"Bone '{bone_name}' is {distance:.2f} studs from root (max: {ANIM_MAX_BOUNDS})"))
-    
+            violations.append(
+                (
+                    bone_name,
+                    f"Bone '{bone_name}' is {distance:.2f} studs from root (max: {ANIM_MAX_BOUNDS})",
+                )
+            )
+
     return violations
 
 
-def _validate_rotation_constraints(armature_obj: "bpy.types.Object", evaluated_obj: "bpy.types.Object") -> List[str]:
+def _validate_rotation_constraints(
+    armature_obj: "bpy.types.Object", evaluated_obj: "bpy.types.Object"
+) -> List[str]:
     """Validate bone rotations for proper constraints."""
     warnings = []
-    
+
     for pbone in evaluated_obj.pose.bones:
         # Check for extreme rotations that might cause issues
         rot = pbone.rotation_quaternion
-        
+
         # Check for NaN or infinite values
         if any(math.isnan(x) or math.isinf(x) for x in rot):
             warnings.append(f"Bone '{pbone.name}' has invalid rotation (NaN/Inf)")
             continue
-        
+
         # Check for extreme rotation angles (more than 180 degrees in any axis)
         euler = rot.to_euler()
         max_angle = max(abs(euler.x), abs(euler.y), abs(euler.z))
-        
+
         if max_angle > math.pi:  # 180 degrees
-            warnings.append(f"Bone '{pbone.name}' has extreme rotation: {math.degrees(max_angle):.1f}°")
-        
+            warnings.append(
+                f"Bone '{pbone.name}' has extreme rotation: {math.degrees(max_angle):.1f}°"
+            )
+
         # Check for gimbal lock conditions
         if abs(rot.w) < 0.1:  # Very small w component indicates near gimbal lock
             warnings.append(f"Bone '{pbone.name}' may be experiencing gimbal lock")
-    
+
     return warnings
 
 
-def _collect_bone_world_head(armature_obj: "bpy.types.Object", evaluated_obj: "bpy.types.Object") -> Dict[str, Vector]:
+def _collect_bone_world_head(
+    armature_obj: "bpy.types.Object", evaluated_obj: "bpy.types.Object"
+) -> Dict[str, Vector]:
     """return world-space head positions for relevant bones on the evaluated armature."""
     positions: Dict[str, Vector] = {}
     # determine which bones to include
@@ -324,9 +353,7 @@ def _collect_bone_world_head(armature_obj: "bpy.types.Object", evaluated_obj: "b
 class OBJECT_OT_ValidateMotionPaths(Operator):
     bl_label = "Validate Motion Paths (Roblox)"
     bl_idname = "object.rbxanims_validate_motionpaths"
-    bl_description = (
-        "check per-frame world displacement of limbs against the max studs/frame and draw violations"
-    )
+    bl_description = "check per-frame world displacement of limbs against the max studs/frame and draw violations"
 
     @classmethod
     def poll(cls, context):
@@ -336,7 +363,12 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         return bool(obj and obj.type == "ARMATURE")
 
     def execute(self, context):
-        global _violation_segments, _violation_draw_handler, _violation_label_draw_handler, _keyframe_points, _keyframe_points_draw_handler
+        global \
+            _violation_segments, \
+            _violation_draw_handler, \
+            _violation_label_draw_handler, \
+            _keyframe_points, \
+            _keyframe_points_draw_handler
 
         scene = context.scene
         settings = getattr(scene, "rbx_anim_settings", None)
@@ -348,7 +380,10 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
 
         depsgraph = context.evaluated_depsgraph_get()
         fps = get_scene_fps()
-        max_studs = getattr(settings, "rbx_max_studs_per_frame", ANIM_MAX_DELTA) or ANIM_MAX_DELTA
+        max_studs = (
+            getattr(settings, "rbx_max_studs_per_frame", ANIM_MAX_DELTA)
+            or ANIM_MAX_DELTA
+        )
 
         force_deform = getattr(settings, "force_deform_bone_serialization", False)
         deform_scale = getattr(settings, "rbx_deform_rig_scale", 1.0)
@@ -364,11 +399,11 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         # Comprehensive validation checks
         all_warnings = []
         all_violations = []
-        
+
         # 1. Duration validation
         duration_warnings = _validate_animation_duration(scene, fps)
         all_warnings.extend(duration_warnings)
-        
+
         # 2. Get root position for bounds checking
         root_pos = None
         if armature.parent:
@@ -387,6 +422,7 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         if action is not None:
             import re
             from ..core.utils import get_action_fcurves
+
             fcurves = get_action_fcurves(action)
             for fcurve in fcurves:
                 if not fcurve.data_path.startswith("pose.bones"):
@@ -427,7 +463,9 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
                         frames = bone_keyframes.get(bone_name, set())
                         key_prev = (f - 1) in frames
                         key_curr = f in frames
-                        _violation_segments.append((prev.copy(), pos.copy(), f, bone_name, key_prev, key_curr))
+                        _violation_segments.append(
+                            (prev.copy(), pos.copy(), f, bone_name, key_prev, key_curr)
+                        )
                         total_violations += 1
                         self.report(
                             {"WARNING"},
@@ -457,26 +495,26 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         settings = getattr(scene, "rbx_anim_settings", None)
         if settings:
             setattr(settings, "rbx_show_motionpath_validation", True)
-        
+
         # Summary report
         total_warnings = len(all_warnings)
         total_bounds_violations = len(all_violations)
-        
+
         summary_msg = f"Validation complete: {total_violations} motion violations"
         if total_warnings > 0:
             summary_msg += f", {total_warnings} warnings"
         if total_bounds_violations > 0:
             summary_msg += f", {total_bounds_violations} bounds violations"
-        
+
         self.report({"INFO"}, summary_msg)
-        
+
         # Log detailed warnings to console
         if all_warnings:
             print("=== ANIMATION VALIDATION WARNINGS ===")
             for warning in all_warnings:
                 print(f"WARNING: {warning}")
             print("=====================================")
-        
+
         return {"FINISHED"}
 
 
@@ -486,25 +524,36 @@ class OBJECT_OT_ClearMotionPathValidation(Operator):
     bl_description = "remove validation overlay and clear cached violations"
 
     def execute(self, context):
-        global _violation_segments, _violation_draw_handler, _violation_label_draw_handler, _keyframe_points, _keyframe_points_draw_handler
+        global \
+            _violation_segments, \
+            _violation_draw_handler, \
+            _violation_label_draw_handler, \
+            _keyframe_points, \
+            _keyframe_points_draw_handler
 
         _violation_segments = []
         _keyframe_points = []
         if _violation_draw_handler is not None:
             try:
-                bpy.types.SpaceView3D.draw_handler_remove(_violation_draw_handler, "WINDOW")
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    _violation_draw_handler, "WINDOW"
+                )
             except Exception:
                 pass
             _violation_draw_handler = None
         if _violation_label_draw_handler is not None:
             try:
-                bpy.types.SpaceView3D.draw_handler_remove(_violation_label_draw_handler, "WINDOW")
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    _violation_label_draw_handler, "WINDOW"
+                )
             except Exception:
                 pass
             _violation_label_draw_handler = None
         if _keyframe_points_draw_handler is not None:
             try:
-                bpy.types.SpaceView3D.draw_handler_remove(_keyframe_points_draw_handler, "WINDOW")
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    _keyframe_points_draw_handler, "WINDOW"
+                )
             except Exception:
                 pass
             _keyframe_points_draw_handler = None
@@ -524,7 +573,12 @@ __all__ = [
 
 def cleanup_validation_draw_handlers():
     """remove any active validation draw handlers and clear cache; safe on reload/unregister."""
-    global _violation_segments, _violation_draw_handler, _violation_label_draw_handler, _keyframe_points, _keyframe_points_draw_handler
+    global \
+        _violation_segments, \
+        _violation_draw_handler, \
+        _violation_label_draw_handler, \
+        _keyframe_points, \
+        _keyframe_points_draw_handler
     _violation_segments = []
     _keyframe_points = []
     if _violation_draw_handler is not None:
@@ -535,15 +589,17 @@ def cleanup_validation_draw_handlers():
         _violation_draw_handler = None
     if _violation_label_draw_handler is not None:
         try:
-            bpy.types.SpaceView3D.draw_handler_remove(_violation_label_draw_handler, "WINDOW")
+            bpy.types.SpaceView3D.draw_handler_remove(
+                _violation_label_draw_handler, "WINDOW"
+            )
         except Exception:
             pass
         _violation_label_draw_handler = None
     if _keyframe_points_draw_handler is not None:
         try:
-            bpy.types.SpaceView3D.draw_handler_remove(_keyframe_points_draw_handler, "WINDOW")
+            bpy.types.SpaceView3D.draw_handler_remove(
+                _keyframe_points_draw_handler, "WINDOW"
+            )
         except Exception:
             pass
         _keyframe_points_draw_handler = None
-
-

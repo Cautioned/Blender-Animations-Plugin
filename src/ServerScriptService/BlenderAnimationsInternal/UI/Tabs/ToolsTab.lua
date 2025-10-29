@@ -141,11 +141,24 @@ function ToolsTab.create(services: any)
 
 								-- Update the rig animation if it exists
 								if State.activeRig and State.activeRig.bones then
-									for _, rigBone in pairs(State.activeRig.bones) do
-										if rigBone.part.Name == bone.name then
-											rigBone.enabled = enabled
-											break
+									-- Find the rig bone by name more reliably
+									local rigBone = State.activeRig.bones[bone.name]
+									if rigBone then
+										rigBone.enabled = enabled
+									else
+										-- Fallback: search by part name
+										for _, rb in pairs(State.activeRig.bones) do
+											if rb.part.Name == bone.name then
+												rb.enabled = enabled
+												break
+											end
 										end
+									end
+									
+									-- Reload the animation to see the effect immediately
+									if services.playbackService then
+										services.playbackService:stopAnimationAndDisconnect()
+										services.playbackService:playCurrentAnimation(State.activeAnimator)
 									end
 								end
 							end,

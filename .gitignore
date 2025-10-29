@@ -24,6 +24,9 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+.ruff_cache
+.pytest_cache
+.mypy_cache
 
 # OS specific
 .DS_Store

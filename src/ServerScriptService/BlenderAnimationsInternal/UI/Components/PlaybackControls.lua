@@ -11,6 +11,7 @@ local OnChange = Fusion.OnChange
 local OnEvent = Fusion.OnEvent
 local Value = Fusion.Value
 local Computed = Fusion.Computed
+local Observer = Fusion.Observer
 
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local Checkbox = require(StudioComponents.Checkbox)
@@ -24,6 +25,15 @@ local themeProvider = require(StudioComponentsUtil.themeProvider)
 local PlaybackControls = {}
 
 function PlaybackControls.createPlaybackScrubber(services: any)
+	local sliderValue = Value(0)
+	
+	-- sync slider value with playhead when not being dragged
+	local cleanupPlayheadObserver = Observer(State.playhead):onChange(function()
+		if not State.userChangingSlider:get() then
+			sliderValue:set(State.playhead:get())
+		end
+	end)
+	
 	return New("Frame")({
 		Size = UDim2.new(1, 0, 0, 25),
 		BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
@@ -39,10 +49,7 @@ function PlaybackControls.createPlaybackScrubber(services: any)
 				Step = 0.01,
 				Min = 0,
 				Max = State.animationLength,
-				Value = Computed(function()
-					local playhead = State.playhead:get()
-					return math.floor(playhead * 100) / 100
-				end),
+				Value = sliderValue,
 				OnChange = function(value)
 					State.playhead:set(value)
 					if services and services.playbackService then
@@ -114,9 +121,14 @@ function PlaybackControls.createPlaybackSection(services: any, layoutOrder: numb
 						ImageColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
 						LayoutOrder = 1,
 						[OnEvent("Activated")] = function()
-							State.isPlaying:set(false)
 							if services and services.playbackService then
 								services.playbackService:seekAnimationToTime(0)
+								State.isPlaying:set(false)
+								-- Stop the animation track to prevent it from continuing
+								if services.playbackService.State.currentAnimTrack then
+									(services.playbackService.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
+								end
+								services.playbackService:updateUI()
 							end
 						end,
 					}),
@@ -151,9 +163,21 @@ function PlaybackControls.createPlaybackSection(services: any, layoutOrder: numb
 						ImageColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
 						LayoutOrder = 4,
 						[OnEvent("Activated")] = function()
-							State.isPlaying:set(false)
 							if services and services.playbackService then
-								services.playbackService:seekAnimationToTime(State.animationLength:get() - 0.001)
+								-- Use the actual animation track length for accurate seeking
+								local animLength = 0
+								if services.playbackService.State.currentAnimTrack then
+									animLength = (services.playbackService.State.currentAnimTrack :: AnimationTrack).Length
+								else
+									animLength = State.animationLength:get()
+								end
+								services.playbackService:seekAnimationToTime(animLength - 0.001)
+								State.isPlaying:set(false)
+								-- Stop the animation track to prevent it from continuing
+								if services.playbackService.State.currentAnimTrack then
+									(services.playbackService.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
+								end
+								services.playbackService:updateUI()
 							end
 						end,
 					}),

@@ -88,8 +88,8 @@ local State = {
     boneWeights = Value({} :: Types.BoneWeightsList),
 
     -- Settings
-    enableFileExport = Value(false),
-    enableClipboardExport = Value(false),
+    enableFileExport = Value(true),
+    enableClipboardExport = Value(true),
     enableLiveSync = Value(false),
     autoConnectToBlender = Value(false),
     showDebugInfo = Value(true),

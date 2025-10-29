@@ -13,6 +13,7 @@ export type RigPart = {
 	enabled: boolean,
 	isDeformRig: boolean,
 	isDeformBone: boolean,
+	jointParentIsPart0: boolean,
 }
 
 local RigPart = {}
@@ -22,7 +23,7 @@ local Pose = require(script.Parent.Pose)
 
 
 
-function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolean)
+function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolean, connectingJoint: Motor6D?)
 	local self: RigPart = {
 		rig = rig,
 		part = part,
@@ -34,10 +35,12 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 		enabled = true,
 		isDeformRig = isDeformRig or false, -- Flag if this is part of a deform rig
 		isDeformBone = false,
+		jointParentIsPart0 = true,
 	}
 	setmetatable(self, RigPart)
 
-	rig.bones[part.Name] = self
+	rig.bonesByInstance = rig.bonesByInstance or {}
+	rig.bonesByInstance[part] = self
 	
 	-- Debug print to check part type
 	
@@ -49,13 +52,21 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 			-- print("Setting bone for", part.Name)
 		else
 			-- Traditional Motor6D joint
-			if rig._jointCache and rig._jointCache[part] then
-				for _, joint in ipairs(rig._jointCache[part]) do
-					if joint.Part0 == parent.part then
-						self.joint = joint
+			local joint: Motor6D? = connectingJoint
+			if not joint and rig._jointCache and rig._jointCache[part] then
+				for _, candidate in ipairs(rig._jointCache[part]) do
+					if candidate.Part0 == parent.part and candidate.Part1 == part then
+						joint = candidate
+						break
+					elseif candidate.Part1 == parent.part and candidate.Part0 == part then
+						joint = candidate
 						break
 					end
 				end
+			end
+			if joint then
+				self.joint = joint
+				self.jointParentIsPart0 = (joint.Part0 == parent.part)
 			end
 			-- if self.joint then
 			-- 	-- print("Found Motor6D joint for", part.Name, "Joint:", self.joint.Name)
@@ -68,9 +79,14 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 	-- Always look for Motor6D-connected children
 	for _, joint in pairs(rig._jointCache[part] or {}) do
 		if joint.Part0 and joint.Part1 then
-			local subpart = joint.Part0 == part and joint.Part1 or joint.Part0
+			local subpart
+			if joint.Part0 == part then
+				subpart = joint.Part1
+			elseif joint.Part1 == part then
+				subpart = joint.Part0
+			end
 			if subpart and (not parent or subpart ~= parent.part) then
-				table.insert(self.children, RigPart.new(rig, subpart, self, isDeformRig))
+				table.insert(self.children, RigPart.new(rig, subpart, self, isDeformRig, joint))
 			end
 		end
 	end
@@ -81,6 +97,28 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 			if child:IsA("Bone") then
 				-- We no longer create a RigPart for the bone here,
 				-- as that is handled by Rig:buildBoneHierarchy
+			end
+		end
+	end
+
+	local existing = rig.bones[part.Name]
+	if existing == nil or existing == self then
+		rig.bones[part.Name] = self
+	else
+		local preferNew = false
+		if self.bone and not existing.bone then
+			preferNew = true
+		elseif self.bone and existing.bone and existing.part ~= part then
+			preferNew = true
+		end
+
+		if preferNew then
+			rig.bones[part.Name] = self
+		else
+			rig._duplicateBoneWarnings = rig._duplicateBoneWarnings or {}
+			if not rig._duplicateBoneWarnings[part.Name] then
+				rig._duplicateBoneWarnings[part.Name] = true
+				warn("Duplicate rig part name detected:", part.Name, "for model", rig.model and rig.model.Name or "<unknown>")
 			end
 		end
 	end
@@ -166,12 +204,22 @@ function RigPart:ApplyPose(t)
 		local joint = self.joint
 		local enabled = self.enabled
 
-		if bone then
+		if bone and enabled then
 			-- For all deform bones, the transform from the addon is the delta to apply directly.
 			bone.Transform = transform
 		elseif joint and joint:IsA("Motor6D") and enabled then
-			-- Only apply to Motor6D joints if enabled
-			joint.C0 = transform * joint.C1:Inverse()
+			if self.jointParentIsPart0 then
+				joint.C0 = transform * joint.C1:Inverse()
+			else
+				joint.C1 = transform * joint.C0
+			end
+		elseif not enabled then
+			-- Debug: log when a bone is disabled
+			if bone then
+				print("Skipping disabled bone:", self.part.Name)
+			elseif joint and joint:IsA("Motor6D") then
+				print("Skipping disabled motor6d:", self.part.Name)
+			end
 		end
 	end
 

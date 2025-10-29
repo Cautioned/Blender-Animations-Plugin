@@ -36,6 +36,8 @@ local DONATION_SUPPORTERS = {
 	[1645075123] = "#f2b161", -- roffcat
 	[25461577] = "#ed7b87", -- 144hertz
 	[25637687] = "#fa9c50", -- TB_Glitch
+	[7445318360] = "#5865f2", -- Rubasta1945
+	
 	
 }
 

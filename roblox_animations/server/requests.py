@@ -3,16 +3,14 @@ Request processing and task management for the animation server.
 """
 
 import json
-import time
 import traceback
 import zlib
 import bpy
 import bpy_extras
 from mathutils import Vector, Matrix
-from ..core.utils import get_cached_armatures, get_action_hash, get_scene_fps, set_scene_fps, cf_to_mat
+from ..core.utils import get_action_hash, get_scene_fps, set_scene_fps, cf_to_mat
 from ..core import utils
 from ..animation.serialization import serialize, is_deform_bone_rig
-from ..core.constants import version
 
 
 # Global request queues
@@ -28,21 +26,28 @@ def process_pending_requests():
     """Process any pending animation requests"""
     try:
         if pending_requests:  # Check if list is not empty
+            print(f"Blender Addon: Processing {len(pending_requests)} pending requests")
             request = pending_requests.pop(0)
             request_type = request[0]
 
             if request_type == "export_animation":
                 _, task_id, armature_name = request
-                print(f"Blender Addon: Dispatching export_animation task (task_id={task_id}, armature={armature_name})")
+                print(
+                    f"Blender Addon: Dispatching export_animation task (task_id={task_id}, armature={armature_name})"
+                )
                 execute_in_main_thread(task_id, armature_name)
             elif request_type == "list_armatures":
                 _, task_id = request
-                print(f"Blender Addon: Dispatching list_armatures task (task_id={task_id})")
+                print(
+                    f"Blender Addon: Dispatching list_armatures task (task_id={task_id})"
+                )
                 execute_list_armatures(task_id)
             elif request_type == "import":
                 if len(request) == 4:
                     _, task_id, animation_data, target_armature = request
-                    print(f"Blender Addon: Dispatching import task (task_id={task_id}, target={target_armature})")
+                    print(
+                        f"Blender Addon: Dispatching import task (task_id={task_id}, target={target_armature})"
+                    )
                     execute_import_animation(task_id, animation_data, target_armature)
                 else:
                     _, task_id, animation_data = request
@@ -50,13 +55,15 @@ def process_pending_requests():
                     execute_import_animation(task_id, animation_data)
             elif request_type == "get_bone_rest":
                 _, task_id, armature_name = request
-                print(f"Blender Addon: Dispatching get_bone_rest task (task_id={task_id}, armature={armature_name})")
+                print(
+                    f"Blender Addon: Dispatching get_bone_rest task (task_id={task_id}, armature={armature_name})"
+                )
                 execute_get_bone_rest(task_id, armature_name)
 
     except Exception as e:
         print(f"Blender Addon: Error processing requests: {str(e)}")
         traceback.print_exc()
-    return 0.1  # Keep checking for new requests
+    return 0.01  # Run every 10ms for good balance
 
 
 def execute_list_armatures(task_id):
@@ -66,17 +73,31 @@ def execute_list_armatures(task_id):
 
         # Force refresh by invalidating cache first
         utils.invalidate_armature_cache()
-        
-        fresh_armatures = [obj.name for obj in bpy.data.objects if obj.type == 'ARMATURE']
+
+        fresh_armatures = [
+            obj.name for obj in bpy.data.objects if obj.type == "ARMATURE"
+        ]
 
         armatures = []
         for armature_name in fresh_armatures:
             obj = bpy.data.objects.get(armature_name)
+            if not obj:
+                # Try to find the object even if it's hidden/disabled
+                for obj_candidate in bpy.data.objects:
+                    if (
+                        obj_candidate.name == armature_name
+                        and obj_candidate.type == "ARMATURE"
+                    ):
+                        obj = obj_candidate
+                        break
+
             if obj:  # Double-check object still exists
                 # build bone hierarchy map: { bone_name: parent_bone_name or None }
                 bone_hierarchy = {}
                 for bone in obj.data.bones:
-                    bone_hierarchy[bone.name] = bone.parent.name if bone.parent else None
+                    bone_hierarchy[bone.name] = (
+                        bone.parent.name if bone.parent else None
+                    )
 
                 armature_info = {
                     "name": obj.name,
@@ -104,7 +125,11 @@ def execute_list_armatures(task_id):
 
         response = {
             "armatures": armatures,
-            "current": getattr(getattr(bpy.context.scene, "rbx_anim_settings", None), "rbx_anim_armature", None),
+            "current": getattr(
+                getattr(bpy.context.scene, "rbx_anim_settings", None),
+                "rbx_anim_armature",
+                None,
+            ),
             "fps": bpy.context.scene.render.fps,
         }
 
@@ -129,22 +154,34 @@ def execute_in_main_thread(task_id, armature_name):
         if not armature_name:
             pending_responses[task_id] = (False, "No armature selected")
             return
-            
+
         ao = bpy.data.objects.get(armature_name)
         if not ao:
-            pending_responses[task_id] = (False, f"Armature '{armature_name}' not found. Please check if the armature exists and is not hidden.")
-            return
+            # Try to find the object even if it's hidden/disabled
+            for obj in bpy.data.objects:
+                if obj.name == armature_name and obj.type == "ARMATURE":
+                    ao = obj
+                    break
 
-        if ao.type != 'ARMATURE':
+            if not ao:
+                pending_responses[task_id] = (
+                    False,
+                    f"Armature '{armature_name}' not found.",
+                )
+                return
+
+        if ao.type != "ARMATURE":
             pending_responses[task_id] = (
-                False, f"Object '{armature_name}' is not an armature (type: {ao.type}). Please select a valid armature object.")
+                False,
+                f"Object '{armature_name}' is not an armature (type: {ao.type}). Please select a valid armature object.",
+            )
             return
 
         bpy.context.view_layer.objects.active = ao
         # Only switch mode if necessary to avoid expensive operations
-        if ao.mode != 'POSE':
+        if ao.mode != "POSE":
             print(f"Blender Addon: Switching to POSE mode for '{armature_name}'...")
-            bpy.ops.object.mode_set(mode='POSE')
+            bpy.ops.object.mode_set(mode="POSE")
 
         desired_fps = get_scene_fps()
         set_scene_fps(desired_fps)
@@ -153,25 +190,29 @@ def execute_in_main_thread(task_id, armature_name):
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         force_deform = getattr(settings, "force_deform_bone_serialization", False)
 
-        use_deform_bone_serialization = is_deform_bone_rig(
-            ao) or force_deform
+        use_deform_bone_serialization = is_deform_bone_rig(ao) or force_deform
         print(
-            f"Server export: Using {'deform bone' if use_deform_bone_serialization else 'Motor6D'} serialization")
+            f"Server export: Using {'deform bone' if use_deform_bone_serialization else 'Motor6D'} serialization"
+        )
         print(f"Blender Addon: Starting animation export for '{armature_name}'...")
 
         serialized = serialize(ao)
         if not serialized:
             pending_responses[task_id] = (
-                False, f"Failed to serialize animation for '{armature_name}'. Check if the armature has animation data or keyframes.")
+                False,
+                f"Failed to serialize animation for '{armature_name}'. Check if the armature has animation data or keyframes.",
+            )
             return
-        
+
         if not serialized.get("kfs") or len(serialized["kfs"]) == 0:
             pending_responses[task_id] = (
-                False, f"No animation data found for '{armature_name}'. Please add keyframes or animation data to the armature.")
+                False,
+                f"No animation data found for '{armature_name}'. Please add keyframes or animation data to the armature.",
+            )
             return
 
         encoded = json.dumps(serialized, separators=(",", ":"))
-        compressed = zlib.compress(encoded.encode('utf-8'))
+        compressed = zlib.compress(encoded.encode("utf-8"))
 
         pending_responses[task_id] = (True, compressed)
 
@@ -190,27 +231,43 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         else:
             settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
             armature_name = settings.rbx_anim_armature if settings else None
-            
+
         if not armature_name:
-            raise ValueError("No armature specified for import. Please provide target armature or select one in the scene.")
+            raise ValueError(
+                "No armature specified for import. Please provide target armature or select one in the scene."
+            )
 
         ao = bpy.data.objects.get(armature_name)
-        if not ao or ao.type != 'ARMATURE':
-            raise ValueError(f"Selected object '{armature_name}' is not a valid armature.")
+        if not ao:
+            # Try to find the object even if it's hidden/disabled
+            for obj in bpy.data.objects:
+                if obj.name == armature_name and obj.type == "ARMATURE":
+                    ao = obj
+                    break
+
+            if not ao:
+                raise ValueError(
+                    f"Selected object '{armature_name}' is not a valid armature."
+                )
+
+        if ao.type != "ARMATURE":
+            raise ValueError(
+                f"Selected object '{armature_name}' is not a valid armature."
+            )
 
         bpy.context.view_layer.objects.active = ao
-        if ao.mode != 'POSE':
-            bpy.ops.object.mode_set(mode='POSE')
+        if ao.mode != "POSE":
+            bpy.ops.object.mode_set(mode="POSE")
 
         # Clear existing animation data
         if ao.animation_data:
             ao.animation_data_clear()
-        
+
         # Reset pose to rest position to ensure a clean slate
         if ao.pose:
             for bone in ao.pose.bones:
                 bone.matrix_basis = Matrix.Identity(4)
-            bpy.context.view_layer.update() # Ensure the pose update is registered
+            bpy.context.view_layer.update()  # Ensure the pose update is registered
 
         action = bpy.data.actions.new(name=f"{armature_name}_ImportedAnimation")
         ao.animation_data_create()
@@ -218,15 +275,17 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
         # Ensure a compatible action slot exists (Blender 4.4+)
         active_slot = None
-        if hasattr(action, 'slots'):
+        if hasattr(action, "slots"):
             if action.slots:
                 active_slot = action.slots[0]
             else:
                 try:
-                    active_slot = action.slots.new(id_type='OBJECT', name=f"OB{ao.name}")
+                    active_slot = action.slots.new(
+                        id_type="OBJECT", name=f"OB{ao.name}"
+                    )
                 except TypeError:
-                    active_slot = action.slots.new(id_type='OBJECT')
-            if active_slot and hasattr(ao.animation_data, 'action_slot'):
+                    active_slot = action.slots.new(id_type="OBJECT")
+            if active_slot and hasattr(ao.animation_data, "action_slot"):
                 try:
                     ao.animation_data.action_slot = active_slot
                 except Exception:
@@ -234,13 +293,13 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         else:
             pass
 
-        fps = animation_data.get('export_info', {}).get('fps', get_scene_fps())
+        fps = animation_data.get("export_info", {}).get("fps", get_scene_fps())
         set_scene_fps(fps)
 
         scene = bpy.context.scene
         scene.frame_start = 0
-        scene.frame_end = int(animation_data['t'] * fps)
-        
+        scene.frame_end = int(animation_data["t"] * fps)
+
         is_deform_rig = animation_data.get("is_deform_bone_rig", False)
 
         # This will store all transform data for all bones across all frames before we create any keyframes.
@@ -256,8 +315,9 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
             start_frame = scene.frame_start
             for bone in ao.pose.bones:
-                is_transformable = (not is_deform_rig and "is_transformable" in bone.bone) or \
-                                   (is_deform_rig and bone.bone.use_deform)
+                is_transformable = (
+                    not is_deform_rig and "is_transformable" in bone.bone
+                ) or (is_deform_rig and bone.bone.use_deform)
                 if is_transformable:
                     all_bone_data[bone.name] = {
                         start_frame: {
@@ -267,16 +327,16 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                         }
                     }
 
-        for kf_data in animation_data['kfs']:
-            frame = int(kf_data['t'] * fps)
-            state = kf_data['kf']
-            
+        for kf_data in animation_data["kfs"]:
+            frame = int(kf_data["t"] * fps)
+            state = kf_data["kf"]
+
             bones_to_process = []
             for bone_name in state.keys():
                 pose_bone = ao.pose.bones.get(bone_name)
                 if pose_bone:
                     bones_to_process.append(pose_bone)
-            
+
             bones_to_process.sort(key=lambda b: len(b.parent_recursive))
 
             # Simplified single-pass processing loop.
@@ -291,7 +351,7 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
                 # Backwards compatibility: Handle old list-based format and new dict-based format.
                 easing_style = "Linear"  # Default easing
-                easing_direction = "In"   # Default easing
+                easing_direction = "In"  # Default easing
 
                 if isinstance(pose_data, list) and len(pose_data) == 3:
                     # New, more robust format: [ [cframe_components], "EasingStyle", "EasingDirection" ]
@@ -311,14 +371,20 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     continue
 
                 bone_transform = cf_to_mat(cframe_components)
-                
+
                 # --- Matrix Calculation ---
                 if is_deform_rig:
                     settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
                     scale_factor = getattr(settings, "rbx_deform_rig_scale", 1.0)
-                    
+
                     loc, rot, sca = bone_transform.decompose()
-                    loc_blender = Vector((-loc.x * scale_factor, loc.y * scale_factor, -loc.z * scale_factor))
+                    loc_blender = Vector(
+                        (
+                            -loc.x * scale_factor,
+                            loc.y * scale_factor,
+                            -loc.z * scale_factor,
+                        )
+                    )
                     sca_blender = Vector((sca.x, sca.z, sca.y))
                     rot.x, rot.z = -rot.x, -rot.z
                     loc_mat = Matrix.Translation(loc_blender)
@@ -327,34 +393,46 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     delta_transform = loc_mat @ rot_mat @ sca_mat
                     rest_local_transform = pose_bone.bone.matrix_local
                     final_matrix = rest_local_transform @ delta_transform
-                else: # Motor6D rig
+                else:  # Motor6D rig
                     back_trans = transform_to_blender.inverted()
                     extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()
-                    
+
                     orig_mat = Matrix(pose_bone.bone["transform"])
                     orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
 
                     if pose_bone.parent and "transform" in pose_bone.parent.bone:
                         parent_orig_mat = Matrix(pose_bone.parent.bone["transform"])
-                        parent_orig_mat_tr1 = Matrix(pose_bone.parent.bone["transform1"])
-                        
+                        parent_orig_mat_tr1 = Matrix(
+                            pose_bone.parent.bone["transform1"]
+                        )
+
                         orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
-                        parent_orig_base_mat = back_trans @ (parent_orig_mat @ parent_orig_mat_tr1)
+                        parent_orig_base_mat = back_trans @ (
+                            parent_orig_mat @ parent_orig_mat_tr1
+                        )
                         orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
-                        
+
                         cur_transform = orig_transform @ bone_transform
-                        
-                        parent_extr_transform = Matrix(pose_bone.parent.bone["nicetransform"]).inverted()
-                        
+
+                        parent_extr_transform = Matrix(
+                            pose_bone.parent.bone["nicetransform"]
+                        ).inverted()
+
                         # Use the parent's current matrix from the pose, which was set in the previous iteration
                         parent_matrix = pose_bone.parent.matrix
-                        parent_obj_transform = back_trans @ (parent_matrix @ parent_extr_transform)
-                        
+                        parent_obj_transform = back_trans @ (
+                            parent_matrix @ parent_extr_transform
+                        )
+
                         cur_obj_transform = parent_obj_transform @ cur_transform
                     else:
                         cur_obj_transform = bone_transform
-                    
-                    final_matrix = transform_to_blender @ cur_obj_transform @ extr_transform.inverted()
+
+                    final_matrix = (
+                        transform_to_blender
+                        @ cur_obj_transform
+                        @ extr_transform.inverted()
+                    )
 
                 # --- Apply and Store ---
                 pose_bone.matrix = final_matrix
@@ -372,10 +450,12 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
             sorted_frames = sorted(frame_data.keys())
 
             channelbag = utils.get_action_channelbag(action)
-            if channelbag is None or not hasattr(channelbag, 'fcurves'):
-                legacy_fcurves = getattr(action, 'fcurves', None)
+            if channelbag is None or not hasattr(channelbag, "fcurves"):
+                legacy_fcurves = getattr(action, "fcurves", None)
                 if legacy_fcurves is None:
-                    raise RuntimeError("Unable to access animation channelbag for import")
+                    raise RuntimeError(
+                        "Unable to access animation channelbag for import"
+                    )
 
                 class _LegacyChannelbag:
                     def __init__(self, fcurves, groups):
@@ -385,16 +465,17 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     def new(self, *args, **kwargs):
                         return self.fcurves.new(*args, **kwargs)
 
-                channelbag = _LegacyChannelbag(legacy_fcurves, getattr(action, 'groups', []))
+                channelbag = _LegacyChannelbag(
+                    legacy_fcurves, getattr(action, "groups", [])
+                )
 
             # Create fcurves with version-appropriate parameters
             def create_fcurve(data_path, index, group_name):
                 try:
                     return channelbag.fcurves.new(data_path, index=index)
                 except TypeError:
-                    group_kw = None
-                    if hasattr(channelbag.fcurves, 'new'):
-                        for candidate in ('group_name', 'action_group'):
+                    if hasattr(channelbag.fcurves, "new"):
+                        for candidate in ("group_name", "action_group"):
                             try:
                                 return channelbag.fcurves.new(
                                     data_path, index=index, **{candidate: group_name}
@@ -402,13 +483,34 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             except TypeError:
                                 continue
                     return channelbag.fcurves.new(data_path, index=index)
-            
+
             # Location
-            loc_fcurves = [create_fcurve(f'pose.bones["{bone_name}"].location', i, bone_name) for i in range(3)]
+            loc_fcurves = [
+                create_fcurve(
+                    f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].location',
+                    i,
+                    bone_name,
+                )
+                for i in range(3)
+            ]
             # Rotation
-            rot_fcurves = [create_fcurve(f'pose.bones["{bone_name}"].rotation_quaternion', i, bone_name) for i in range(4)]
+            rot_fcurves = [
+                create_fcurve(
+                    f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].rotation_quaternion',
+                    i,
+                    bone_name,
+                )
+                for i in range(4)
+            ]
             # Scale
-            scale_fcurves = [create_fcurve(f'pose.bones["{bone_name}"].scale', i, bone_name) for i in range(3)]
+            scale_fcurves = [
+                create_fcurve(
+                    f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].scale',
+                    i,
+                    bone_name,
+                )
+                for i in range(3)
+            ]
 
             # Most Roblox easings map to their corresponding interpolation type in Blender.
             interpolation_map = {
@@ -424,7 +526,7 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 "Quint": "QUINT",
                 "Expo": "EXPO",
                 "Circular": "CIRC",
-                "Back": "BACK"
+                "Back": "BACK",
             }
 
             num_frames = len(sorted_frames)
@@ -443,15 +545,15 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 for axis in range(3):
                     kp = loc_fcurves[axis].keyframe_points[idx]
                     kp.co = (frame, loc[axis])
-                    kp.handle_left_type = kp.handle_right_type = 'AUTO'
+                    kp.handle_left_type = kp.handle_right_type = "AUTO"
                 for axis in range(4):
                     kp = rot_fcurves[axis].keyframe_points[idx]
                     kp.co = (frame, rot[axis])
-                    kp.handle_left_type = kp.handle_right_type = 'AUTO'
+                    kp.handle_left_type = kp.handle_right_type = "AUTO"
                 for axis in range(3):
                     kp = scale_fcurves[axis].keyframe_points[idx]
                     kp.co = (frame, scl[axis])
-                    kp.handle_left_type = kp.handle_right_type = 'AUTO'
+                    kp.handle_left_type = kp.handle_right_type = "AUTO"
 
             if num_frames > 1:
                 for idx in range(num_frames - 1):
@@ -462,9 +564,11 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
                     for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
                         kp_current = fcurve.keyframe_points[idx]
-                        kp_current.interpolation = interpolation_map.get(easing_style, "LINEAR")
+                        kp_current.interpolation = interpolation_map.get(
+                            easing_style, "LINEAR"
+                        )
 
-                        if kp_current.interpolation not in ['LINEAR', 'CONSTANT']:
+                        if kp_current.interpolation not in ["LINEAR", "CONSTANT"]:
                             if easing_direction == "In":
                                 kp_current.easing = "EASE_IN"
                             elif easing_direction == "Out":
@@ -472,13 +576,13 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             elif easing_direction == "InOut":
                                 kp_current.easing = "EASE_IN_OUT"
                         else:
-                            kp_current.easing = 'AUTO'
+                            kp_current.easing = "AUTO"
 
             for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
                 fcurve.update()
-        
+
         pending_responses[task_id] = (True, "Animation imported successfully")
-        
+
     except Exception as e:
         print(f"Error in main thread (import_animation): {str(e)}")
         traceback.print_exc()
@@ -502,12 +606,29 @@ def execute_get_bone_rest(task_id, armature_name):
             return
 
         ao = bpy.data.objects.get(armature_name)
-        if not ao or ao.type != 'ARMATURE':
+        if not ao:
+            # Try to find the object even if it's hidden/disabled
+            for obj in bpy.data.objects:
+                if obj.name == armature_name and obj.type == "ARMATURE":
+                    ao = obj
+                    break
+
+            if not ao:
+                pending_responses[task_id] = (
+                    False,
+                    f"Object '{armature_name}' is not a valid armature.",
+                )
+                return
+
+        if ao.type != "ARMATURE":
             pending_responses[task_id] = (
-                False, f"Object '{armature_name}' is not a valid armature.")
+                False,
+                f"Object '{armature_name}' is not a valid armature.",
+            )
             return
 
         from ..core.constants import get_transform_to_blender
+
         back_trans = get_transform_to_blender().inverted()
         world_transform = back_trans @ ao.matrix_world
 
@@ -515,8 +636,8 @@ def execute_get_bone_rest(task_id, armature_name):
 
         original_mode = ao.mode
         bpy.context.view_layer.objects.active = ao
-        if ao.mode != 'POSE':
-            bpy.ops.object.mode_set(mode='POSE')
+        if ao.mode != "POSE":
+            bpy.ops.object.mode_set(mode="POSE")
 
         # Save current bone poses before clearing them
         for bone in ao.pose.bones:
@@ -525,10 +646,10 @@ def execute_get_bone_rest(task_id, armature_name):
         # Clear transforms to guarantee we are calculating from the rest pose.
         # This is crucial for ensuring that pose_bone.matrix reflects the actual
         # rest pose of the armature.
-        bpy.ops.pose.select_all(action='SELECT')
+        bpy.ops.pose.select_all(action="SELECT")
         bpy.ops.pose.transforms_clear()
-        bpy.ops.pose.select_all(action='DESELECT')
-        
+        bpy.ops.pose.select_all(action="DESELECT")
+
         # Cache for rest transforms to avoid re-calculating for parents
         rest_transform_cache = {}
 
@@ -543,22 +664,26 @@ def execute_get_bone_rest(task_id, armature_name):
                 # Traditional bone with nicetransform - use tail position logic
                 extr_inv = Matrix(pose_bone.bone["nicetransform"]).inverted()
                 # Use the tail position instead of head by translating matrix_local by the bone vector.
-                tail_local_matrix = pose_bone.bone.matrix_local @ Matrix.Translation(pose_bone.bone.vector)
+                tail_local_matrix = pose_bone.bone.matrix_local @ Matrix.Translation(
+                    pose_bone.bone.vector
+                )
                 rest_obj_transform = world_transform @ (tail_local_matrix @ extr_inv)
             else:
                 # New bone without nicetransform - use head position (matrix_local)
                 rest_obj_transform = world_transform @ pose_bone.bone.matrix_local
 
             rest_transform_cache[pose_bone.name] = rest_obj_transform
-            
+
             # Calculate the bone's rest transform relative to its parent.
             if pose_bone.parent:
                 parent_rest_transform = rest_transform_cache.get(pose_bone.parent.name)
                 if parent_rest_transform:
                     try:
                         # The relative transform is the transformation from the parent's space to the child's space.
-                        rest_local_transform = parent_rest_transform.inverted() @ rest_obj_transform
-                    except ValueError: 
+                        rest_local_transform = (
+                            parent_rest_transform.inverted() @ rest_obj_transform
+                        )
+                    except ValueError:
                         # Fallback for non-invertible parent matrix, though this is rare.
                         rest_local_transform = rest_obj_transform
                 else:
@@ -574,18 +699,34 @@ def execute_get_bone_rest(task_id, armature_name):
             # Convert matrices to Roblox CFrame-compatible components.
             world_translation = world_matrix.to_translation()
             world_components = [
-                world_translation.x, world_translation.y, world_translation.z,
-                world_matrix[0][0], world_matrix[0][1], world_matrix[0][2],
-                world_matrix[1][0], world_matrix[1][1], world_matrix[1][2],
-                world_matrix[2][0], world_matrix[2][1], world_matrix[2][2],
+                world_translation.x,
+                world_translation.y,
+                world_translation.z,
+                world_matrix[0][0],
+                world_matrix[0][1],
+                world_matrix[0][2],
+                world_matrix[1][0],
+                world_matrix[1][1],
+                world_matrix[1][2],
+                world_matrix[2][0],
+                world_matrix[2][1],
+                world_matrix[2][2],
             ]
-            
+
             relative_translation = relative_matrix.to_translation()
             relative_components = [
-                relative_translation.x, relative_translation.y, relative_translation.z,
-                relative_matrix[0][0], relative_matrix[0][1], relative_matrix[0][2],
-                relative_matrix[1][0], relative_matrix[1][1], relative_matrix[1][2],
-                relative_matrix[2][0], relative_matrix[2][1], relative_matrix[2][2],
+                relative_translation.x,
+                relative_translation.y,
+                relative_translation.z,
+                relative_matrix[0][0],
+                relative_matrix[0][1],
+                relative_matrix[0][2],
+                relative_matrix[1][0],
+                relative_matrix[1][1],
+                relative_matrix[1][2],
+                relative_matrix[2][0],
+                relative_matrix[2][1],
+                relative_matrix[2][2],
             ]
 
             is_synthetic = pose_bone.bone.get("is_synthetic_helper", False)
@@ -593,32 +734,28 @@ def execute_get_bone_rest(task_id, armature_name):
                 "world": world_components,
                 "relative": relative_components,
                 "parent": pose_bone.parent.name if pose_bone.parent else None,
-                "is_synthetic_helper": is_synthetic
+                "is_synthetic_helper": is_synthetic,
             }
 
         # Restore original mode
         if ao.mode != original_mode:
             bpy.ops.object.mode_set(mode=original_mode)
 
-        response = {
-            "armature": armature_name,
-            "bone_poses": bone_poses
-        }
+        response = {"armature": armature_name, "bone_poses": bone_poses}
 
         data = json.dumps(response).encode("utf-8")
         pending_responses[task_id] = (True, data)
 
     except Exception as e:
         traceback.print_exc()
-        pending_responses[task_id] = (
-            False, f"Error getting bone rest poses: {str(e)}")
+        pending_responses[task_id] = (False, f"Error getting bone rest poses: {str(e)}")
     finally:
         # Restore original bone poses
         if ao and saved_bone_matrices:
             for bone in ao.pose.bones:
                 if bone.name in saved_bone_matrices:
                     bone.matrix_basis = saved_bone_matrices[bone.name]
-        
+
         # Ensure mode is restored even if an error occurs
         if original_mode and ao and ao.mode != original_mode:
             bpy.ops.object.mode_set(mode=original_mode)

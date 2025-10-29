@@ -4,35 +4,40 @@ Animation serialization logic for exporting to Roblox format.
 
 import bpy
 import re
-import time
+import math
 from typing import Dict, Set, List, Optional, Any, Tuple
 from mathutils import Vector, Matrix
-from ..core.constants import get_transform_to_blender, identity_cf, cf_round, cf_round_fac
-from ..core.utils import get_scene_fps, set_scene_fps, mat_to_cf, get_action_fcurves
+from ..core.constants import (
+    get_transform_to_blender,
+    identity_cf,
+    cf_round,
+    cf_round_fac,
+)
+from ..core.utils import get_scene_fps, mat_to_cf, get_action_fcurves
 from .easing import get_easing_for_bone, map_blender_to_roblox_easing
 
 
-def is_deform_bone_rig(armature: 'bpy.types.Object') -> bool:
+def is_deform_bone_rig(armature: "bpy.types.Object") -> bool:
     """
     Determines if an armature is a deform bone rig by checking if any mesh
     in the scene uses it in an Armature modifier. This is the standard
     and most reliable way to identify skinned meshes.
     """
-    if not armature or armature.type != 'ARMATURE':
+    if not armature or armature.type != "ARMATURE":
         return False
 
     # Iterate through all mesh objects in the scene
     for mesh_obj in bpy.data.objects:
-        if mesh_obj.type == 'MESH':
+        if mesh_obj.type == "MESH":
             # Check if the mesh has an Armature modifier targeting our armature
             for modifier in mesh_obj.modifiers:
-                if modifier.type == 'ARMATURE' and modifier.object == armature:
+                if modifier.type == "ARMATURE" and modifier.object == armature:
                     return True
 
     return False
 
 
-def extract_bone_hierarchy(armature: 'bpy.types.Object') -> Dict[str, Optional[str]]:
+def extract_bone_hierarchy(armature: "bpy.types.Object") -> Dict[str, Optional[str]]:
     """
     Extracts the bone hierarchy from an armature.
     Returns a dictionary with bone names as keys and their parent bone names as values.
@@ -40,7 +45,7 @@ def extract_bone_hierarchy(armature: 'bpy.types.Object') -> Dict[str, Optional[s
     """
     hierarchy = {}
 
-    if not armature or armature.type != 'ARMATURE':
+    if not armature or armature.type != "ARMATURE":
         return hierarchy
 
     for bone in armature.data.bones:
@@ -53,7 +58,7 @@ def extract_bone_hierarchy(armature: 'bpy.types.Object') -> Dict[str, Optional[s
 
 
 def serialize_animation_state(
-    ao: 'bpy.types.Object',
+    ao: "bpy.types.Object",
     back_trans_cached: Optional[Matrix] = None,
     static_cache: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, List[float]]:
@@ -61,8 +66,12 @@ def serialize_animation_state(
     state: Dict[str, List[float]] = {}
 
     # Use cached transform or compute once
-    back_trans = back_trans_cached if back_trans_cached is not None else get_transform_to_blender().inverted()
-    t2b = back_trans.inverted()
+    back_trans = (
+        back_trans_cached
+        if back_trans_cached is not None
+        else get_transform_to_blender().inverted()
+    )
+    back_trans.inverted()
 
     # Local bindings for speed
     pose_bones = ao.pose.bones
@@ -70,9 +79,11 @@ def serialize_animation_state(
     get_bone_cache = cache.get
 
     for bone in pose_bones:
-        has_motor6d_props = ("transform" in bone.bone and
-                             "transform1" in bone.bone and
-                             "nicetransform" in bone.bone)
+        has_motor6d_props = (
+            "transform" in bone.bone
+            and "transform1" in bone.bone
+            and "nicetransform" in bone.bone
+        )
 
         if has_motor6d_props:
             # --- Traditional Motor6D bone logic ---
@@ -111,25 +122,38 @@ def serialize_animation_state(
             cur_obj_transform = back_trans @ (bone.matrix @ extr_inv)
 
             if bone.parent:
-                parent_has_motor6d_props = ("transform" in bone.parent.bone and
-                                            "transform1" in bone.parent.bone and
-                                            "nicetransform" in bone.parent.bone)
+                parent_has_motor6d_props = (
+                    "transform" in bone.parent.bone
+                    and "transform1" in bone.parent.bone
+                    and "nicetransform" in bone.parent.bone
+                )
                 if parent_has_motor6d_props:
                     pcb = get_bone_cache(bone.parent.name, {})
                     parent_extr_inv = pcb.get("extr_inv")
                     parent_orig_base_mat = pcb.get("orig_base_mat")
                     if parent_extr_inv is None:
-                        parent_nicetransform = bone.parent.bone.get("nicetransform", Matrix.Identity(4))
+                        parent_nicetransform = bone.parent.bone.get(
+                            "nicetransform", Matrix.Identity(4)
+                        )
                         if not isinstance(parent_nicetransform, Matrix):
-                            if isinstance(parent_nicetransform, list) and len(parent_nicetransform) == 4:
-                                matrix_data = tuple(tuple(row) for row in parent_nicetransform)
+                            if (
+                                isinstance(parent_nicetransform, list)
+                                and len(parent_nicetransform) == 4
+                            ):
+                                matrix_data = tuple(
+                                    tuple(row) for row in parent_nicetransform
+                                )
                                 parent_nicetransform = Matrix(matrix_data)
                             else:
                                 parent_nicetransform = Matrix.Identity(4)
                         parent_extr_inv = parent_nicetransform.inverted()
                     if parent_orig_base_mat is None:
-                        p_orig_mat = bone.parent.bone.get("transform", Matrix.Identity(4))
-                        p_orig_mat_tr1 = bone.parent.bone.get("transform1", Matrix.Identity(4))
+                        p_orig_mat = bone.parent.bone.get(
+                            "transform", Matrix.Identity(4)
+                        )
+                        p_orig_mat_tr1 = bone.parent.bone.get(
+                            "transform1", Matrix.Identity(4)
+                        )
                         if not isinstance(p_orig_mat, Matrix):
                             if isinstance(p_orig_mat, list) and len(p_orig_mat) == 4:
                                 matrix_data = tuple(tuple(row) for row in p_orig_mat)
@@ -137,14 +161,23 @@ def serialize_animation_state(
                             else:
                                 p_orig_mat = Matrix.Identity(4)
                         if not isinstance(p_orig_mat_tr1, Matrix):
-                            if isinstance(p_orig_mat_tr1, list) and len(p_orig_mat_tr1) == 4:
-                                matrix_data = tuple(tuple(row) for row in p_orig_mat_tr1)
+                            if (
+                                isinstance(p_orig_mat_tr1, list)
+                                and len(p_orig_mat_tr1) == 4
+                            ):
+                                matrix_data = tuple(
+                                    tuple(row) for row in p_orig_mat_tr1
+                                )
                                 p_orig_mat_tr1 = Matrix(matrix_data)
                             else:
                                 p_orig_mat_tr1 = Matrix.Identity(4)
-                        parent_orig_base_mat = back_trans @ (p_orig_mat @ p_orig_mat_tr1)
+                        parent_orig_base_mat = back_trans @ (
+                            p_orig_mat @ p_orig_mat_tr1
+                        )
 
-                    parent_obj_transform = back_trans @ (bone.parent.matrix @ parent_extr_inv)
+                    parent_obj_transform = back_trans @ (
+                        bone.parent.matrix @ parent_extr_inv
+                    )
                     orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
                     cur_transform = parent_obj_transform.inverted() @ cur_obj_transform
                     bone_transform = orig_transform.inverted() @ cur_transform
@@ -166,7 +199,7 @@ def serialize_animation_state(
 
 
 def serialize_deform_animation_state(
-    ao: 'bpy.types.Object',
+    ao: "bpy.types.Object",
     is_skinned_rig: bool,
     world_transform_cached: Optional[Matrix] = None,
     scale_factor_cached: Optional[float] = None,
@@ -190,12 +223,16 @@ def serialize_deform_animation_state(
 
     state: Dict[str, List[float]] = {}
     bone_cache: Dict[str, Tuple[Matrix, Matrix]] = {}
-    
+
     # Pre-populate cache for all non-Motor6D bones to simplify parent lookups
     bones_to_process = []
     for bone in ao.pose.bones:
         # Exclude Motor6D bones from deform serialization
-        if ("transform" in bone.bone and "transform1" in bone.bone and "nicetransform" in bone.bone):
+        if (
+            "transform" in bone.bone
+            and "transform1" in bone.bone
+            and "nicetransform" in bone.bone
+        ):
             continue
         bones_to_process.append(bone)
 
@@ -203,31 +240,40 @@ def serialize_deform_animation_state(
     def get_parent_transforms(bone):
         if not bone.parent:
             return None, None
-        
+
         # Check if parent is in deform bone cache
         if bone.parent.name in bone_cache:
             return bone_cache.get(bone.parent.name)
-        
+
         # Parent is not in cache, check if it's a motor6d bone
-        parent_has_motor6d_props = ("transform" in bone.parent.bone and
-                                   "transform1" in bone.parent.bone and
-                                   "nicetransform" in bone.parent.bone)
-        
+        parent_has_motor6d_props = (
+            "transform" in bone.parent.bone
+            and "transform1" in bone.parent.bone
+            and "nicetransform" in bone.parent.bone
+        )
+
         if parent_has_motor6d_props:
             # Convert motor6d parent to roblox space for deform calculation
-            parent_nicetransform = bone.parent.bone.get("nicetransform", Matrix.Identity(4))
+            parent_nicetransform = bone.parent.bone.get(
+                "nicetransform", Matrix.Identity(4)
+            )
             if not isinstance(parent_nicetransform, Matrix):
-                if isinstance(parent_nicetransform, list) and len(parent_nicetransform) == 4:
+                if (
+                    isinstance(parent_nicetransform, list)
+                    and len(parent_nicetransform) == 4
+                ):
                     matrix_data = tuple(tuple(row) for row in parent_nicetransform)
                     parent_nicetransform = Matrix(matrix_data)
                 else:
                     parent_nicetransform = Matrix.Identity(4)
             parent_extr_inv = parent_nicetransform.inverted()
-            
+
             parent_current = world_transform @ (bone.parent.matrix @ parent_extr_inv)
-            parent_rest = world_transform @ (bone.parent.bone.matrix_local @ parent_extr_inv)
+            parent_rest = world_transform @ (
+                bone.parent.bone.matrix_local @ parent_extr_inv
+            )
             return (parent_current, parent_rest)
-        
+
         # Parent is neither deform nor motor6d, treat as root
         return None, None
 
@@ -239,7 +285,7 @@ def serialize_deform_animation_state(
 
     for bone in bones_to_process:
         current_matrix, rest_matrix = bone_cache[bone.name]
-        
+
         if bone.parent:
             parent_transforms = get_parent_transforms(bone)
             if parent_transforms:
@@ -247,7 +293,9 @@ def serialize_deform_animation_state(
                 try:
                     current_local_transform = parent_current.inverted() @ current_matrix
                     rest_local_transform = parent_rest.inverted() @ rest_matrix
-                    delta_transform = rest_local_transform.inverted() @ current_local_transform
+                    delta_transform = (
+                        rest_local_transform.inverted() @ current_local_transform
+                    )
                 except ValueError:
                     delta_transform = rest_matrix.inverted() @ current_matrix
             else:
@@ -301,9 +349,9 @@ def serialize_deform_animation_state(
 
 
 def serialize_combined_animation_state(
-    ao: 'bpy.types.Object',
-    ao_eval: 'bpy.types.Object',
-    depsgraph: 'bpy.types.Depsgraph',
+    ao: "bpy.types.Object",
+    ao_eval: "bpy.types.Object",
+    depsgraph: "bpy.types.Depsgraph",
     run_deform_path: bool,
     skinned_rig: bool,
     back_trans_cached: Optional[Matrix] = None,
@@ -321,7 +369,7 @@ def serialize_combined_animation_state(
     # Always run the standard Motor6D serialization first.
     motor_state = serialize_animation_state(ao_eval, back_trans_cached, static_cache)
     state.update(motor_state)
-    
+
     # Then, if we need deform data (skinned rig or helper bones), run deform serialization
     # and merge the results. Deform data will override Motor6D data for any
     # bone that might be flagged as both.
@@ -334,22 +382,22 @@ def serialize_combined_animation_state(
             static_cache,
         )
         state.update(deform_state)
-        
+
     return state
 
 
-def get_ik_affected_bones(armature_obj: 'bpy.types.Object') -> Set[str]:
+def get_ik_affected_bones(armature_obj: "bpy.types.Object") -> Set[str]:
     """
     Scans an armature for IK constraints and returns a set of all bone names
     that are part of an IK chain.
     """
     ik_bones: Set[str] = set()
-    if not armature_obj or armature_obj.type != 'ARMATURE':
+    if not armature_obj or armature_obj.type != "ARMATURE":
         return ik_bones
 
     for bone in armature_obj.pose.bones:
         for constraint in bone.constraints:
-            if constraint.type == 'IK':
+            if constraint.type == "IK":
                 # This bone is the end of the chain, add it
                 ik_bones.add(bone.name)
                 # Add the parents in the chain up to the chain_count
@@ -363,20 +411,20 @@ def get_ik_affected_bones(armature_obj: 'bpy.types.Object') -> Set[str]:
     return ik_bones
 
 
-def get_all_constrained_bones(armature_obj: 'bpy.types.Object') -> Set[str]:
+def get_all_constrained_bones(armature_obj: "bpy.types.Object") -> Set[str]:
     """
     Finds all bones that are directly or indirectly affected by any constraint.
     For IK, it includes the entire chain. For others, it's the bone with the constraint.
     """
     constrained_bones: Set[str] = set()
-    if not armature_obj or armature_obj.type != 'ARMATURE':
+    if not armature_obj or armature_obj.type != "ARMATURE":
         return constrained_bones
 
     for bone in armature_obj.pose.bones:
         if bone.constraints:
             constrained_bones.add(bone.name)
             for constraint in bone.constraints:
-                if constraint.type == 'IK' and constraint.chain_count > 0:
+                if constraint.type == "IK" and constraint.chain_count > 0:
                     # The chain starts from the PARENT of the bone with the constraint.
                     current_bone = bone.parent
                     if current_bone:
@@ -391,7 +439,7 @@ def get_all_constrained_bones(armature_obj: 'bpy.types.Object') -> Set[str]:
     return constrained_bones
 
 
-def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
+def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     """Main serialization function that handles all animation export logic"""
     ctx = bpy.context
     desired_fps = get_scene_fps()
@@ -407,14 +455,18 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
     # is_skinned_rig: true deform/skin rig (armature modifier) or forced by user
     # has_new_bones: bones without Motor6D props present (should run deform path, but not mark rig as deform)
     has_new_bones = any(
-        not ("transform" in bone.bone and "transform1" in bone.bone and "nicetransform" in bone.bone)
+        not (
+            "transform" in bone.bone
+            and "transform1" in bone.bone
+            and "nicetransform" in bone.bone
+        )
         for bone in ao_eval.pose.bones
     )
     settings = getattr(ctx.scene, "rbx_anim_settings", None)
     force_deform = getattr(settings, "force_deform_bone_serialization", False)
     is_skinned_rig = is_deform_bone_rig(ao) or force_deform
     run_deform_path = is_skinned_rig or has_new_bones
-    
+
     # Cache static transforms once per serialize call
     back_trans_cached = get_transform_to_blender().inverted()
     world_transform_cached = back_trans_cached @ ao.matrix_world
@@ -499,15 +551,19 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
             fcurves = get_action_fcurves(action)
             for fcurve in fcurves:
                 if fcurve.data_path.startswith("pose.bones"):
-                    match = re.search(
-                        r'pose\.bones\["(.+?)"\]', fcurve.data_path)
+                    match = re.search(r'pose\.bones\["(.+?)"\]', fcurve.data_path)
                     if match:
                         animated_bones.add(match.group(1))
 
         # Also find bones driven by constrained targets and gather their actions
         for bone in ao_eval.pose.bones:
             for c in bone.constraints:
-                if hasattr(c, 'target') and c.target and c.target.animation_data and c.target.animation_data.action:
+                if (
+                    hasattr(c, "target")
+                    and c.target
+                    and c.target.animation_data
+                    and c.target.animation_data.action
+                ):
                     animated_bones.add(bone.name)
                     all_actions.add(c.target.animation_data.action)
 
@@ -529,7 +585,7 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         frame_start = ctx.scene.frame_start
         frame_end = ctx.scene.frame_end
         keyframe_times = {frame_start, frame_end}
-        
+
         all_fcurves = []
         for act in all_actions:
             fcurves = get_action_fcurves(act)
@@ -537,7 +593,8 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
 
         # Track bezier segments per bone to force dense sampling later
         from collections import defaultdict
-        bezier_segments: Dict[str, Set[Tuple[int,int]]] = defaultdict(set)
+
+        bezier_segments: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
 
         for fcurve in all_fcurves:
             # determine bone name for this fcurve (if any)
@@ -555,8 +612,10 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
                 # If a keyframe uses curved interpolation, we need to bake all the
                 # frames between it and the next keyframe to accurately capture the curve.
                 # only densify segments that actually curve (deviate from linear)
-                curved_interpolations = {'BEZIER'}
-                if kp.interpolation in curved_interpolations and i + 1 < len(fcurve.keyframe_points):
+                curved_interpolations = {"BEZIER"}
+                if kp.interpolation in curved_interpolations and i + 1 < len(
+                    fcurve.keyframe_points
+                ):
                     next_kp = fcurve.keyframe_points[i + 1]
                     start_bezier_frame = int(kp.co.x + 0.5)
                     end_bezier_frame = int(next_kp.co.x + 0.5)
@@ -566,20 +625,32 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
                         try:
                             # For BEZIER: always densify to ensure full fidelity
                             # Bezier curves can have subtle curves that are important
-                            is_curved = (kp.interpolation == 'BEZIER')
+                            is_curved = kp.interpolation == "BEZIER"
 
                             # only densify if the curve is actually curved
                             if is_curved:
-                                keyframe_times.update(range(start_bezier_frame + 1, end_bezier_frame))
+                                keyframe_times.update(
+                                    range(start_bezier_frame + 1, end_bezier_frame)
+                                )
                                 if bone_name_for_curve:
-                                    bezier_segments[bone_name_for_curve].add((min(start_bezier_frame, end_bezier_frame), max(start_bezier_frame, end_bezier_frame)))
+                                    bezier_segments[bone_name_for_curve].add(
+                                        (
+                                            min(start_bezier_frame, end_bezier_frame),
+                                            max(start_bezier_frame, end_bezier_frame),
+                                        )
+                                    )
                         except Exception:
                             # if evaluation fails, assume it's curved and densify
-                            keyframe_times.update(range(start_bezier_frame + 1, end_bezier_frame))
+                            keyframe_times.update(
+                                range(start_bezier_frame + 1, end_bezier_frame)
+                            )
                             if bone_name_for_curve:
-                                bezier_segments[bone_name_for_curve].add((min(start_bezier_frame, end_bezier_frame), max(start_bezier_frame, end_bezier_frame)))
-
-        start_time_offset = min(keyframe_times) if keyframe_times else 0
+                                bezier_segments[bone_name_for_curve].add(
+                                    (
+                                        min(start_bezier_frame, end_bezier_frame),
+                                        max(start_bezier_frame, end_bezier_frame),
+                                    )
+                                )
 
         # 4. Single Baking Pass
         collected = []
@@ -592,9 +663,47 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         # - without constraints: evaluate only sparse keyframes (plus bezier fills collected above)
         full_range = getattr(settings, "rbx_full_range_bake", True)
 
+        # Map of {bone_name: {frame_index: (interpolation, easing)}} built from action fcurves
+        per_bone_interpolation: Dict[
+            str, Dict[int, Tuple[Optional[str], Optional[str]]]
+        ] = {}
+        if action:
+            for fcurve in all_fcurves:
+                if not fcurve.data_path.startswith("pose.bones"):
+                    continue
+
+                match = re.search(r'pose\.bones\["(.+?)"\]', fcurve.data_path)
+                if not match:
+                    continue
+
+                bone_name_for_curve = match.group(1)
+                frame_map = per_bone_interpolation.setdefault(bone_name_for_curve, {})
+
+                for keyframe_point in fcurve.keyframe_points:
+                    frame_idx = int(round(keyframe_point.co.x))
+                    if frame_idx < frame_start or frame_idx > frame_end:
+                        continue
+
+                    existing = frame_map.get(frame_idx)
+                    # Prefer non-constant interpolation over constant when multiple curves share the same frame
+                    if (
+                        existing
+                        and existing[0] == "CONSTANT"
+                        and keyframe_point.interpolation != "CONSTANT"
+                    ):
+                        frame_map[frame_idx] = (
+                            keyframe_point.interpolation,
+                            keyframe_point.easing,
+                        )
+                    elif existing is None:
+                        frame_map[frame_idx] = (
+                            keyframe_point.interpolation,
+                            keyframe_point.easing,
+                        )
+
         def _uses_cyclic(fc):
             try:
-                return any(mod.type == 'CYCLES' for mod in getattr(fc, "modifiers", []))
+                return any(mod.type == "CYCLES" for mod in getattr(fc, "modifiers", []))
             except Exception:
                 return False
 
@@ -603,48 +712,98 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         if has_constraints_local:
             all_frames_to_bake = list(range(frame_start, frame_end + 1))
         elif fcurves_with_cycles:
-            # For cyclic animations, collect ALL keyframes from ALL fcurves
-            # (not just cyclic ones) to handle cases where different axes have different timings
-            cycle_source_frames = set()
-            for fc in all_fcurves:  # collect from all fcurves, not just cyclic ones
+            # For cyclic animations, replicate the base cycle sparsely across the range
+            cycle_frames_all: Set[int] = set()
+            for fc in fcurves_with_cycles:
                 try:
                     for kp in fc.keyframe_points:
-                        frame = int(round(kp.co.x))
-                        if frame_start <= frame <= frame_end:
-                            cycle_source_frames.add(frame)
+                        cycle_frames_all.add(int(round(kp.co.x)))
                 except Exception:
                     continue
 
-            # Start with just the original keyframes and frame_end
             extended_frames = set(keyframe_times)
+
+            if cycle_frames_all:
+                cycle_sorted = sorted(cycle_frames_all)
+
+                # Determine base cycle interval from the action if available
+                base_start = cycle_sorted[0]
+                base_end = cycle_sorted[-1]
+                if action and action.frame_range:
+                    action_start, action_end = action.frame_range
+                    base_start = int(math.floor(action_start))
+                    base_end = int(math.ceil(action_end - 1e-6))
+
+                frame_step = max(getattr(ctx.scene, "frame_step", 1), 1)
+                cycle_len = base_end - base_start
+                if cycle_len <= 0:
+                    cycle_len = frame_step
+
+                # Collect base cycle frames within one cycle interval
+                base_cycle_frames = []
+                for fc in fcurves_with_cycles:
+                    try:
+                        for kp in fc.keyframe_points:
+                            frame = int(round(kp.co.x))
+                            if base_start - cycle_len <= frame <= base_end:
+                                base_cycle_frames.append(frame)
+                    except Exception:
+                        continue
+                base_cycle_frames = sorted(set(base_cycle_frames))
+
+                if not base_cycle_frames:
+                    # Fallback: sample densely across the base cycle using frame_step
+                    base_cycle_frames = list(
+                        range(base_start, base_end + 1, frame_step)
+                    )
+
+                if base_end not in base_cycle_frames:
+                    base_cycle_frames.append(base_end)
+                if base_start not in base_cycle_frames:
+                    base_cycle_frames.insert(0, base_start)
+
+                # include previous cycle samples for reference but do not bake them directly
+                base_cycle_with_prev = sorted(
+                    set(
+                        [frame for frame in base_cycle_frames]
+                        + [frame - cycle_len for frame in base_cycle_frames]
+                    )
+                )
+
+                # Replicate backwards to cover frames before the base cycle
+                if cycle_len > 0:
+                    offset = math.floor((frame_start - base_end) / cycle_len)
+                    while base_end + offset * cycle_len >= frame_start:
+                        for base_frame in base_cycle_with_prev:
+                            new_frame = base_frame + offset * cycle_len
+                            if frame_start <= new_frame <= frame_end:
+                                extended_frames.add(new_frame)
+                        offset -= 1
+
+                # Replicate forward to cover entire range through frame_end
+                if cycle_len > 0:
+                    offset = math.ceil((frame_start - base_start) / cycle_len)
+                    while base_start + offset * cycle_len <= frame_end:
+                        for base_frame in base_cycle_with_prev:
+                            new_frame = base_frame + offset * cycle_len
+                            if frame_start <= new_frame <= frame_end:
+                                extended_frames.add(new_frame)
+                        offset += 1
+
             extended_frames.add(frame_end)
-            
-            # Generate cycle extensions to cover the full scene range
-            if cycle_source_frames:
-                cycle_source_frames = sorted(cycle_source_frames)
-                if len(cycle_source_frames) >= 2:
-                    cycle_len = cycle_source_frames[-1] - cycle_source_frames[0]
-                    if cycle_len > 0:
-                        # Calculate how many cycles we need to cover the full range
-                        first_cycle_frame = cycle_source_frames[0]
-                        cycles_needed = ((frame_end - first_cycle_frame) // cycle_len) + 1
-                        
-                        # Generate all cycle extensions
-                        for cycle_idx in range(cycles_needed):
-                            offset = cycle_idx * cycle_len
-                            for base_frame in cycle_source_frames:
-                                new_frame = base_frame + offset
-                                if frame_start <= new_frame <= frame_end:
-                                    extended_frames.add(new_frame)
-                        
+            extended_frames.add(frame_start)
 
             all_frames_to_bake = sorted(extended_frames)
-            # Update keyframe_times to include all extended frames for proper sparse key detection
             keyframe_times.update(extended_frames)
         elif full_range:
             all_frames_to_bake = list(range(frame_start, frame_end + 1))
         else:
             all_frames_to_bake = sorted(list(keyframe_times))
+
+        # Final safety check: ensure all frames are within valid range
+        all_frames_to_bake = sorted(
+            {f for f in all_frames_to_bake if frame_start <= f <= frame_end}
+        )
 
         # debug: frame count chosen
         try:
@@ -652,8 +811,38 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         except Exception:
             pass
 
-        total_frames = len(all_frames_to_bake)
+        len(all_frames_to_bake)
         shared_cache = {}
+        last_baked_states: Dict[str, List[Any]] = {}
+
+        def _bone_state_equivalent(
+            prev_values: List[Any], new_values: List[Any], tol: float = 1e-6
+        ) -> bool:
+            if len(prev_values) != len(new_values):
+                return False
+
+            prev_components, prev_style, prev_direction = prev_values
+            new_components, new_style, new_direction = new_values
+
+            if prev_style != new_style or prev_direction != new_direction:
+                return False
+
+            if len(prev_components) != len(new_components):
+                return False
+
+            for idx in range(len(prev_components)):
+                if abs(prev_components[idx] - new_components[idx]) > tol:
+                    return False
+
+            return True
+
+        # Ensure dependency graph is properly updated before baking
+        depsgraph.update()
+
+        # Set to first frame to ensure proper initialization
+        ctx.scene.frame_set(frame_start)
+        depsgraph.update()
+
         for i, frame in enumerate(all_frames_to_bake):
             ctx.scene.frame_set(frame)
             # --- OPTIMIZATION: Pass the existing depsgraph instead of re-evaluating. ---
@@ -671,7 +860,7 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
                 shared_cache,
             )
             final_kf_state = {}
-            is_boundary_frame = (frame == frame_start or frame == frame_end)
+            is_boundary_frame = frame == frame_start or frame == frame_end
 
             is_sparse_key = frame in keyframe_times
             if is_sparse_key:
@@ -694,6 +883,8 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
                     should_bake = True
                 elif is_animated and is_sparse_key:
                     should_bake = True
+                elif is_animated and is_boundary_frame:
+                    should_bake = True
                 elif is_animated:
                     # Check whether this frame falls within any BEZIER segment for this bone
                     for start_frame, end_frame in bezier_segments.get(bone_name, set()):
@@ -707,43 +898,147 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
                 # Use the armature's action to find easing, if it exists.
                 interpolation, easing = get_easing_for_bone(action, bone_name, frame)
 
-                # Constrained bones or keys without explicit interpolation (like from IK) become Linear.
-                if is_constrained or not interpolation:
-                    roblox_style, roblox_direction = ("Linear", "Out")
-                else:
-                    roblox_style, roblox_direction = map_blender_to_roblox_easing(
-                        interpolation, easing)
+                # Respect explicit keyframe interpolation when available. Fall back to Linear only when
+                # Blender does not provide interpolation data (e.g. constraint-only output).
+                previous_state = last_baked_states.get(bone_name)
 
-                final_kf_state[bone_name] = [
-                    cframe_data, roblox_style, roblox_direction]
+                if not interpolation and bone_name in per_bone_interpolation:
+                    # Look up interpolation straight from the cached fcurve data if available
+                    cached = per_bone_interpolation[bone_name].get(frame)
+                    if cached:
+                        interpolation, easing = cached
+
+                # If still no interpolation and this is a constrained bone, try to inherit from constraint sources
+                if not interpolation and is_constrained:
+                    for constraint_bone in ao_eval.pose.bones:
+                        if constraint_bone.name == bone_name:
+                            for constraint in constraint_bone.constraints:
+                                if (
+                                    hasattr(constraint, "target")
+                                    and constraint.target
+                                    and constraint.target.animation_data
+                                    and constraint.target.animation_data.action
+                                ):
+                                    # Check if the constraint target has keyframe data at this frame
+                                    target_action = (
+                                        constraint.target.animation_data.action
+                                    )
+                                    target_fcurves = get_action_fcurves(target_action)
+                                    if target_fcurves:
+                                        for fcurve in target_fcurves:
+                                            if (
+                                                fcurve.data_path.startswith(
+                                                    "pose.bones"
+                                                )
+                                                and constraint.subtarget
+                                            ):
+                                                match = re.search(
+                                                    r'pose\.bones\["(.+?)"\]',
+                                                    fcurve.data_path,
+                                                )
+                                                if (
+                                                    match
+                                                    and match.group(1)
+                                                    == constraint.subtarget
+                                                ):
+                                                    for kp in fcurve.keyframe_points:
+                                                        if abs(kp.co.x - frame) < 0.5:
+                                                            interpolation, easing = (
+                                                                kp.interpolation,
+                                                                kp.easing,
+                                                            )
+                                                            break
+                                            if interpolation:
+                                                break
+                                if interpolation:
+                                    break
+                            if interpolation:
+                                break
+
+                if interpolation:
+                    roblox_style, roblox_direction = map_blender_to_roblox_easing(
+                        interpolation, easing
+                    )
+                elif previous_state is not None:
+                    roblox_style, roblox_direction = (
+                        previous_state[1],
+                        previous_state[2],
+                    )
+                else:
+                    roblox_style, roblox_direction = ("Linear", "Out")
+
+                candidate_state = [cframe_data, roblox_style, roblox_direction]
+
+                is_constant_hold = (
+                    interpolation == "CONSTANT"
+                    and not is_sparse_key
+                    and not is_boundary_frame
+                )
+
+                if is_constant_hold:
+                    if previous_state is not None:
+                        continue
+
+                if not is_sparse_key and not is_boundary_frame:
+                    if previous_state and _bone_state_equivalent(
+                        previous_state, candidate_state
+                    ):
+                        continue
+
+                final_kf_state[bone_name] = candidate_state
 
             if final_kf_state:
-                time_in_seconds = (frame - start_time_offset) / fps
+                time_in_seconds = (frame - frame_start) / fps
                 collected.append({"t": time_in_seconds, "kf": final_kf_state})
+                for baked_bone, state in final_kf_state.items():
+                    last_baked_states[baked_bone] = state
 
         # 4.5. Safety sort to ensure keyframes are always ordered correctly
         # This prevents rare floating point precision issues from causing unordered keyframes
-        collected.sort(key=lambda kf: kf['t'])
+        collected.sort(key=lambda kf: kf["t"])
 
         # 5. Optimization - remove consecutive duplicate keyframes.
         if len(collected) > 2:
+
+            def _kf_states_equivalent(
+                prev_state: Dict[str, List[Any]],
+                new_state: Dict[str, List[Any]],
+                tol: float = 1e-6,
+            ) -> bool:
+                if prev_state.keys() != new_state.keys():
+                    return False
+
+                for bone_name, prev_values in prev_state.items():
+                    new_values = new_state.get(bone_name)
+                    if new_values is None:
+                        return False
+
+                    if not _bone_state_equivalent(prev_values, new_values, tol):
+                        return False
+
+                return True
+
             optimized_kfs = [collected[0]]
             for i in range(1, len(collected) - 1):
                 kf_data = collected[i]
-                is_explicit_key = kf_data['t'] * desired_fps + \
-                    start_time_offset in keyframe_times
-                has_constrained_bone = any(
-                    bone_name in constrained_bones for bone_name in kf_data['kf'])
+                frame_from_time = int(round(kf_data["t"] * desired_fps + frame_start))
+                is_explicit_key = frame_from_time in keyframe_times
 
-                if is_explicit_key or has_constrained_bone or kf_data['kf'] != optimized_kfs[-1]['kf']:
+                if is_explicit_key:
                     optimized_kfs.append(kf_data)
+                    continue
+
+                if not _kf_states_equivalent(optimized_kfs[-1]["kf"], kf_data["kf"]):
+                    optimized_kfs.append(kf_data)
+
             optimized_kfs.append(collected[-1])
             collected = optimized_kfs
 
-        final_duration = (max(keyframe_times) - start_time_offset) / \
-            desired_fps if keyframe_times else 0
+        final_duration = (
+            (frame_end - frame_start) / desired_fps if frame_end >= frame_start else 0
+        )
         result = {"t": final_duration, "kfs": collected}
-        
+
     else:
         # No NLA, no action, and no constraints. Bake a single frame of the current pose.
         # Also grab the evaluated state for the single-frame pose bake
@@ -776,4 +1071,3 @@ def serialize(ao: 'bpy.types.Object') -> Dict[str, Any]:
         return None
 
     return result
-

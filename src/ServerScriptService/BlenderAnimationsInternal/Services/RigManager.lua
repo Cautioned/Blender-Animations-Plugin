@@ -224,7 +224,26 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 	State.loadingEnabled:set(true)
 	self:clearWarnings()
 
-	self.playbackService:stopAnimationAndDisconnect({ background = true })
+	local previousAnimator = State.activeAnimator
+	local previousRigModel = State.activeRigModel
+
+	if rigModel == nil then
+		-- No new rig selected; keep playing on previous animator if it exists
+		State.loadingEnabled:set(false)
+		return
+	end
+
+	if previousRigModel and previousRigModel ~= rigModel then
+		if previousAnimator then
+			self.playbackService:stopAnimationAndDisconnect({
+				background = true,
+				animatorOverride = previousAnimator,
+			})
+		end
+	end
+
+	-- explicitly stop current animation before switching to the new rig
+	self.playbackService:stopAnimationAndDisconnect()
 
 	if not rigModel then
 		State.activeRigModel = nil
@@ -260,11 +279,13 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 
 	-- Check model size to prevent performance issues
 	local descendantCount = 0
-	for _ in pairs(rigModel:GetDescendants()) do
-		descendantCount = descendantCount + 1
-		if descendantCount > 5000 then -- Prevent performance issues with huge models
-			self:addWarning("Model has too many descendants (" .. descendantCount .. "). This may cause performance issues.")
-			break
+	for _, descendant in pairs(rigModel:GetDescendants()) do
+		if descendant:IsA("Part") then
+			descendantCount = descendantCount + 1
+			if descendantCount > 5000 then -- Prevent performance issues with huge models
+				self:addWarning("Model has too many parts (" .. descendantCount .. "). This may cause performance issues.")
+				break
+			end
 		end
 	end
 

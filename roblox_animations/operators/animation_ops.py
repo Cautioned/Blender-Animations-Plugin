@@ -10,7 +10,12 @@ from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper
 from bpy.props import StringProperty
 from ..animation.serialization import serialize, is_deform_bone_rig
-from ..animation.import_export import get_mapping_error_bones, prepare_for_kf_map, copy_anim_state, apply_ao_transform
+from ..animation.import_export import (
+    get_mapping_error_bones,
+    prepare_for_kf_map,
+    copy_anim_state,
+    apply_ao_transform,
+)
 from ..core.utils import get_scene_fps, set_scene_fps
 
 
@@ -32,8 +37,7 @@ class OBJECT_OT_ApplyTransform(bpy.types.Operator):
 
     def execute(self, context):
         if not bpy.context.scene.keying_sets.active:
-            self.report(
-                {"ERROR"}, "There is no active keying set, this is required.")
+            self.report({"ERROR"}, "There is no active keying set, this is required.")
             return {"FINISHED"}
 
         apply_ao_transform(bpy.context.view_layer.objects.active)
@@ -57,14 +61,12 @@ class OBJECT_OT_MapKeyframes(bpy.types.Operator):
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         armature_name = settings.rbx_anim_armature if settings else None
         if not bpy.context.scene.keying_sets.active:
-            self.report(
-                {"ERROR"}, "There is no active keying set, this is required.")
+            self.report({"ERROR"}, "There is no active keying set, this is required.")
             return {"FINISHED"}
 
         ao_imp = bpy.context.view_layer.objects.active
 
-        err_mappings = get_mapping_error_bones(
-            bpy.data.objects[armature_name], ao_imp)
+        err_mappings = get_mapping_error_bones(bpy.data.objects[armature_name], ao_imp)
         if len(err_mappings) > 0:
             self.report(
                 {"ERROR"},
@@ -91,7 +93,10 @@ class OBJECT_OT_Bake(bpy.types.Operator):
         # Allow baking if there's a selected armature
         settings = getattr(context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
-        return arm_name in bpy.data.objects and bpy.data.objects[arm_name].type == 'ARMATURE'
+        return (
+            arm_name in bpy.data.objects
+            and bpy.data.objects[arm_name].type == "ARMATURE"
+        )
 
     def execute(self, context):
         try:
@@ -101,39 +106,42 @@ class OBJECT_OT_Bake(bpy.types.Operator):
             settings = getattr(context.scene, "rbx_anim_settings", None)
             armature_name = settings.rbx_anim_armature if settings else None
             ao = bpy.data.objects[armature_name]
-            
-            if ao.type != 'ARMATURE':
+
+            if ao.type != "ARMATURE":
                 self.report(
-                    {"ERROR"}, f"Selected object '{armature_name}' is not an armature")
+                    {"ERROR"}, f"Selected object '{armature_name}' is not an armature"
+                )
                 return {"CANCELLED"}
-                
+
             # Check if this is a deform bone rig or if deform bone serialization is forced
             force_deform = getattr(settings, "force_deform_bone_serialization", False)
             use_deform_bone_serialization = is_deform_bone_rig(ao) or force_deform
-            
+
             serialized = serialize(ao)
             if not serialized:
                 self.report({"ERROR"}, "Failed to serialize animation")
                 return {"CANCELLED"}
-                
+
             encoded = json.dumps(serialized, separators=(",", ":"))
-            compressed = zlib.compress(encoded.encode('utf-8'))
-            b64_data = base64.b64encode(compressed).decode('utf-8')
-            
+            compressed = zlib.compress(encoded.encode("utf-8"))
+            b64_data = base64.b64encode(compressed).decode("utf-8")
+
             bpy.context.window_manager.clipboard = b64_data
-            
+
             duration = serialized["t"]
             num_keyframes = len(serialized["kfs"])
-            
+
             # Include information about the rig type in the report
-            rig_type = "Deform Bone Rig" if use_deform_bone_serialization else "Motor6D Rig"
+            rig_type = (
+                "Deform Bone Rig" if use_deform_bone_serialization else "Motor6D Rig"
+            )
             self.report(
                 {"INFO"},
-                f"Baked {rig_type} animation data exported to clipboard ({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS)."
+                f"Baked {rig_type} animation data exported to clipboard ({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS).",
             )
         except Exception as e:
             self.report({"ERROR"}, f"Error during baking: {str(e)}")
-            
+
         return {"FINISHED"}
 
 
@@ -147,16 +155,19 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
 
     filter_glob: StringProperty(
         default="*.rbxanim",
-        options={'HIDDEN'},
+        options={"HIDDEN"},
         maxlen=255,  # Max internal buffer length, longer would be clamped.
     )
-    
+
     @classmethod
     def poll(cls, context):
         # Allow baking if there's a selected armature
         settings = getattr(context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
-        return arm_name in bpy.data.objects and bpy.data.objects[arm_name].type == 'ARMATURE'
+        return (
+            arm_name in bpy.data.objects
+            and bpy.data.objects[arm_name].type == "ARMATURE"
+        )
 
     def execute(self, context):
         try:
@@ -173,36 +184,38 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
             else:
                 # Fall back to active object
                 armature = bpy.context.view_layer.objects.active
-                
-            if not armature or armature.type != 'ARMATURE':
+
+            if not armature or armature.type != "ARMATURE":
                 self.report({"ERROR"}, "No valid armature selected")
                 return {"CANCELLED"}
-            
+
             # Check if this is a deform bone rig or if deform bone serialization is forced
             force_deform = getattr(settings, "force_deform_bone_serialization", False)
             use_deform_bone_serialization = is_deform_bone_rig(armature) or force_deform
-            
+
             serialized = serialize(armature)
             if not serialized:
                 self.report({"ERROR"}, "Failed to serialize animation")
                 return {"CANCELLED"}
-                
+
             encoded = json.dumps(serialized, separators=(",", ":"))
             compressed_data = zlib.compress(encoded.encode(), 9)
 
             # Save to file using the provided file path
             filepath = self.filepath
-            with open(filepath, 'wb') as file:
+            with open(filepath, "wb") as file:
                 file.write(compressed_data)
 
             duration = serialized["t"]
             num_keyframes = len(serialized["kfs"])
-            
+
             # Include information about the rig type in the report
-            rig_type = "Deform Bone Rig" if use_deform_bone_serialization else "Motor6D Rig"
+            rig_type = (
+                "Deform Bone Rig" if use_deform_bone_serialization else "Motor6D Rig"
+            )
             self.report(
                 {"INFO"},
-                f"Baked {rig_type} animation data exported to {filepath} ({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS)."
+                f"Baked {rig_type} animation data exported to {filepath} ({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS).",
             )
             return {"FINISHED"}
         except Exception as e:

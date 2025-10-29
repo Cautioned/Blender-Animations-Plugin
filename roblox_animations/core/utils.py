@@ -5,14 +5,9 @@ Utility functions for the Roblox Animations Blender Addon.
 import bpy
 import hashlib
 import time
-import re
-from mathutils import Vector, Matrix
+from mathutils import Matrix
 from .constants import (
     get_blender_version,
-    get_transform_to_blender,
-    identity_cf,
-    cf_round,
-    cf_round_fac,
     CACHE_DURATION,
     HASH_CACHE_DURATION,
 )
@@ -25,8 +20,6 @@ _action_hash_cache = {}
 _action_hash_cache_timestamp = 0
 
 # Animation tracking globals
-armature_update_timestamps = {}
-last_known_synced_armature = ""
 armature_anim_hashes = {}
 
 
@@ -113,7 +106,9 @@ def get_action_channelbag(action, slot=None):
                 target_slot = slots_attr[0]
             else:
                 try:
-                    target_slot = action.slots.new(id_type="OBJECT", name=f"Object.{action.name}")
+                    target_slot = action.slots.new(
+                        id_type="OBJECT", name=f"Object.{action.name}"
+                    )
                 except TypeError:
                     target_slot = action.slots.new(id_type="OBJECT")
                 except Exception:
@@ -129,7 +124,9 @@ def get_action_channelbag(action, slot=None):
                 anim_utils = None
 
             if anim_utils is not None:
-                ensure_fn = getattr(anim_utils, "action_ensure_channelbag_for_slot", None)
+                ensure_fn = getattr(
+                    anim_utils, "action_ensure_channelbag_for_slot", None
+                )
                 get_fn = getattr(anim_utils, "action_get_channelbag_for_slot", None)
                 try:
                     if ensure_fn is not None:
@@ -139,7 +136,9 @@ def get_action_channelbag(action, slot=None):
                 except (AttributeError, TypeError) as exc:
                     slot_errors.append(exc)
                     channelbag = None
-                except Exception as exc:  # pragma: no cover - defensive logging for unknown failures
+                except (
+                    Exception
+                ) as exc:  # pragma: no cover - defensive logging for unknown failures
                     slot_errors.append(exc)
                     channelbag = None
 
@@ -151,6 +150,7 @@ def get_action_channelbag(action, slot=None):
                 return direct_channelbag
 
             if hasattr(target_slot, "fcurves"):
+
                 class _LegacySlotChannelbag:
                     def __init__(self, slot_obj):
                         self.fcurves = slot_obj.fcurves
@@ -159,7 +159,11 @@ def get_action_channelbag(action, slot=None):
                 return _LegacySlotChannelbag(target_slot)
 
         if modern_action_api and slot_errors:
-            messages = ", ".join(sorted({type(err).__name__ + ": " + str(err) for err in slot_errors if err}))
+            messages = ", ".join(
+                sorted(
+                    {type(err).__name__ + ": " + str(err) for err in slot_errors if err}
+                )
+            )
             raise RuntimeError(
                 "failed to access Blender action channelbag via slots API; "
                 "ensure bpy_extras.anim_utils is available and the action has a valid slot. "
@@ -167,6 +171,7 @@ def get_action_channelbag(action, slot=None):
             )
 
     if hasattr(action, "fcurves"):
+
         class _LegacyActionChannelbag:
             def __init__(self, legacy_action):
                 self.fcurves = legacy_action.fcurves
@@ -192,10 +197,9 @@ def get_action_hash(action):
     fcurves = get_action_fcurves(action)
     if not fcurves:
         return ""
-    
+
     # Sort fcurves to ensure consistent hash
-    fcurves = sorted(fcurves, key=lambda fc: (
-        fc.data_path, fc.array_index))
+    fcurves = sorted(fcurves, key=lambda fc: (fc.data_path, fc.array_index))
 
     hash_parts = []
     for fcurve in fcurves:
@@ -226,7 +230,6 @@ def get_timeline_hash():
         scene.frame_start,
         scene.frame_end,
         scene.render.fps,
-        scene.frame_current,
     )
     return hashlib.md5(str(timeline_data).encode("utf-8")).hexdigest()
 
@@ -236,11 +239,11 @@ def get_armature_timeline_hash(armature_name):
     obj = bpy.data.objects.get(armature_name)
     if not obj or obj.type != "ARMATURE":
         return ""
-    
+
     action = obj.animation_data.action if obj.animation_data else None
     action_hash = get_action_hash(action)
     timeline_hash = get_timeline_hash()
-    
+
     # Combine action and timeline hashes
     combined_data = f"{action_hash}:{timeline_hash}"
     return hashlib.md5(combined_data.encode("utf-8")).hexdigest()
@@ -249,69 +252,42 @@ def get_armature_timeline_hash(armature_name):
 def get_cached_armature_hash(armature_name):
     """Get cached combined hash (action + timeline) or compute if cache is stale"""
     global _action_hash_cache, _action_hash_cache_timestamp
-    
+
     if not armature_name:
         return ""
-    
+
     current_time = time.time()
     cache_key = f"{armature_name}_combined"  # Use armature name as cache key
-    
-    if (cache_key not in _action_hash_cache or 
-        current_time - _action_hash_cache_timestamp > HASH_CACHE_DURATION):
-        
+
+    if (
+        cache_key not in _action_hash_cache
+        or current_time - _action_hash_cache_timestamp > HASH_CACHE_DURATION
+    ):
         # Refresh cache with combined hash
         _action_hash_cache[cache_key] = get_armature_timeline_hash(armature_name)
         _action_hash_cache_timestamp = current_time
-    
+
     return _action_hash_cache[cache_key]
-
-
-def has_animation_changed(action):
-    """Check if animation has changed since last check - simplified approach"""
-    global _last_animation_check_time, _animation_change_detected
-    
-    current_time = time.time()
-    
-    # Always return True for now to ensure changes are detected
-    # The caching will still provide performance benefits
-    # TODO: Implement more reliable change detection
-    return True
-
-
-def on_animation_update(scene):
-    """depsgraph handler to detect animation changes"""
-    global last_known_synced_armature, armature_anim_hashes, armature_update_timestamps
-    if not last_known_synced_armature:
-        return
-
-    obj = bpy.data.objects.get(last_known_synced_armature)
-    if not (obj and obj.type == "ARMATURE"):
-        return
-
-    action = obj.animation_data.action if obj.animation_data else None
-
-    current_hash = get_action_hash(action)
-    last_hash = armature_anim_hashes.get(obj.name)
-
-    if current_hash != last_hash:
-        print(f"Keyframe change detected for {obj.name}. Updating timestamp.")
-        armature_update_timestamps[obj.name] = time.time()
-        armature_anim_hashes[obj.name] = current_hash
 
 
 def get_cached_armatures():
     """Get cached armature list or refresh if cache is stale"""
     global _armature_cache, _armature_cache_timestamp
-    
+
     current_time = time.time()
-    if (_armature_cache is None or 
-        current_time - _armature_cache_timestamp > CACHE_DURATION):
-        
+    if (
+        _armature_cache is None
+        or current_time - _armature_cache_timestamp > CACHE_DURATION
+    ):
         # Refresh cache
-        _armature_cache = [obj.name for obj in bpy.data.objects if obj.type == 'ARMATURE']
+        _armature_cache = [
+            obj.name for obj in bpy.data.objects if obj.type == "ARMATURE"
+        ]
         _armature_cache_timestamp = current_time
-        print(f"Blender Addon: Refreshed armature cache with {len(_armature_cache)} armatures")
-    
+        print(
+            f"Blender Addon: Refreshed armature cache with {len(_armature_cache)} armatures"
+        )
+
     return _armature_cache
 
 
@@ -376,7 +352,9 @@ def get_unique_name(base_name):
 def find_master_collection_for_object(obj):
     """Find the top-level 'RIG: ' collection for a given object."""
     for coll in bpy.data.collections:
-        if coll.name.startswith("RIG: ") and obj.name in [o.name for o in coll.all_objects]:
+        if coll.name.startswith("RIG: ") and obj.name in [
+            o.name for o in coll.all_objects
+        ]:
             return coll
     return None
 
@@ -406,4 +384,3 @@ def get_scene_fps():
     """Get the current scene FPS"""
     scene = bpy.context.scene
     return scene.render.fps / scene.render.fps_base
-

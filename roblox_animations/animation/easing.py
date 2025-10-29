@@ -2,8 +2,7 @@
 Easing and interpolation utilities for animation export.
 """
 
-import re
-from ..core.constants import identity_cf
+import bpy
 from ..core.utils import get_action_fcurves
 
 
@@ -19,19 +18,20 @@ def get_easing_for_bone(action, bone_name, frame):
     fcurves = get_action_fcurves(action)
     if not fcurves:
         return None, None
-    
+
     # Check across all transform properties for a keyframe at this frame
-    props_to_check = [
-        ('location', 3), ('rotation_quaternion', 4), ('scale', 3)]
-    
+    props_to_check = [("location", 3), ("rotation_quaternion", 4), ("scale", 3)]
+
     # Find the closest keyframe to the target frame (within 0.5 frames)
     closest_interpolation = None
     closest_easing = None
-    closest_distance = float('inf')
-    
+    closest_distance = float("inf")
+
     for prop_name, num_indices in props_to_check:
         for i in range(num_indices):
-            datapath = f'pose.bones["{bone_name}"].{prop_name}'
+            datapath = (
+                f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].{prop_name}'
+            )
             fcurve = fcurves.find(datapath, index=i)
             if fcurve:
                 for kp in fcurve.keyframe_points:
@@ -40,7 +40,7 @@ def get_easing_for_bone(action, bone_name, frame):
                         closest_interpolation = kp.interpolation
                         closest_easing = kp.easing
                         closest_distance = distance
-    
+
     return closest_interpolation, closest_easing
 
 
@@ -51,12 +51,12 @@ def map_blender_to_roblox_easing(interpolation, easing):
     """
     # Define the direct mappings from Blender interpolation types to Roblox EasingStyles.
     style_map = {
-            "LINEAR": "Linear",
-            "CONSTANT": "Constant",
-            "CUBIC": "CubicV2",
-            "BOUNCE": "Bounce",
-            "ELASTIC": "Elastic",
-        }    
+        "LINEAR": "Linear",
+        "CONSTANT": "Constant",
+        "CUBIC": "CubicV2",
+        "BOUNCE": "Bounce",
+        "ELASTIC": "Elastic",
+    }
 
     roblox_style = style_map.get(interpolation, None)
 

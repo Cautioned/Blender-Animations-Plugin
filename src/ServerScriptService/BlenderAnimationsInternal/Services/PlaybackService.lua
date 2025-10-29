@@ -8,7 +8,7 @@ local AnimationClipProvider = game:GetService("AnimationClipProvider")
 local Utils = require(script.Parent.Parent:WaitForChild("Utils"))
 
 type HeartbeatType = { conn: RBXScriptConnection? }
-type StopOptions = { background: boolean? }
+type StopOptions = { background: boolean?, animatorOverride: Instance? }
 
 function PlaybackService.new(State, Types)
 	local self = setmetatable({}, PlaybackService)
@@ -64,7 +64,7 @@ function PlaybackService:stopAnimationAndDisconnect(options: StopOptions?)
 		doInBackground = true
 	end
 
-	local animatorToStop = self.State.activeAnimator
+	local animatorToStop = if options and options.animatorOverride then options.animatorOverride else self.State.activeAnimator
 	local heartbeatToDisconnect = self.State.heartbeat.conn
 
 	-- Immediately clear the state for the new animation, but leave the animator.
@@ -90,17 +90,21 @@ function PlaybackService:stopAnimationAndDisconnect(options: StopOptions?)
 end
 
 function PlaybackService:updateUI()
-	if self.State.isPlaying:get() then
-		if self.State.isReversed:get() then
+	local isPlaying = self.State.isPlaying:get()
+	local isReversed = self.State.isReversed:get()
+	
+	if isPlaying then
+		if isReversed then
+			-- Playing in reverse: show pause on reverse button, play on main button
 			self.State.playPauseButtonImage:set("rbxasset://textures/AnimationEditor/button_control_play.png")
 			self.State.reversePlayPauseButtonImage:set("rbxasset://textures/AnimationEditor/button_pause_white@2x.png")
 		else
+			-- Playing forward: show pause on main button, reverse on reverse button
 			self.State.playPauseButtonImage:set("rbxasset://textures/AnimationEditor/button_pause_white@2x.png")
-			self.State.reversePlayPauseButtonImage:set(
-				"rbxasset://textures/AnimationEditor/button_control_reverseplay.png"
-			)
+			self.State.reversePlayPauseButtonImage:set("rbxasset://textures/AnimationEditor/button_control_reverseplay.png")
 		end
 	else
+		-- Not playing: show play on main button, reverse on reverse button
 		self.State.playPauseButtonImage:set("rbxasset://textures/AnimationEditor/button_control_play.png")
 		self.State.reversePlayPauseButtonImage:set("rbxasset://textures/AnimationEditor/button_control_reverseplay.png")
 	end
@@ -119,11 +123,13 @@ end
 
 function PlaybackService:onPlayPauseButtonActivated()
 	if self.State.isPlaying:get() then
+		-- Currently playing, pause it
 		self.State.isPlaying:set(false)
 		if self.State.currentAnimTrack then
 			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
 		end
 	else
+		-- Not playing, start playing forward
 		self.State.isPlaying:set(true)
 		self.State.isReversed:set(false)
 		if self.State.isFinished:get() then
@@ -139,32 +145,37 @@ end
 
 function PlaybackService:onReverseButtonActivated()
 	if self.State.isPlaying:get() and self.State.isReversed:get() then
+		-- Currently playing in reverse, stop it
 		self.State.isPlaying:set(false)
 		if self.State.currentAnimTrack then
 			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
 		end
 	else
+		-- Start playing in reverse
 		self.State.isPlaying:set(true)
 		self.State.isReversed:set(true)
 		if self.State.playhead:get() == 0 and self.State.animationLength:get() then
 			self:seekAnimationToTime(self.State.animationLength:get())
 		end
-		if self.State.isPlaying:get() and self.State.currentAnimTrack then
+		if self.State.currentAnimTrack then
 			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(-1)
 		end
-		self:updateUI()
 	end
+	self:updateUI()
 end
 
 function PlaybackService:onSliderChange(newValue: number)
 	if self.State.currentAnimTrack then
-		if self.State.isPlaying:get() then
-			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
-			self:seekAnimationToTime(newValue);
-			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(self.State.isReversed:get() and -1 or 1)
-		else
-			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
-			self:seekAnimationToTime(newValue)
+		local wasPlaying = self.State.isPlaying:get()
+		local wasReversed = self.State.isReversed:get();
+		
+		-- Pause animation while seeking
+		(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(0)
+		self:seekAnimationToTime(newValue)
+		
+		-- Resume animation if it was playing
+		if wasPlaying then
+			(self.State.currentAnimTrack :: AnimationTrack):AdjustSpeed(wasReversed and -1 or 1)
 		end
 	end
 end
@@ -215,23 +226,31 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 		self.State.currentAnimTrack = animator:LoadAnimation(animation)
 	end
 
-	if self.State.currentAnimTrack then
-		local animTrack = self.State.currentAnimTrack :: AnimationTrack
-		animTrack.Looped = false
-		self:onPlayPauseButtonActivated()
-	else
+    if self.State.currentAnimTrack then
+        local animTrack = self.State.currentAnimTrack :: AnimationTrack
+        animTrack.Looped = false
+        -- explicitly set forward play state instead of toggling
+        self.State.isReversed:set(false)
+        self.State.isFinished:set(false)
+        self.State.isPlaying:set(true)
+        animTrack:AdjustSpeed(1)
+        self:updateUI()
+    else
 		self:stopAnimationAndDisconnect()
 		warn("Failed to load animation track.")
 	end
 
-	local function playAnimation()
-		if self.State.currentAnimTrack then
-			local animTrack = self.State.currentAnimTrack :: AnimationTrack
-			animTrack.TimePosition = 0
-			animTrack:Play()
-			self.State.isPlaying:set(true)
-		end
-	end
+    local function playAnimation()
+        if self.State.currentAnimTrack then
+            local animTrack = self.State.currentAnimTrack :: AnimationTrack
+            animTrack.TimePosition = 0
+            animTrack:Play()
+            -- ensure ui reflects the current state
+            self.State.isPlaying:set(true)
+            self.State.isReversed:set(false)
+            self:updateUI()
+        end
+    end
 
 	playAnimation()
 
@@ -255,7 +274,7 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 			if self.State.currentAnimTrack then
 				local animTrack = self.State.currentAnimTrack :: AnimationTrack
 				if animTrack.TimePosition >= animLength - 0.01 then
-					if self.State.loopAnimation:get() then
+					if self.State.loopAnimation:get() and self.State.isPlaying:get() then
 						playAnimation()
 					else
 						if self.State.isPlaying:get() then
@@ -273,11 +292,11 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 						end
 					end
 				elseif animTrack.TimePosition <= 0 then
-					if self.State.isReversed:get() and self.State.loopAnimation:get() then
+					if self.State.isReversed:get() and self.State.loopAnimation:get() and self.State.isPlaying:get() then
 						if self.State.animationLength:get() then
 							self:seekAnimationToTime(self.State.animationLength:get())
 						end
-					elseif self.State.isReversed:get() then
+					elseif self.State.isReversed:get() and self.State.isPlaying:get() then
 						if self.State.isPlaying:get() then
 							self.State.isPlaying:set(false)
 							self:updateUI()

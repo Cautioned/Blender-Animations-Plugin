@@ -35,6 +35,12 @@ function BlenderSyncManager:updateAvailableArmatures()
 		if #armatures == 1 and not State.selectedArmature:get() then
 			State.selectedArmature:set(armatures[1])
 			print("Auto-selected single armature:", armatures[1].name)
+			
+			-- Auto-start live sync if enabled and there's only one armature
+			if State.liveSyncEnabled:get() and State.isServerConnected:get() then
+				print("Auto-starting live sync for single armature:", armatures[1].name)
+				self:startLiveSyncing()
+			end
 		end
 		
 		return true
@@ -123,7 +129,7 @@ function BlenderSyncManager:startLiveSyncing()
 
 	self.liveSyncCoroutine = coroutine.create(function()
 		-- print("Live sync started.")
-		local pollInterval = 0.1  -- Start with fast polling
+		local pollInterval = 0.033  -- Start with fast polling
 		local noChangeCount = 0
 		local maxPollInterval = 2.0  -- Maximum 2 seconds between polls
 		local lastArmatureRefresh = 0
@@ -165,7 +171,7 @@ function BlenderSyncManager:startLiveSyncing()
 							State.serverStatus:set("Live Sync: Connection lost")
 						end
 						-- Reset polling on connection loss
-						pollInterval = 0.1
+						pollInterval = 0.033
 						noChangeCount = 0
 					else
 						if State.serverStatus:get() == "Live Sync: Connection lost" then
@@ -176,12 +182,12 @@ function BlenderSyncManager:startLiveSyncing()
 							self:importAnimationFromBlender()
 							State.lastKnownBlenderAnimHash:set((err :: any).hash)
 							-- Reset to fast polling when changes detected
-							pollInterval = 0.1
+							pollInterval = 0.033
 							noChangeCount = 0
 						else
 							-- No changes detected, gradually increase polling interval
 							noChangeCount += 1
-							pollInterval = math.min(0.1 + (noChangeCount * 0.1), maxPollInterval)
+							pollInterval = math.min(0.033 + (noChangeCount * 0.033), maxPollInterval)
 						end
 					end
 				end
@@ -233,3 +239,6 @@ function BlenderSyncManager:cleanup()
 end
 
 return BlenderSyncManager
+
+
+

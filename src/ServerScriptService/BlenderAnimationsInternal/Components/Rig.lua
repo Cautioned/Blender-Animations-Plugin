@@ -14,9 +14,11 @@ type self = {
 	priority: Enum.AnimationPriority,
 	keyframeNames: { { t: number, name: string } },
 	bones: { [string]: RigPart.RigPart },
+	bonesByInstance: { [Instance]: RigPart.RigPart },
 	isDeformRig: boolean,
 	boneHierarchy: { [string]: string? },
 	_jointCache: { [Instance]: { Motor6D } },
+	_duplicateBoneWarnings: { [string]: boolean }?,
 }
 
 function Rig.new(model: Model)
@@ -28,9 +30,11 @@ function Rig.new(model: Model)
 		priority = Enum.AnimationPriority.Action,
 		keyframeNames = {}, -- table with values each in the format: {t = number, name = string}
 		bones = {}, -- Initialize bones property
+		bonesByInstance = {},
 		isDeformRig = false, -- Flag to indicate if this is a deform bone rig
 		boneHierarchy = {}, -- Store bone parent relationships
 		_jointCache = {},
+		_duplicateBoneWarnings = {},
 	}
 	setmetatable(self, Rig)
 
@@ -174,18 +178,59 @@ function Rig:buildBoneHierarchy(allBones)
     -- intentionally unused local kept for readability when editing
     local _bones = self.bones
 
-	-- Populate bones array with RigPart objects for each bone
+	local unresolved = {}
 	for _, bone in ipairs(allBones) do
-		-- Find the parent RigPart (which should be a BasePart that's already in the rig)
-		local parentPart = self:FindRigPart(bone.Parent.Name)
+		unresolved[#unresolved + 1] = bone
+	end
 
-		if parentPart then
-			-- Create a new RigPart for the bone and add it to the parent's children
-            local rigPart = RigPart.new(self, bone, parentPart, true)
-            table.insert(parentPart.children, rigPart)
-            self.bones[bone.Name] = rigPart
-		else
-			warn("Could not find parent rig part for bone:", bone.Name, "Parent:", bone.Parent.Name)
+	local safetyCounter = 0
+	while #unresolved > 0 do
+		safetyCounter += 1
+		if safetyCounter > #unresolved + 5 then
+			for _, bone in ipairs(unresolved) do
+				local parentInstance = bone.Parent
+				warn(
+					"Could not resolve parent rig part for bone:",
+					bone.Name,
+					"Parent:",
+					parentInstance and parentInstance.Name or "<nil>"
+				)
+			end
+			break
+		end
+
+		local resolvedThisPass = false
+		for i = #unresolved, 1, -1 do
+			local bone = unresolved[i]
+			local parentInstance = bone.Parent
+			local parentPart = nil
+			if parentInstance then
+				parentPart = self:FindRigPartByInstance(parentInstance) or self:FindRigPart(parentInstance.Name)
+			end
+
+			if parentPart then
+				local rigPart = RigPart.new(self, bone, parentPart, true)
+				table.insert(parentPart.children, rigPart)
+				if self.bones[bone.Name] == nil then
+					self.bones[bone.Name] = rigPart
+				end
+				table.remove(unresolved, i)
+				resolvedThisPass = true
+			end
+		end
+
+		if not resolvedThisPass then
+			-- Avoid infinite loop if parents are missing entirely
+			for _, bone in ipairs(unresolved) do
+				local parentInstance = bone.Parent
+				warn(
+					"Could not resolve parent rig part for bone:",
+					bone.Name,
+					"Parent:",
+					parentInstance and parentInstance.Name or "<nil>"
+				)
+			end
+			break
 		end
 	end
 end
@@ -217,6 +262,10 @@ end
 
 function Rig:FindRigPart(name)
 	return self.bones[name]
+end
+
+function Rig:FindRigPartByInstance(instance: Instance)
+	return self.bonesByInstance and self.bonesByInstance[instance] or nil
 end
 
 function Rig:ClearPoses()
@@ -352,10 +401,27 @@ function Rig:LoadAnimation(data)
 					rigPart.isDeformBone = true
 				end
 
-				-- normalize each rotation vector
+				-- normalize each rotation vector, falling back to canonical axes if the vector is degenerate
 				for axis = 0, 2 do
-					local normvec = Vector3.new(cfc[4 + axis], cfc[7 + axis], cfc[10 + axis]).Unit
-					cfc[4 + axis], cfc[7 + axis], cfc[10 + axis] = normvec.X, normvec.Y, normvec.Z
+					local x = cfc[4 + axis]
+					local y = cfc[7 + axis]
+					local z = cfc[10 + axis]
+					local lengthSq = x * x + y * y + z * z
+					if lengthSq > 1e-8 then
+						local invLen = 1 / math.sqrt(lengthSq)
+						x *= invLen
+						y *= invLen
+						z *= invLen
+					else
+						if axis == 0 then
+							x, y, z = 1, 0, 0
+						elseif axis == 1 then
+							x, y, z = 0, 1, 0
+						else
+							x, y, z = 0, 0, 1
+						end
+					end
+					cfc[4 + axis], cfc[7 + axis], cfc[10 + axis] = x, y, z
 				end
 
 				rigPart:AddPose(kfdef.t, CFrame.new(unpack(cfc)), isDeformBone, easingStyle, easingDirection)
@@ -443,13 +509,14 @@ function Rig:RebuildAsDeformRig()
 
 	print("Rebuilding rig as a deform bone rig...")
 	self.isDeformRig = true
+	self.bones = {}
+	self.bonesByInstance = {}
 	if self.model.PrimaryPart then
 		self.root = RigPart.new(self, self.model.PrimaryPart, nil, true)
 	else
 		warn("Cannot rebuild as deform rig: Model has no PrimaryPart.")
 		self.root = nil
 	end
-	self.bones = {}
 	if self.root then -- Only call AddParts if root is not nil
 		self:AddParts(self.root)
 	end
@@ -457,7 +524,10 @@ end
 
 function Rig:AddParts(part)
 	for _, child in pairs(part.children) do
-		table.insert(self.bones, child)
+		if self.bones[child.part.Name] == nil then
+			self.bones[child.part.Name] = child
+		end
+		self.bonesByInstance[child.part] = child
 		self:AddParts(child)
 	end
 end
