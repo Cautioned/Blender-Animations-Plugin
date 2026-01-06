@@ -315,9 +315,12 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
             start_frame = scene.frame_start
             for bone in ao.pose.bones:
-                is_transformable = (
-                    not is_deform_rig and "is_transformable" in bone.bone
-                ) or (is_deform_rig and bone.bone.use_deform)
+                if is_deform_rig:
+                    is_transformable = bone.bone.use_deform
+                else:
+                    # Handle both boolean True and integer 1 for backward compatibility
+                    # We check truthiness to support both True (bool) and 1 (int)
+                    is_transformable = bool(bone.bone.get("is_transformable", False))
                 if is_transformable:
                     all_bone_data[bone.name] = {
                         start_frame: {
@@ -373,26 +376,18 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 bone_transform = cf_to_mat(cframe_components)
 
                 # --- Matrix Calculation ---
-                if is_deform_rig:
-                    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
-                    scale_factor = getattr(settings, "rbx_deform_rig_scale", 1.0)
+                # Check if this bone has Motor6D properties (from rig build)
+                has_motor6d_props = (
+                    "nicetransform" in pose_bone.bone
+                    and "transform" in pose_bone.bone
+                    and "transform1" in pose_bone.bone
+                )
 
-                    loc, rot, sca = bone_transform.decompose()
-                    loc_blender = Vector(
-                        (
-                            -loc.x * scale_factor,
-                            loc.y * scale_factor,
-                            -loc.z * scale_factor,
-                        )
-                    )
-                    sca_blender = Vector((sca.x, sca.z, sca.y))
-                    rot.x, rot.z = -rot.x, -rot.z
-                    loc_mat = Matrix.Translation(loc_blender)
-                    rot_mat = rot.to_matrix().to_4x4()
-                    sca_mat = Matrix.Diagonal(sca_blender).to_4x4()
-                    delta_transform = loc_mat @ rot_mat @ sca_mat
-                    rest_local_transform = pose_bone.bone.matrix_local
-                    final_matrix = rest_local_transform @ delta_transform
+                if not has_motor6d_props:
+                    # Simple delta path - works for deform bones and any bone without Motor6D data
+                    # The transform is a LOCAL delta in the bone's own space.
+                    # Just apply it directly to the rest pose.
+                    final_matrix = pose_bone.bone.matrix_local @ bone_transform
                 else:  # Motor6D rig
                     back_trans = transform_to_blender.inverted()
                     extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()

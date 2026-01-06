@@ -28,10 +28,12 @@ class OBJECT_OT_RunTests(bpy.types.Operator):
 
         try:
             # Only discover tests in the roblox_animations/tests directory
+            # We set top_level_dir to package_root.parent so that imports like 'from ..core' work
+            # because the module will be loaded as 'roblox_animations.tests.test_metadata'
             suite = loader.discover(
                 start_dir=str(tests_dir),
                 pattern="test_*.py",
-                top_level_dir=str(package_root),
+                top_level_dir=str(package_root.parent),
             )
         except Exception:  # pragma: no cover - defensive: discovery failure path
             err = traceback.format_exc()

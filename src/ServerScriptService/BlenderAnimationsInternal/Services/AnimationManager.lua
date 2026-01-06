@@ -145,7 +145,7 @@ function AnimationManager:saveAnimationRig()
 		return
 	end
 
-	local kfs = self:createKeyframeSequenceFromState()
+    local kfs = self:createKeyframeSequenceFromState()
 	if not kfs then
 		return
 	end
@@ -227,14 +227,43 @@ function AnimationManager:uploadAnimation()
 	if not kfs then
 		return
 	end
-	kfs.Parent = game.Workspace
+    kfs.Parent = game.Workspace
 
-	
-	SelectionService:Set({kfs})
-	self.plugin:SaveSelectedToRoblox()
+    -- upload the selected KeyframeSequence
+    SelectionService:Set({ kfs })
+    self.plugin:SaveSelectedToRoblox()
 
-	task.wait(2)
-	kfs:Destroy()
+    -- persist the uploaded sequence instead of deleting it
+    -- move it under the active rig's AnimSaves container for user access
+    local animSaves: any = State.activeRigModel:FindFirstChild("AnimSaves")
+    if not animSaves then
+        animSaves = Instance.new("ObjectValue")
+        animSaves.Name = "AnimSaves"
+        animSaves.Parent = State.activeRigModel
+    end
+
+    -- ensure unique name if needed
+    if State.uniqueNames:get() then
+        local existingNames = {}
+        for _, d in ipairs(animSaves:GetDescendants()) do
+            existingNames[d.Name] = true
+        end
+        local baseName = kfs.Name
+        local finalName = baseName
+        if existingNames[baseName] then
+            local i = 1
+            while true do
+                finalName = baseName .. "_" .. tostring(i)
+                if not existingNames[finalName] then
+                    break
+                end
+                i += 1
+            end
+        end
+        kfs.Name = finalName
+    end
+
+    kfs.Parent = animSaves
 end
 
 function AnimationManager:playSavedAnimation(animation)

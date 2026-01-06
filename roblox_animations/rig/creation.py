@@ -62,6 +62,14 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
     t2b = get_transform_to_blender()
     bone_dir = (t2b @ mat).to_3x3().to_4x4() @ Vector((0, 0, 1))
 
+    # Check if this bone is marked as a deform bone from Studio export
+    is_deform_bone = rigsubdef.get("isDeformBone", False)
+    if is_deform_bone:
+        # Mark as a deform bone for proper animation import handling
+        bone["rbx_is_deform_bone"] = True
+        bone["is_transformable"] = True
+        bone.use_deform = True
+
     if "jointtransform0" not in rigsubdef:
         # Rig root
         bone.head = (t2b @ mat).to_translation()
@@ -78,7 +86,9 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
         mat1 = cf_to_mat(rigsubdef["jointtransform1"])
         bone["transform0"] = _matrix_to_idprop(mat0)
         bone["transform1"] = _matrix_to_idprop(mat1)
-        bone["is_transformable"] = True
+        # Only set is_transformable for Motor6D bones if not already set for deform bones
+        if not is_deform_bone:
+            bone["is_transformable"] = True
 
         bone.parent = parent_bone
         o_trans = t2b @ (mat @ mat1)
@@ -89,10 +99,13 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
         bone.tail = real_tail
         bone.align_roll(bone_dir)
 
-        # store neutral matrix
+        # Store neutral matrix before any transforms (needed for all modes)
         pre_mat = bone.matrix
 
-        if rigging_type != "RAW":  # If so, apply some transform
+        # For RAW (nodes only), use original bone positions without any modifications
+        # This preserves the exact bone structure from the original rig data
+        if rigging_type != "RAW":
+            # For other rigging types, apply "nice" transforms for better visualization/IK
             if len(rigsubdef["children"]) == 1:
                 nextmat = cf_to_mat(rigsubdef["children"][0]["transform"])
                 nextmat1 = cf_to_mat(rigsubdef["children"][0]["jointtransform1"])
@@ -101,8 +114,9 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
                 if rigging_type == "CONNECT":  # Instantly connect
                     bone.tail = next_joint_pos
                 else:
+                    # For LOCAL_AXIS_EXTEND, determine best axis (calculation kept for consistency with backup.py)
                     if rigging_type == "LOCAL_AXIS_EXTEND":  # Allow non-Y too
-                        invtrf = pre_mat.inverted() * next_joint_pos
+                        invtrf = pre_mat.inverted() @ next_joint_pos
                         bestdist = abs(invtrf.y)
                         for paxis in ["x", "z"]:
                             dist = abs(getattr(invtrf, paxis))
@@ -129,6 +143,7 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
     post_mat = bone.matrix
 
     # this value stores the transform between the "proper" matrix and the "nice" matrix where bones are oriented in a more friendly way
+    # For RAW mode, this should be close to identity since we're not applying nice transforms
     bone["nicetransform"] = _matrix_to_idprop(o_trans.inverted() @ post_mat)
 
     # link objects to bone by searching ONLY within the provided parts_collection

@@ -37,6 +37,7 @@ local DONATION_SUPPORTERS = {
 	[25461577] = "#ed7b87", -- 144hertz
 	[25637687] = "#fa9c50", -- TB_Glitch
 	[7445318360] = "#5865f2", -- Rubasta1945
+	[116174560] = "#fc0398", -- N4Animation
 	
 	
 }

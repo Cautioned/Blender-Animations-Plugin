@@ -1,0 +1,637 @@
+"""
+Center of Mass (COM) calculation and visualization utilities.
+
+Provides tools for calculating the center of mass of a rig and
+visualizing it in the viewport. Uses bone weights for fast real-time calculation.
+
+Custom bone weights can be set via the 'com_weight' custom property
+on individual bones, allowing per-rig customization without cluttering the UI.
+"""
+
+import bpy
+import gpu
+from gpu_extras.batch import batch_for_shader
+from mathutils import Vector, Matrix
+from typing import Optional, Dict, List, Tuple
+
+# Default bone weights based on human body proportions (biomechanics data)
+# Values represent approximate percentage of total body mass
+# Total sums to ~1.0 and gets normalized in calculate_com()
+DEFAULT_BONE_WEIGHTS = {
+    # Torso (~50% total)
+    "HumanoidRootPart": 0.12,  # Pelvis region
+    "LowerTorso": 0.18,        # Abdomen + lower back
+    "UpperTorso": 0.20,        # Chest + upper back
+    # Head (~8%)
+    "Head": 0.08,
+    # Arms (~5% each side = 10% total)
+    "LeftUpperArm": 0.028,
+    "LeftLowerArm": 0.016,
+    "LeftHand": 0.006,
+    "RightUpperArm": 0.028,
+    "RightLowerArm": 0.016,
+    "RightHand": 0.006,
+    # Legs (~16% each side = 32% total)
+    "LeftUpperLeg": 0.10,
+    "LeftLowerLeg": 0.047,
+    "LeftFoot": 0.015,
+    "RightUpperLeg": 0.10,
+    "RightLowerLeg": 0.047,
+    "RightFoot": 0.015,
+}
+
+# Default weight for bones not in the default list and without custom weight
+DEFAULT_WEIGHT = 0.05
+
+# Custom property name for storing bone weights
+COM_WEIGHT_PROP = "com_weight"
+
+# IK bone suffixes to skip in COM calculation
+_IK_SUFFIXES = ("-IKTarget", "-IKPole", "-IKStretch")
+
+
+def get_bone_weight(bone: "bpy.types.Bone") -> float:
+    """Get the COM weight for a bone.
+    
+    Priority order:
+    1. Custom 'com_weight' property on the bone
+    2. Default weight from DEFAULT_BONE_WEIGHTS dict
+    3. Partial name match in DEFAULT_BONE_WEIGHTS
+    4. DEFAULT_WEIGHT constant
+    
+    Args:
+        bone: The bone to get weight for.
+        
+    Returns:
+        Weight value (0.0 to 1.0 typically, but can be any positive value).
+    """
+    # Check for custom weight property first
+    if COM_WEIGHT_PROP in bone:
+        return float(bone[COM_WEIGHT_PROP])
+    
+    # Check exact match in defaults
+    if bone.name in DEFAULT_BONE_WEIGHTS:
+        return DEFAULT_BONE_WEIGHTS[bone.name]
+    
+    # Check partial match (case insensitive)
+    bone_name_lower = bone.name.lower()
+    for key, weight in DEFAULT_BONE_WEIGHTS.items():
+        if key.lower() in bone_name_lower:
+            return weight
+    
+    return DEFAULT_WEIGHT
+
+
+def set_bone_weight(bone: "bpy.types.Bone", weight: float):
+    """Set a custom COM weight for a bone.
+    
+    Args:
+        bone: The bone to set weight for.
+        weight: Weight value (use -1 or None to remove custom weight).
+    """
+    if weight is None or weight < 0:
+        # Remove custom weight, revert to default
+        if COM_WEIGHT_PROP in bone:
+            del bone[COM_WEIGHT_PROP]
+    else:
+        bone[COM_WEIGHT_PROP] = weight
+
+
+def get_all_bone_weights(armature: "bpy.types.Object") -> Dict[str, Tuple[float, bool]]:
+    """Get all bone weights for an armature.
+    
+    Args:
+        armature: The armature object.
+        
+    Returns:
+        Dict mapping bone name to (weight, is_custom) tuple.
+    """
+    weights = {}
+    if not armature or armature.type != "ARMATURE":
+        return weights
+    
+    for bone in armature.data.bones:
+        is_custom = COM_WEIGHT_PROP in bone
+        weight = get_bone_weight(bone)
+        weights[bone.name] = (weight, is_custom)
+    
+    return weights
+
+
+def clear_all_custom_weights(armature: "bpy.types.Object"):
+    """Remove all custom COM weights from an armature.
+    
+    Args:
+        armature: The armature object.
+    """
+    if not armature or armature.type != "ARMATURE":
+        return
+    
+    for bone in armature.data.bones:
+        if COM_WEIGHT_PROP in bone:
+            del bone[COM_WEIGHT_PROP]
+
+
+def apply_default_weights(armature: "bpy.types.Object", overwrite: bool = False):
+    """Apply default weights as custom properties to all bones.
+    
+    This allows users to see and edit the default values.
+    
+    Args:
+        armature: The armature object.
+        overwrite: If True, overwrite existing custom weights.
+    """
+    if not armature or armature.type != "ARMATURE":
+        return
+    
+    for bone in armature.data.bones:
+        if overwrite or COM_WEIGHT_PROP not in bone:
+            # Get the default weight for this bone
+            weight = DEFAULT_WEIGHT
+            if bone.name in DEFAULT_BONE_WEIGHTS:
+                weight = DEFAULT_BONE_WEIGHTS[bone.name]
+            else:
+                bone_name_lower = bone.name.lower()
+                for key, w in DEFAULT_BONE_WEIGHTS.items():
+                    if key.lower() in bone_name_lower:
+                        weight = w
+                        break
+            
+            bone[COM_WEIGHT_PROP] = weight
+
+
+def calculate_com(armature: "bpy.types.Object") -> Vector:
+    """Calculate the center of mass for an armature using bone weights.
+    
+    Uses anatomical bone weights for fast real-time calculation.
+    Custom weights can be set via the 'com_weight' property on bones.
+    
+    Args:
+        armature: The armature object to calculate COM for.
+        
+    Returns:
+        World-space position of the center of mass.
+    """
+    if not armature or armature.type != "ARMATURE":
+        return Vector((0, 0, 0))
+    
+    total_weight = 0.0
+    weighted_position = Vector((0, 0, 0))
+    
+    # Cache the matrix for all bones
+    matrix_world = armature.matrix_world
+    
+    for pose_bone in armature.pose.bones:
+        # Skip IK helper bones
+        bone_name = pose_bone.name
+        if any(bone_name.endswith(suffix) for suffix in _IK_SUFFIXES):
+            continue
+        
+        # Get bone weight (custom or default)
+        weight = get_bone_weight(pose_bone.bone)
+        
+        # Skip bones with zero weight
+        if weight <= 0:
+            continue
+        
+        # Get bone center position in world space
+        # Use head + (tail - head) * 0.5 for center
+        bone_center = matrix_world @ ((pose_bone.head + pose_bone.tail) * 0.5)
+        
+        weighted_position += bone_center * weight
+        total_weight += weight
+    
+    if total_weight > 0:
+        return weighted_position / total_weight
+    
+    return armature.location.copy()
+
+
+def calculate_com_velocity(
+    armature: "bpy.types.Object",
+    frame_current: int,
+    frame_prev: int,
+    fps: float = 30.0
+) -> Vector:
+    """Calculate the velocity of the center of mass between two frames.
+    
+    Args:
+        armature: The armature object.
+        frame_current: Current frame number.
+        frame_prev: Previous frame number.
+        fps: Frames per second.
+        
+    Returns:
+        Velocity vector (units per second).
+    """
+    scene = bpy.context.scene
+    original_frame = scene.frame_current
+    
+    # Get COM at previous frame
+    scene.frame_set(frame_prev)
+    bpy.context.view_layer.update()
+    com_prev = calculate_com(armature)
+    
+    # Get COM at current frame
+    scene.frame_set(frame_current)
+    bpy.context.view_layer.update()
+    com_current = calculate_com(armature)
+    
+    # Restore original frame
+    scene.frame_set(original_frame)
+    
+    # Calculate velocity
+    frame_delta = abs(frame_current - frame_prev)
+    if frame_delta == 0:
+        return Vector((0, 0, 0))
+    
+    time_delta = frame_delta / fps
+    velocity = (com_current - com_prev) / time_delta
+    
+    return velocity
+
+
+# Global state for COM visualization
+_com_draw_handler = None
+_com_data = {
+    "enabled": False,
+    "armature_name": None,  # Track which armature the COM is for
+    "position": Vector((0, 0, 0)),
+    "show_projection": True,
+    "show_grid": True,  # Circular grid at ground level
+    "grid_radius": 1.0,  # Radius of the circular grid
+    "grid_rings": 3,  # Number of concentric rings
+    "projection_z": 0.0,
+    "color": (1.0, 0.8, 0.0, 1.0),  # Yellow
+    "projection_color": (0.0, 0.8, 1.0, 0.5),  # Cyan, semi-transparent
+    "grid_color": (0.5, 0.5, 0.5, 0.3),  # Gray, semi-transparent
+    "size": 0.15,
+    "pivot_bone": None,  # Name of the bone currently set as COM pivot
+}
+
+
+def _draw_com_callback():
+    """OpenGL callback to draw the COM indicator."""
+    if not _com_data["enabled"]:
+        return
+    
+    # Only draw if the tracked armature still exists and is valid
+    armature_name = _com_data.get("armature_name")
+    if armature_name:
+        armature = bpy.data.objects.get(armature_name)
+        if not armature or armature.type != "ARMATURE":
+            # Armature was deleted or renamed, disable visualization
+            _com_data["enabled"] = False
+            return
+    
+    pos = _com_data["position"]
+    size = _com_data["size"]
+    color = _com_data["color"]
+    
+    # Get shader
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    
+    # Draw COM sphere (approximated with lines)
+    vertices = []
+    
+    # Create a simple cross/star pattern for the COM
+    # X axis
+    vertices.extend([
+        (pos.x - size, pos.y, pos.z),
+        (pos.x + size, pos.y, pos.z),
+    ])
+    # Y axis
+    vertices.extend([
+        (pos.x, pos.y - size, pos.z),
+        (pos.x, pos.y + size, pos.z),
+    ])
+    # Z axis
+    vertices.extend([
+        (pos.x, pos.y, pos.z - size),
+        (pos.x, pos.y, pos.z + size),
+    ])
+    
+    # Draw circle in XY plane
+    import math
+    segments = 16
+    for i in range(segments):
+        angle1 = (i / segments) * 2 * math.pi
+        angle2 = ((i + 1) / segments) * 2 * math.pi
+        vertices.extend([
+            (pos.x + math.cos(angle1) * size * 0.7, pos.y + math.sin(angle1) * size * 0.7, pos.z),
+            (pos.x + math.cos(angle2) * size * 0.7, pos.y + math.sin(angle2) * size * 0.7, pos.z),
+        ])
+    
+    batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
+    
+    shader.bind()
+    shader.uniform_float("color", color)
+    
+    gpu.state.line_width_set(2.0)
+    gpu.state.blend_set('ALPHA')
+    batch.draw(shader)
+    
+    # Draw projection line to ground
+    if _com_data["show_projection"]:
+        proj_z = _com_data["projection_z"]
+        proj_color = _com_data["projection_color"]
+        
+        proj_vertices = [
+            (pos.x, pos.y, pos.z),
+            (pos.x, pos.y, proj_z),
+        ]
+        
+        # Draw projection point (small cross on ground)
+        cross_size = size * 0.5
+        proj_vertices.extend([
+            (pos.x - cross_size, pos.y, proj_z),
+            (pos.x + cross_size, pos.y, proj_z),
+            (pos.x, pos.y - cross_size, proj_z),
+            (pos.x, pos.y + cross_size, proj_z),
+        ])
+        
+        batch_proj = batch_for_shader(shader, 'LINES', {"pos": proj_vertices})
+        shader.uniform_float("color", proj_color)
+        gpu.state.line_width_set(1.0)
+        batch_proj.draw(shader)
+    
+    # Draw circular grid at ground level
+    if _com_data["show_grid"]:
+        proj_z = _com_data["projection_z"]
+        grid_color = _com_data["grid_color"]
+        grid_radius = _com_data["grid_radius"]
+        grid_rings = _com_data["grid_rings"]
+        
+        grid_vertices = []
+        segments = 32  # Segments per circle
+        
+        # Draw concentric rings centered on COM projection
+        for ring in range(1, grid_rings + 1):
+            ring_radius = (ring / grid_rings) * grid_radius
+            for i in range(segments):
+                angle1 = (i / segments) * 2 * math.pi
+                angle2 = ((i + 1) / segments) * 2 * math.pi
+                grid_vertices.extend([
+                    (pos.x + math.cos(angle1) * ring_radius, pos.y + math.sin(angle1) * ring_radius, proj_z),
+                    (pos.x + math.cos(angle2) * ring_radius, pos.y + math.sin(angle2) * ring_radius, proj_z),
+                ])
+        
+        # Draw cross lines through center
+        grid_vertices.extend([
+            (pos.x - grid_radius, pos.y, proj_z),
+            (pos.x + grid_radius, pos.y, proj_z),
+            (pos.x, pos.y - grid_radius, proj_z),
+            (pos.x, pos.y + grid_radius, proj_z),
+        ])
+        
+        # Draw diagonal lines
+        diag = grid_radius * 0.707  # cos(45°)
+        grid_vertices.extend([
+            (pos.x - diag, pos.y - diag, proj_z),
+            (pos.x + diag, pos.y + diag, proj_z),
+            (pos.x - diag, pos.y + diag, proj_z),
+            (pos.x + diag, pos.y - diag, proj_z),
+        ])
+        
+        batch_grid = batch_for_shader(shader, 'LINES', {"pos": grid_vertices})
+        shader.uniform_float("color", grid_color)
+        gpu.state.line_width_set(1.0)
+        batch_grid.draw(shader)
+    
+    gpu.state.blend_set('NONE')
+    gpu.state.line_width_set(1.0)
+
+
+def enable_com_visualization(enable: bool = True):
+    """Enable or disable COM visualization in the viewport."""
+    global _com_draw_handler
+    
+    _com_data["enabled"] = enable
+    
+    if enable and _com_draw_handler is None:
+        _com_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_com_callback, (), 'WINDOW', 'POST_VIEW'
+        )
+    elif not enable and _com_draw_handler is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_com_draw_handler, 'WINDOW')
+        _com_draw_handler = None
+        # Clear armature tracking when disabled
+        _com_data["armature_name"] = None
+        _com_data["pivot_bone"] = None
+    
+    # Redraw viewports
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
+def update_com_visualization(armature: "bpy.types.Object"):
+    """Update the COM visualization position."""
+    if not _com_data["enabled"]:
+        return
+    
+    # Check if armature is valid
+    if not armature or armature.type != "ARMATURE":
+        return
+    
+    # Track which armature we're visualizing
+    _com_data["armature_name"] = armature.name
+    
+    com = calculate_com(armature)
+    _com_data["position"] = com
+    
+    # Update projection Z to be at the lowest foot position or 0
+    min_z = 0.0
+    for pose_bone in armature.pose.bones:
+        if "foot" in pose_bone.name.lower():
+            foot_pos = armature.matrix_world @ pose_bone.head
+            min_z = min(min_z, foot_pos.z)
+    
+    _com_data["projection_z"] = min_z
+    
+    # Redraw
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
+def get_com_armature_name() -> Optional[str]:
+    """Get the name of the armature currently being visualized.
+    
+    Returns:
+        Armature name or None if no visualization is active.
+    """
+    return _com_data.get("armature_name")
+
+
+def is_com_for_armature(armature: "bpy.types.Object") -> bool:
+    """Check if COM visualization is active for a specific armature.
+    
+    Args:
+        armature: The armature to check.
+        
+    Returns:
+        True if COM is enabled and tracking this armature.
+    """
+    if not _com_data["enabled"] or not armature:
+        return False
+    return _com_data.get("armature_name") == armature.name
+
+
+def is_com_visualization_enabled() -> bool:
+    """Check if COM visualization is enabled."""
+    return _com_data["enabled"]
+
+
+def is_com_grid_enabled() -> bool:
+    """Check if COM circular grid is enabled."""
+    return _com_data["show_grid"]
+
+
+def toggle_com_grid(enable: Optional[bool] = None):
+    """Toggle or set the circular grid display.
+    
+    Args:
+        enable: If provided, set grid to this state. If None, toggle.
+    """
+    if enable is None:
+        _com_data["show_grid"] = not _com_data["show_grid"]
+    else:
+        _com_data["show_grid"] = enable
+    
+    # Redraw viewports
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
+def set_com_grid_radius(radius: float):
+    """Set the radius of the circular grid.
+    
+    Args:
+        radius: Grid radius in Blender units.
+    """
+    _com_data["grid_radius"] = max(0.1, radius)
+    
+    # Redraw viewports
+    for area in bpy.context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
+def get_com_grid_radius() -> float:
+    """Get the current grid radius."""
+    return _com_data["grid_radius"]
+
+
+def get_com_pivot_bone() -> Optional[str]:
+    """Get the name of the bone currently set as COM pivot.
+    
+    Returns:
+        Bone name or None if no pivot is set.
+    """
+    return _com_data["pivot_bone"]
+
+
+def set_com_pivot_bone(bone_name: Optional[str]):
+    """Set or clear the COM pivot bone.
+    
+    Args:
+        bone_name: Name of the bone to set as pivot, or None to clear.
+    """
+    _com_data["pivot_bone"] = bone_name
+
+
+def is_bone_com_pivot(bone_name: str) -> bool:
+    """Check if a bone is currently set as the COM pivot.
+    
+    Args:
+        bone_name: Name of the bone to check.
+        
+    Returns:
+        True if this bone is the current pivot.
+    """
+    return _com_data["pivot_bone"] == bone_name
+
+
+def set_com_pivot(armature: "bpy.types.Object", bone_name: Optional[str] = None):
+    """Set the 3D cursor to the center of mass position.
+    
+    This allows rotating the rig around its COM using cursor pivot.
+    
+    Args:
+        armature: The armature object.
+        bone_name: Optional bone name to track as the pivot source.
+    """
+    com = calculate_com(armature)
+    bpy.context.scene.cursor.location = com
+    _com_data["pivot_bone"] = bone_name
+
+
+def rotate_around_com(
+    armature: "bpy.types.Object",
+    axis: str,
+    angle: float
+):
+    """Rotate the armature around its center of mass.
+    
+    Args:
+        armature: The armature object.
+        axis: Rotation axis ('X', 'Y', or 'Z').
+        angle: Rotation angle in radians.
+    """
+    import mathutils
+    
+    # Calculate COM
+    com = calculate_com(armature)
+    
+    # Create rotation matrix
+    if axis == 'X':
+        rot_matrix = Matrix.Rotation(angle, 4, 'X')
+    elif axis == 'Y':
+        rot_matrix = Matrix.Rotation(angle, 4, 'Y')
+    else:
+        rot_matrix = Matrix.Rotation(angle, 4, 'Z')
+    
+    # Store original cursor location and pivot
+    original_cursor = bpy.context.scene.cursor.location.copy()
+    original_pivot = bpy.context.scene.tool_settings.transform_pivot_point
+    
+    # Set cursor to COM and use cursor as pivot
+    bpy.context.scene.cursor.location = com
+    bpy.context.scene.tool_settings.transform_pivot_point = 'CURSOR'
+    
+    # Select armature and rotate
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    
+    # Apply rotation
+    bpy.ops.transform.rotate(value=angle, orient_axis=axis, center_override=com)
+    
+    # Restore original cursor and pivot
+    bpy.context.scene.cursor.location = original_cursor
+    bpy.context.scene.tool_settings.transform_pivot_point = original_pivot
+
+
+# Frame change handler for real-time COM updates
+def _frame_change_handler(scene):
+    """Update COM visualization when frame changes."""
+    if not _com_data["enabled"]:
+        return
+    
+    # Find active armature
+    obj = bpy.context.active_object
+    if obj and obj.type == "ARMATURE":
+        update_com_visualization(obj)
+
+
+def register_frame_handler():
+    """Register the frame change handler for real-time COM updates."""
+    if _frame_change_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_frame_change_handler)
+
+
+def unregister_frame_handler():
+    """Unregister the frame change handler."""
+    if _frame_change_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_frame_change_handler)

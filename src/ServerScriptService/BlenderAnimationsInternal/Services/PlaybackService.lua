@@ -211,7 +211,9 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 	end
 
 	local kfs = kfsOverride or self.State.activeRig:ToRobloxAnimation()
-	if self.State.scaleFactor:get() ~= 1 then
+	-- only scale if we're creating a new animation from the rig (no kfsOverride)
+	-- if kfsOverride is provided, it's already been scaled by the caller
+	if not kfsOverride and self.State.scaleFactor:get() ~= 1 then
 		kfs = Utils.scaleAnimation(kfs, self.State.scaleFactor:get())
 	end
 	self.State.currentKeyframeSequence = kfs

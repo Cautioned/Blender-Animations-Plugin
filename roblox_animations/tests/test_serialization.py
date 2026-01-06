@@ -1656,8 +1656,8 @@ class TestAnimationSerialization(unittest.TestCase):
         complex animation to test performance under heavy load.
         """
         # --- SETUP ---
-        BONE_COUNT = 100
-        FRAME_COUNT = 100
+        BONE_COUNT = 200
+        FRAME_COUNT = 10000
 
         # 1. Create Armature
         bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
@@ -2425,6 +2425,8 @@ class TestAnimationSerialization(unittest.TestCase):
         pbone.location = (2, 0, 0)
         pbone.keyframe_insert(data_path="location", frame=4)
 
+        self.set_action_interpolation(action, "LINEAR")
+
         from ..core.utils import get_action_fcurves
 
         fcurves = get_action_fcurves(action)
@@ -2455,7 +2457,12 @@ class TestAnimationSerialization(unittest.TestCase):
                 for kf in result["kfs"]
             }
 
-            expected_frames = {0, 4, 8, 12}
+            # With keyframes at -4 and 4 (cycle_len=8), and frame_start=0, frame_end=12:
+            # - Frame 0: boundary (frame_start)
+            # - Frame 4: keyframe position
+            # - Frame 12: boundary (frame_end) and cycle repeat of frame 4
+            # Note: Frame 8 is not a keyframe position, so sparse baking doesn't include it
+            expected_frames = {0, 4, 12}
             self.assertSetEqual(baked_frames, expected_frames)
         finally:
             scene.render.fps = original_fps

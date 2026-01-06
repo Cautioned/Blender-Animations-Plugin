@@ -7,14 +7,14 @@ function Utils.scaleAnimation(keyframeSequence: KeyframeSequence, scaleFactor: n
 	assert(type(scaleFactor) == "number" and scaleFactor > 0, "Scale factor must be a positive number")
 
 	local scaledSequence = keyframeSequence:Clone()
-    for _, pose in pairs(scaledSequence:GetDescendants()) do
-        if pose:IsA("Pose") then
+	for _, pose in pairs(scaledSequence:GetDescendants()) do
+		if pose:IsA("Pose") then
             local cf = pose.CFrame
             local pos = cf.Position * scaleFactor
             -- preserve rotation, scale only the translational component
             pose.CFrame = CFrame.new(pos) * (cf - cf.Position)
-        end
-    end
+		end
+	end
 	return scaledSequence
 end
 

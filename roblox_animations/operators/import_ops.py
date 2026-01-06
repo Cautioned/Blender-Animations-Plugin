@@ -190,115 +190,105 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
             copy_anim_state,
             apply_ao_transform,
         )
+        from ..core.utils import get_action_fcurves
         import math
 
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         armature_name = settings.rbx_anim_armature if settings else None
-        # check active keying set
-        if not bpy.context.scene.keying_sets.active:
-            self.report({"ERROR"}, "There is no active keying set, this is required.")
-            return {"FINISHED"}
+        
+        # Get target armature early to fail fast
+        armature = bpy.data.objects.get(armature_name)
+        if not armature:
+            self.report(
+                {"ERROR"},
+                f"No armature named '{armature_name}' found. Please ensure the correct rig is selected.",
+            )
+            return {"CANCELLED"}
 
-        # import and keep track of what is imported
-        objnames_before_import = [x.name for x in bpy.data.objects]
+        # Ensure active keying set exists, create one if needed
+        if not bpy.context.scene.keying_sets.active:
+            bpy.ops.anim.keying_set_add()
+            self.report({"INFO"}, "Created new keying set for animation import.")
+
+        # Import and keep track of what is imported (use set for faster lookup)
+        objnames_before_import = {obj.name for obj in bpy.data.objects}
         bpy.ops.import_scene.fbx(filepath=self.properties.filepath)
         objnames_imported = [
-            x.name for x in bpy.data.objects if x.name not in objnames_before_import
+            obj.name for obj in bpy.data.objects if obj.name not in objnames_before_import
         ]
 
         def clear_imported():
-            # Use low-level API to remove objects directly
+            """Clean up all objects imported from the FBX file."""
             for obj_name in objnames_imported:
                 obj = bpy.data.objects.get(obj_name)
                 if obj:
                     bpy.data.objects.remove(obj)
 
-        # check that there's only 1 armature
+        # Check that there's exactly 1 armature in the imported file
         armatures_imported = [
-            x
-            for x in bpy.data.objects
-            if x.type == "ARMATURE" and x.name in objnames_imported
+            obj for obj in bpy.data.objects
+            if obj.type == "ARMATURE" and obj.name in objnames_imported
         ]
-        if len(armatures_imported) != 1:
+        if len(armatures_imported) == 0:
+            self.report({"ERROR"}, "Imported FBX file contains no armature.")
+            clear_imported()
+            return {"CANCELLED"}
+        if len(armatures_imported) > 1:
             self.report(
                 {"ERROR"},
-                "Imported file contains {:d} armatures, expected 1.".format(
-                    len(armatures_imported)
-                ),
+                f"Imported FBX file contains {len(armatures_imported)} armatures, expected 1.",
             )
             clear_imported()
-            return {"FINISHED"}
+            return {"CANCELLED"}
 
         ao_imp = armatures_imported[0]
 
-        err_mappings = get_mapping_error_bones(bpy.data.objects[armature_name], ao_imp)
-        if len(err_mappings) > 0:
+        # Validate bone mapping between source and target
+        err_mappings = get_mapping_error_bones(armature, ao_imp)
+        if err_mappings:
             self.report(
                 {"ERROR"},
-                "Cannot map rig, the following bones are missing from the source rig: {}.".format(
-                    ", ".join(err_mappings)
-                ),
+                f"Cannot map rig, the following bones are missing from the source rig: {', '.join(err_mappings)}.",
             )
             clear_imported()
-            return {"FINISHED"}
+            return {"CANCELLED"}
 
-        print(dir(bpy.context.scene))
-        bpy.context.view_layer.objects.active = ao_imp
-
-        # check that the ao contains anim data
-        from ..core.utils import get_action_fcurves
-
-        fcurves = (
-            get_action_fcurves(ao_imp.animation_data.action)
-            if ao_imp.animation_data and ao_imp.animation_data.action
-            else []
-        )
-        if not ao_imp.animation_data or not ao_imp.animation_data.action or not fcurves:
-            self.report({"ERROR"}, "Imported armature contains no animation data.")
+        # Validate imported armature has animation data
+        if not ao_imp.animation_data or not ao_imp.animation_data.action:
+            self.report({"ERROR"}, "Imported FBX armature contains no animation data.")
             clear_imported()
-            return {"FINISHED"}
+            return {"CANCELLED"}
 
-        # get keyframes + boundary timestamps
         fcurves = get_action_fcurves(ao_imp.animation_data.action)
-        kp_frames = []
-        for key in fcurves:
-            kp_frames += [kp.co.x for kp in key.keyframe_points]
-        if len(kp_frames) <= 0:
-            self.report({"ERROR"}, "Imported armature contains no keyframes.")
+        if not fcurves:
+            self.report({"ERROR"}, "Imported FBX armature contains no animation curves.")
             clear_imported()
-            return {"FINISHED"}
+            return {"CANCELLED"}
 
-        # set frame range
+        # Get keyframes and set frame range
+        kp_frames = [kp.co.x for fcurve in fcurves for kp in fcurve.keyframe_points]
+        if not kp_frames:
+            self.report({"ERROR"}, "Imported FBX armature contains no keyframes.")
+            clear_imported()
+            return {"CANCELLED"}
+
         bpy.context.scene.frame_start = math.floor(min(kp_frames))
         bpy.context.scene.frame_end = math.ceil(max(kp_frames))
 
-        # for the imported rig, apply ao transforms
+        # Apply transforms and prepare for keyframe mapping
+        bpy.context.view_layer.objects.active = ao_imp
         apply_ao_transform(ao_imp)
-
         prepare_for_kf_map()
 
-        settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
-        armature_name = settings.rbx_anim_armature if settings else None
-        try:
-            armature = bpy.data.objects[armature_name]
-        except KeyError:
-            self.report(
-                {"ERROR"},
-                f"No object named '{armature_name}' found. Please ensure the correct rig is selected.",
-            )
-            return {"FINISHED"}
-
+        # Ensure the target armature has animation_data initialized
         if armature.animation_data is None:
-            self.report(
-                {"ERROR"},
-                f"The object '{armature_name}' has no animation data. Please ensure the correct rig is selected.",
-            )
-            return {"FINISHED"}
+            armature.animation_data_create()
 
-        # actually copy state
-        copy_anim_state(bpy.data.objects[armature_name], ao_imp)
+        # Copy animation state from imported armature to target
+        copy_anim_state(armature, ao_imp)
 
         clear_imported()
+        self.report({"INFO"}, f"Successfully imported animation with {len(kp_frames)} keyframes.")
         return {"FINISHED"}
 
     def invoke(self, context, event):
