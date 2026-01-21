@@ -57,8 +57,9 @@ export type ArmatureInfo = {
 
 export type SavedAnimation = {
 	name: string,
-	instance: KeyframeSequence,
-	duration: number,
+	instance: KeyframeSequence | CurveAnimation,
+	type: string?,
+	duration: number?,
 }
 
 export type KeyframeName = {
@@ -74,6 +75,15 @@ export type BoneWeight = {
 }
 
 export type BoneWeightsList = { BoneWeight }
+
+export type ExportBoneWeight = {
+	name: string,
+	enabled: boolean,
+	depth: number,
+	parentName: string,
+}
+
+export type ExportBoneWeightsList = { ExportBoneWeight }
 
 export type KeyframeStats = {
 	count: number,

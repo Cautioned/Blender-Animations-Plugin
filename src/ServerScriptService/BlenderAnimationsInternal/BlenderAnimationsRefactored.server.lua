@@ -65,6 +65,9 @@ local animationManager = AnimationManager.new(playbackService, Plugin)
 local exportManager = ExportManager.new()
 local blenderSyncManager = BlenderSyncManager.new(playbackService, animationManager)
 
+
+State.rigManager = rigManager
+
 -- Create services object for passing to UI components
 local services = {
 	playbackService = playbackService,
@@ -77,8 +80,16 @@ local services = {
 }
 
 local function cleanupAll()
-	-- 1. Stop running processes
-	playbackService:stopAnimationAndDisconnect()
+	-- 1. Stop running processes (mirror setRig pattern: background stop, then foreground stop)
+	local currentAnimator = State.activeAnimator
+	if currentAnimator then
+		playbackService:stopAnimationAndDisconnect({
+			background = true,
+			animatorOverride = currentAnimator,
+		})
+	else
+		playbackService:stopAnimationAndDisconnect()
+	end
 	blenderSyncManager:cleanup()
 
 	-- 2. Disconnect UI-related connections
@@ -110,7 +121,7 @@ end
 local function cleanupRigSelection()
 	-- This function is a subset of cleanupAll, intended for when a rig is deselected.
 	-- It resets rig-specific state without killing the Blender connection.
-	playbackService:stopAnimationAndDisconnect()
+	playbackService:stopAnimationAndDisconnect( { background = true } )
 
 	-- Reset state variables related to the rig
 	State.loadingEnabled:set(false)
@@ -240,23 +251,26 @@ do -- Creates the plugin
 
 	-- Handle plugin unloading
 	Plugin.Unloading:Connect(function()
-		-- Disconnect observers first to prevent them from firing during cleanup
-		for _, obs in ipairs(State.observers) do
-			obs()
-		end
-		table.clear(State.observers)
+		-- Run cleanup async so playbackService background stop can finish gracefully
+		task.spawn(function()
+			-- Disconnect observers first to prevent them from firing during cleanup
+			for _, obs in ipairs(State.observers) do
+				obs()
+			end
+			table.clear(State.observers)
 
-		cleanupAll()
+			cleanupAll()
 
-		if State.selectionConnection then
-			State.selectionConnection:Disconnect()
-			State.selectionConnection = nil
-		end
+			if State.selectionConnection then
+				State.selectionConnection:Disconnect()
+				State.selectionConnection = nil
+			end
 
-		for _, conn in ipairs(State.connections) do
-			conn:Disconnect()
-		end
-		table.clear(State.connections)
+			for _, conn in ipairs(State.connections) do
+				conn:Disconnect()
+			end
+			table.clear(State.connections)
+		end)
 	end)
 
 	-- Handle widget enabled/disabled
@@ -344,6 +358,8 @@ do -- Creates the plugin
     if typeof(els) == "boolean" then State.enableLiveSync:set(els) end
     local ac = plugin:GetSetting("AutoConnectToBlender")
     if typeof(ac) == "boolean" then State.autoConnectToBlender:set(ac) end
+	local rm = plugin:GetSetting("ReducedMotion")
+	if typeof(rm) == "boolean" then State.reducedMotion:set(rm) end
     local sd = plugin:GetSetting("ShowDebugInfo")
     if typeof(sd) == "boolean" then State.showDebugInfo:set(sd) end
     

@@ -27,7 +27,7 @@ local Hydrate = Fusion.Hydrate
 local Value = Fusion.Value
 local New = Fusion.New
 
-local HEADER_HEIGHT = 25
+local HEADER_HEIGHT = 20
 
 local COMPONENT_ONLY_PROPERTIES = {
 	"Padding",
@@ -120,7 +120,7 @@ return function(props: VerticalExpandingListProperties): Frame
 		Name = "VerticalCollapsibleSection",
 		BackgroundTransparency = 1,
 		--TODO: remove this +2 once BorderMode becomes a thing for UIStroke
-		Size = UDim2.new(1, 0, 0, HEADER_HEIGHT+2),
+		Size = UDim2.new(1, 0, 0, HEADER_HEIGHT+1),
 		Padding = props.Padding,
 
 		AutomaticSize = Computed(function()
@@ -162,8 +162,8 @@ return function(props: VerticalExpandingListProperties): Frame
 						New "ImageLabel" {
 							Name = "Icon",
 							AnchorPoint = Vector2.new(0, 0.5),
-							Position = UDim2.new(0, 7, 0.5, 0),
-							Size = UDim2.fromOffset(10, 10),
+							Position = UDim2.new(0, 6, 0.5, 0),
+							Size = UDim2.fromOffset(9, 9),
 							Image = "rbxassetid://5607705156",
 							ImageRectSize = Vector2.new(10, 10),
 							BackgroundTransparency = 1,
@@ -200,7 +200,7 @@ return function(props: VerticalExpandingListProperties): Frame
 						end),
 
 							[Children] = New "UIPadding" {
-								PaddingLeft = UDim.new(0, 24),
+								PaddingLeft = UDim.new(0, 18),
 							}
 						}
 					}

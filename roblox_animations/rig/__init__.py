@@ -17,6 +17,24 @@ from .constraints import (
 from .ik import (
     create_ik_config,
     remove_ik_config,
+    has_ik_constraint,
+    get_ik_constraint,
+    update_pole_axis,
+    setup_ik_stretch,
+    setup_ik_fk_switch,
+)
+from .com import (
+    calculate_com,
+    enable_com_visualization,
+    update_com_visualization,
+    is_com_visualization_enabled,
+    is_com_for_armature,
+    get_com_armature_name,
+    register_frame_handler,
+    unregister_frame_handler,
+)
+from .physics import (
+    cleanup_physics,
 )
 
 __all__ = [
@@ -31,4 +49,20 @@ __all__ = [
     # IK
     "create_ik_config",
     "remove_ik_config",
+    "has_ik_constraint",
+    "get_ik_constraint",
+    "update_pole_axis",
+    "setup_ik_stretch",
+    "setup_ik_fk_switch",
+    # Center of Mass
+    "calculate_com",
+    "enable_com_visualization",
+    "update_com_visualization",
+    "is_com_visualization_enabled",
+    "is_com_for_armature",
+    "get_com_armature_name",
+    "register_frame_handler",
+    "unregister_frame_handler",
+    # Physics
+    "cleanup_physics",
 ]

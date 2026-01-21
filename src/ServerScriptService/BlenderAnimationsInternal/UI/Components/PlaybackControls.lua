@@ -12,6 +12,7 @@ local OnEvent = Fusion.OnEvent
 local Value = Fusion.Value
 local Computed = Fusion.Computed
 local Observer = Fusion.Observer
+local Spring = Fusion.Spring
 
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local Checkbox = require(StudioComponents.Checkbox)
@@ -96,6 +97,54 @@ function PlaybackControls.createPlaybackScrubber(services: any)
 end
 
 function PlaybackControls.createPlaybackSection(services: any, layoutOrder: number?)
+	local function createPlaybackButton(props: { [any]: any })
+		return (function()
+			local isHovering = Value(false)
+			local isPressed = Value(false)
+			return New("ImageButton")({
+				Image = props.Image,
+				Size = props.Size or UDim2.new(0, 40, 0, 40),
+				BackgroundTransparency = 1,
+				ImageColor3 = props.ImageColor3,
+				LayoutOrder = props.LayoutOrder,
+				[Children] = {
+					New("UIScale")({
+						Scale = Spring(Computed(function()
+							if State.reducedMotion:get() then
+								return 1
+							end
+							if isPressed:get() then
+								return 0.97
+							end
+							if isHovering:get() then
+								return 1.02
+							end
+							return 1
+						end), 25, 0.9),
+					}),
+				},
+				[OnEvent("MouseEnter")] = function()
+					isHovering:set(true)
+				end,
+				[OnEvent("MouseLeave")] = function()
+					isHovering:set(false)
+					isPressed:set(false)
+				end,
+				[OnEvent("InputBegan")] = function(input)
+					if input.UserInputType == Enum.UserInputType.MouseButton1 then
+						isPressed:set(true)
+					end
+				end,
+				[OnEvent("InputEnded")] = function(input)
+					if input.UserInputType == Enum.UserInputType.MouseButton1 then
+						isPressed:set(false)
+					end
+				end,
+				[OnEvent("Activated")] = props.Activated,
+			})
+		end)()
+	end
+
 	return VerticalCollapsibleSection({
 		Text = "Playback",
 		Collapsed = false,
@@ -114,13 +163,11 @@ function PlaybackControls.createPlaybackSection(services: any, layoutOrder: numb
 						VerticalAlignment = Enum.VerticalAlignment.Center,
 						SortOrder = Enum.SortOrder.LayoutOrder,
 					}),
-					New("ImageButton")({
+					createPlaybackButton({
 						Image = "rbxasset://textures/AnimationEditor/button_control_previous.png",
-						Size = UDim2.new(0, 40, 0, 40),
-						BackgroundTransparency = 1,
 						ImageColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
 						LayoutOrder = 1,
-						[OnEvent("Activated")] = function()
+						Activated = function()
 							if services and services.playbackService then
 								services.playbackService:seekAnimationToTime(0)
 								State.isPlaying:set(false)
@@ -132,37 +179,31 @@ function PlaybackControls.createPlaybackSection(services: any, layoutOrder: numb
 							end
 						end,
 					}),
-					New("ImageButton")({
+					createPlaybackButton({
 						Image = State.reversePlayPauseButtonImage,
-						Size = UDim2.new(0, 40, 0, 40),
-						BackgroundTransparency = 1,
 						ImageColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
 						LayoutOrder = 2,
-						[OnEvent("Activated")] = function()
+						Activated = function()
 							if services and services.playbackService then
 								services.playbackService:onReverseButtonActivated()
 							end
 						end,
 					}),
-					New("ImageButton")({
+					createPlaybackButton({
 						Image = State.playPauseButtonImage,
-						Size = UDim2.new(0, 40, 0, 40),
-						BackgroundTransparency = 1,
 						ImageColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
 						LayoutOrder = 3,
-						[OnEvent("Activated")] = function()
+						Activated = function()
 							if services and services.playbackService then
 								services.playbackService:onPlayPauseButtonActivated()
 							end
 						end,
 					}),
-					New("ImageButton")({
+					createPlaybackButton({
 						Image = "rbxasset://textures/AnimationEditor/button_control_next.png",
-						Size = UDim2.new(0, 40, 0, 40),
-						BackgroundTransparency = 1,
 						ImageColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText) :: any,
 						LayoutOrder = 4,
-						[OnEvent("Activated")] = function()
+						Activated = function()
 							if services and services.playbackService then
 								-- Use the actual animation track length for accurate seeking
 								local animLength = 0

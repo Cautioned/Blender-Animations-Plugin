@@ -12,6 +12,7 @@ local OnChange = Fusion.OnChange
 local OnEvent = Fusion.OnEvent
 local Value = Fusion.Value
 local Computed = Fusion.Computed
+local Spring = Fusion.Spring
 
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local Button = require(StudioComponents.Button)
@@ -27,6 +28,7 @@ local themeProvider = require(StudioComponentsUtil.themeProvider)
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
 local PlaybackControls = require(script.Parent.Parent.Components.PlaybackControls)
+local BoneToggles = require(script.Parent.Parent.Components.BoneToggles)
 
 local BlenderSyncTab = {}
 
@@ -153,6 +155,8 @@ function BlenderSyncTab.create(services: any)
 
 						for i, armature in ipairs(armatures :: any) do
 							local isSelected = selected and (selected :: any).name == (armature :: any).name
+							local isHovering = Value(false)
+							local isPressed = Value(false)
 
 							table.insert(
 								elements,
@@ -165,6 +169,20 @@ function BlenderSyncTab.create(services: any)
 									BorderSizePixel = 0,
 									LayoutOrder = i,
 									[Children] = {
+										New("UIScale")({
+											Scale = Spring(Computed(function()
+												if State.reducedMotion:get() then
+													return 1
+												end
+												if isPressed:get() then
+													return 0.97
+												end
+												if isHovering:get() then
+													return 1.02
+												end
+												return 1
+											end), 25, 0.9),
+										}),
 										New("UICorner")({
 											CornerRadius = UDim.new(0, 4),
 										}),
@@ -194,9 +212,22 @@ function BlenderSyncTab.create(services: any)
 											) :: any,
 										}),
 									},
+									[OnEvent("MouseEnter")] = function()
+										isHovering:set(true)
+									end,
+									[OnEvent("MouseLeave")] = function()
+										isHovering:set(false)
+										isPressed:set(false)
+									end,
 									[OnEvent("InputBegan")] = function(input)
 										if input.UserInputType == Enum.UserInputType.MouseButton1 then
+											isPressed:set(true)
 											State.selectedArmature:set(armature)
+										end
+									end,
+									[OnEvent("InputEnded")] = function(input)
+										if input.UserInputType == Enum.UserInputType.MouseButton1 then
+											isPressed:set(false)
 										end
 									end,
 								})
@@ -243,7 +274,7 @@ function BlenderSyncTab.create(services: any)
 						return nil
 					end,
 					[OnEvent("MouseEnter")] = function()
-						activeHint:set("Exports the current animation to Blender.")
+						activeHint:set("Exports the currently playing animation to Blender. You can load them in the player tab, place the animation inside your AnimSaves.")
 					end,
 					[OnEvent("MouseLeave")] = function()
 						activeHint:set("")
@@ -388,56 +419,7 @@ function BlenderSyncTab.create(services: any)
 				}),
 			},
 		}),
-		VerticalCollapsibleSection({
-			Text = "Bone Toggles",
-			Collapsed = false,
-			LayoutOrder = 2,
-			Visible = State.activeRigExists,
-			[Children] = Computed(function()
-				local boneWeights = State.boneWeights:get()
-				local boneToggles = {}
-
-				for i, bone in ipairs(boneWeights) do
-					-- Create indented text based on depth
-					local indentText = string.rep("  ", bone.depth) .. bone.name
-					table.insert(boneToggles, Checkbox({
-						Value = bone.enabled,
-						Text = indentText,
-						LayoutOrder = i,
-						OnChange = function(enabled: boolean)
-							-- Update the bone weight
-							bone.enabled = enabled
-							State.boneWeights:set(boneWeights) -- Trigger reactivity
-
-							-- Update the rig animation if it exists
-							if State.activeRig and State.activeRig.bones then
-								-- Find the rig bone by name more reliably
-								local rigBone = State.activeRig.bones[bone.name]
-								if rigBone then
-									rigBone.enabled = enabled
-								else
-									-- Fallback: search by part name
-									for _, rb in pairs(State.activeRig.bones) do
-										if rb.part.Name == bone.name then
-											rb.enabled = enabled
-											break
-										end
-									end
-								end
-								
-								-- Reload the animation to see the effect immediately
-								if services.playbackService then
-									services.playbackService:stopAnimationAndDisconnect()
-									services.playbackService:playCurrentAnimation(State.activeAnimator)
-								end
-							end
-						end,
-					}))
-				end
-
-				return boneToggles
-			end),
-		}),
+		BoneToggles.create(services, 2),
 		
 	}
 	

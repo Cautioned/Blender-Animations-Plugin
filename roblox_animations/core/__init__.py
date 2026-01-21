@@ -32,6 +32,7 @@ from .utils import (
     find_parts_collection_in_master,
     set_scene_fps,
     get_scene_fps,
+    get_rig_facing_direction,
     armature_anim_hashes,
 )
 
@@ -62,5 +63,6 @@ __all__ = [
     "find_parts_collection_in_master",
     "set_scene_fps",
     "get_scene_fps",
+    "get_rig_facing_direction",
     "armature_anim_hashes",
 ]

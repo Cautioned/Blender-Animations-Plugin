@@ -24,6 +24,7 @@ local _themeProvider = require(StudioComponentsUtil.themeProvider)
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
 
 -- Donation supporters data: {userId = color} -- username fetched dynamically via Players:GetNameFromUserIdAsync
+-- If you're wondering about the color choice I personally pick them out based on what I think you would like
 local DONATION_SUPPORTERS = {
     [1505918452] = "#9e4aff", -- JPlayHD
     [51636134] = "#d63838", -- AltiWyre
@@ -37,6 +38,10 @@ local DONATION_SUPPORTERS = {
 	[25461577] = "#ed7b87", -- 144hertz
 	[25637687] = "#fa9c50", -- TB_Glitch
 	[7445318360] = "#5865f2", -- Rubasta1945
+	[116174560] = "#fc0398", -- N4Animation
+	[1129195252] = "#6a71ba", -- Wingboy0
+	[1552097906] = "#e8c5e3", -- megeservice
+	[7180198] = "#7b5bbd" -- ZacAttackk
 	
 	
 }
@@ -61,8 +66,7 @@ local function _generateThankYouText(): string
             return game:GetService("Players")
         end)
 
-        if not playersSuccess then
-            warn("Failed to get Players service: " .. tostring(playersResult))
+		if not playersSuccess then
             -- Fallback: show supporters without usernames
             for userId, color in pairs(DONATION_SUPPORTERS) do
                 table.insert(supporterEntries, string.format("<font color='%s'>Supporter %s</font>", color, tostring(userId)))
@@ -79,23 +83,21 @@ local function _generateThankYouText(): string
                 return Players:GetNameFromUserIdAsync(userId)
             end)
 
-            if apiSuccess and apiResult then
-                username = apiResult
-            else
-                warn("Failed to get username for user ID " .. tostring(userId) .. ": " .. tostring(apiResult))
+			if apiSuccess and apiResult then
+				username = apiResult
+			else
                 -- Fallback to User + ID for display
                 username = "User" .. tostring(userId)
             end
 
             -- Safely format the supporter entry
-            local formatSuccess, formattedEntry = pcall(function()
+			local formatSuccess, formattedEntry = pcall(function()
                 return string.format("<font color='%s'>%s</font>", color, username)
             end)
 
             if formatSuccess then
                 table.insert(supporterEntries, formattedEntry)
             else
-                warn("Failed to format supporter entry for user ID " .. tostring(userId))
                 table.insert(supporterEntries, string.format("<font color='%s'>Supporter %s</font>", color, tostring(userId)))
             end
         end
@@ -104,14 +106,13 @@ local function _generateThankYouText(): string
         table.insert(supporterEntries, "and everyone else who has supported me!")
 
         -- Safely concatenate the entries
-        local concatSuccess, finalText = pcall(function()
+		local concatSuccess, finalText = pcall(function()
             return supportersText .. table.concat(supporterEntries, ", ")
         end)
 
         if concatSuccess then
             return finalText
         else
-            warn("Failed to concatenate supporter entries")
             return supportersText .. "our amazing supporters!"
         end
     end)
@@ -119,7 +120,6 @@ local function _generateThankYouText(): string
     if success then
         return result
     else
-        warn("Critical error generating thank you text: " .. tostring(result))
         -- Ultimate fallback
         return "Thank you to all of those who have supported me in the development of this plugin!"
     end
@@ -129,12 +129,11 @@ end
 local function _preloadThankYouText(): nil
     if not _thankYouTextLoaded then
         local success, generatedText = pcall(_generateThankYouText)
-        if success and generatedText then
+		if success and generatedText then
             _cachedThankYouText = generatedText
             _thankYouTextLoaded = true
             print("Preloaded donation supporters text")
         else
-            warn("Failed to preload donation supporters text: " .. tostring(generatedText))
             -- Still mark as loaded to avoid repeated attempts
             _thankYouTextLoaded = true
         end
@@ -150,12 +149,11 @@ local function getThankYouText(): string
 
     -- Generate the text if not cached
     local success, generatedText = pcall(_generateThankYouText)
-    if success and generatedText then
+	if success and generatedText then
         _cachedThankYouText = generatedText
         _thankYouTextLoaded = true
         return generatedText
     else
-        warn("Failed to generate thank you text: " .. tostring(generatedText))
         -- Return a safe fallback
         local fallbackText = "Thank you to all of those who have supported me in the development of this plugin!"
         _cachedThankYouText = fallbackText
@@ -244,6 +242,22 @@ function MoreTab.create(services: any)
 					end,
 					[OnEvent("MouseEnter")] = function()
 						activeHint:set("Automatically connects to Blender when the plugin starts.")
+					end,
+					[OnEvent("MouseLeave")] = function()
+						activeHint:set("")
+					end,
+				}),
+				Checkbox({
+					Value = State.reducedMotion,
+					Text = "Reduced Motion",
+					LayoutOrder = 3,
+					OnChange = function(enabled: boolean): nil
+						State.reducedMotion:set(enabled)
+						services.plugin:SetSetting("ReducedMotion", enabled)
+						return nil
+					end,
+					[OnEvent("MouseEnter")] = function()
+						activeHint:set("Disables most UI motion animations.")
 					end,
 					[OnEvent("MouseLeave")] = function()
 						activeHint:set("")

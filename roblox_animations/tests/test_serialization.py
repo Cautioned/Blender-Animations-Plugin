@@ -945,6 +945,148 @@ class TestAnimationSerialization(unittest.TestCase):
             "Bone from second NLA track not found in baked keyframe.",
         )
 
+    def test_nla_single_strip_uses_hybrid_easing(self):
+        """Tests that a single NLA strip uses hybrid bake and respects easing."""
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NlaSingleRig"
+        armature = armature_obj.data
+        armature.name = "NlaSingleArmature"
+
+        armature.edit_bones.new("Bone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("NlaSingleAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["Bone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 2, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(action, "CONSTANT")
+
+        # Set up a single active NLA strip
+        armature_obj.animation_data.action = None
+        track = armature_obj.animation_data.nla_tracks.new()
+        track.name = "TrackSingle"
+        track.strips.new(name="StripSingle", start=1, action=action)
+        armature_obj.animation_data.use_nla = True
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for single NLA strip test.")
+        desired_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+        baked_frames = {
+            bpy.context.scene.frame_start + int(round(kf["t"] * desired_fps))
+            for kf in result["kfs"]
+        }
+
+        self.assertSetEqual(
+            baked_frames,
+            {1, 10, 20},
+            "Expected sparse keyframes for single NLA strip hybrid bake.",
+        )
+
+        first_kf = result["kfs"][0]["kf"].get("Bone")
+        self.assertIsNotNone(first_kf, "Bone missing from first keyframe.")
+        self.assertEqual(
+            first_kf[1], "Constant", "NLA hybrid bake should respect Constant easing."
+        )
+
+        # Ensure the frame after the first key is clamped to the constant pose
+        frame_times = [
+            bpy.context.scene.frame_start + int(round(kf["t"] * desired_fps))
+            for kf in result["kfs"]
+        ]
+        if 2 in frame_times:
+            frame_index = frame_times.index(2)
+            frame_kf = result["kfs"][frame_index]["kf"].get("Bone")
+            self.assertIsNotNone(frame_kf, "Bone missing from frame 2 keyframe.")
+            self.assertEqual(
+                frame_kf[1],
+                "Constant",
+                "Frame 2 should keep Constant easing style.",
+            )
+            self.assertEqual(
+                frame_kf[0],
+                first_kf[0],
+                "Frame 2 should clamp to the first Constant pose.",
+            )
+
+    def test_nla_single_strip_bezier_forces_full_bake(self):
+        """Tests that BEZIER on a single NLA strip forces a full bake."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "NlaBezierRig"
+        armature = armature_obj.data
+        armature.name = "NlaBezierArmature"
+
+        armature.edit_bones.new("Bone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("NlaBezierAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["Bone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 3, 0)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            for kp in fcurve.keyframe_points:
+                kp.interpolation = "BEZIER"
+
+        armature_obj.animation_data.action = None
+        track = armature_obj.animation_data.nla_tracks.new()
+        track.name = "TrackBezier"
+        track.strips.new(name="StripBezier", start=1, action=action)
+        armature_obj.animation_data.use_nla = True
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        self.assertTrue(result, "Serialization returned no result for NLA bezier test.")
+        self.assertEqual(
+            len(result["kfs"]),
+            10,
+            "Expected full bake for single-strip NLA with BEZIER interpolation.",
+        )
+
     def test_easing_serialization(self):
         """Tests that Blender's easing types are correctly mapped to Roblox enums."""
         # --- SETUP ---
@@ -954,7 +1096,14 @@ class TestAnimationSerialization(unittest.TestCase):
         armature = armature_obj.data
         armature.name = "EasingArmature"
 
-        bone_names = ["SupportedEase", "UnsupportedEase", "ConstantEase"]
+        bone_names = [
+            "SupportedEase",
+            "UnsupportedEase",
+            "ConstantEase",
+            "LinearEase",
+            "BounceEase",
+            "ElasticEase",
+        ]
         for i, name in enumerate(bone_names):
             bone = armature.edit_bones.new(name)
             bone.head = (i, 0, 1)
@@ -974,7 +1123,7 @@ class TestAnimationSerialization(unittest.TestCase):
         armature_obj.animation_data.action = action
 
         # Animate bones
-        for bone_name in ["SupportedEase", "UnsupportedEase", "ConstantEase"]:
+        for bone_name in bone_names:
             pbone = armature_obj.pose.bones[bone_name]
             pbone.location = (0, 0, 0)
             pbone.keyframe_insert(data_path="location", frame=1)
@@ -995,6 +1144,15 @@ class TestAnimationSerialization(unittest.TestCase):
                 kp.easing = "EASE_IN"
             elif "ConstantEase" in fcurve.data_path:
                 kp.interpolation = "CONSTANT"
+            elif "LinearEase" in fcurve.data_path:
+                kp.interpolation = "LINEAR"
+                kp.easing = "EASE_IN"
+            elif "BounceEase" in fcurve.data_path:
+                kp.interpolation = "BOUNCE"
+                kp.easing = "EASE_OUT"
+            elif "ElasticEase" in fcurve.data_path:
+                kp.interpolation = "ELASTIC"
+                kp.easing = "EASE_IN"
 
         bpy.context.scene.frame_start = 1
         bpy.context.scene.frame_end = 20
@@ -1057,6 +1215,317 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertEqual(
             constant_data[2], "Out", "Constant easing direction did not map correctly."
         )
+
+        # Check LinearEase (LINEAR, EASE_IN) -> ("Linear", "In")
+        linear_data = first_frame_kf.get("LinearEase")
+        self.assertIsNotNone(linear_data, "LinearEase bone missing from keyframe.")
+        self.assertEqual(
+            linear_data[1], "Linear", "Linear easing style did not map correctly."
+        )
+        self.assertEqual(
+            linear_data[2], "In", "Linear easing direction did not map correctly."
+        )
+
+        # Check BounceEase (BOUNCE, EASE_OUT) -> ("Bounce", "Out")
+        bounce_data = first_frame_kf.get("BounceEase")
+        self.assertIsNotNone(bounce_data, "BounceEase bone missing from keyframe.")
+        self.assertEqual(
+            bounce_data[1], "Bounce", "Bounce easing style did not map correctly."
+        )
+        self.assertEqual(
+            bounce_data[2], "Out", "Bounce easing direction did not map correctly."
+        )
+
+        # Check ElasticEase (ELASTIC, EASE_IN) -> ("Elastic", "In")
+        elastic_data = first_frame_kf.get("ElasticEase")
+        self.assertIsNotNone(elastic_data, "ElasticEase bone missing from keyframe.")
+        self.assertEqual(
+            elastic_data[1], "Elastic", "Elastic easing style did not map correctly."
+        )
+        self.assertEqual(
+            elastic_data[2], "In", "Elastic easing direction did not map correctly."
+        )
+
+    def test_linear_easing_consistent_across_keyframes(self):
+        """Ensure linear interpolation exports Linear/Out on every baked keyframe."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "LinearEasingRig"
+        armature = armature_obj.data
+        armature.name = "LinearEasingArmature"
+
+        armature.edit_bones.new("LinearBone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("LinearEasingAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["LinearBone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 0, 5)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            for kp in fcurve.keyframe_points:
+                kp.easing = "EASE_OUT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        self.assertTrue(result, "Serialization returned no result for linear easing.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(len(keyframes), 2, "Linear animation should remain sparse.")
+
+        first_kf = keyframes[0]["kf"].get("LinearBone")
+        last_kf = keyframes[-1]["kf"].get("LinearBone")
+
+        self.assertIsNotNone(first_kf, "LinearBone missing from first keyframe.")
+        self.assertIsNotNone(last_kf, "LinearBone missing from last keyframe.")
+
+        self.assertEqual(first_kf[1], "Linear", "First keyframe easing style should be Linear.")
+        self.assertEqual(first_kf[2], "Out", "First keyframe easing direction should be Out.")
+        self.assertEqual(last_kf[1], "Linear", "Last keyframe easing style should be Linear.")
+        self.assertEqual(last_kf[2], "Out", "Last keyframe easing direction should be Out.")
+
+        self.assertNotEqual(
+            first_kf[0],
+            last_kf[0],
+            "Linear bone should move between keyframes.",
+        )
+
+    def test_constant_easing_consistent_across_keyframes(self):
+        """Ensure constant interpolation exports Constant/Out on every baked keyframe."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ConstantEasingRig"
+        armature = armature_obj.data
+        armature.name = "ConstantEasingArmature"
+
+        armature.edit_bones.new("ConstantBone").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("ConstantEasingAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        pbone = armature_obj.pose.bones["ConstantBone"]
+        pbone.location = (0, 0, 0)
+        pbone.keyframe_insert(data_path="location", frame=1)
+        pbone.location = (0, 0, 3)
+        pbone.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(action, "CONSTANT")
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            for kp in fcurve.keyframe_points:
+                kp.easing = "EASE_OUT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        self.assertTrue(result, "Serialization returned no result for constant easing.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(len(keyframes), 2, "Constant animation should remain sparse.")
+
+        for kf in (keyframes[0]["kf"], keyframes[-1]["kf"]):
+            constant_kf = kf.get("ConstantBone")
+            self.assertIsNotNone(constant_kf, "ConstantBone missing from keyframe.")
+            self.assertEqual(constant_kf[1], "Constant", "Easing style should be Constant.")
+            self.assertEqual(constant_kf[2], "Out", "Easing direction should be Out for Constant style.")
+
+        start_components = keyframes[0]["kf"]["ConstantBone"][0]
+        end_components = keyframes[-1]["kf"]["ConstantBone"][0]
+
+        self.assertNotEqual(
+            start_components,
+            end_components,
+            "Constant bone should jump to a new value on the last keyframe.",
+        )
+
+    def test_easing_with_external_copy_transforms_rig(self):
+        """Ensure constrained rig inherits easing from the target rig."""
+        # --- SETUP: Master rig ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        master_obj = bpy.context.object
+        master_obj.name = "EasingMasterRig"
+        master_armature = master_obj.data
+        master_armature.name = "EasingMasterArmature"
+
+        driver_bones = [
+            "DriverLinear",
+            "DriverCubic",
+            "DriverConstant",
+            "DriverBounce",
+            "DriverElastic",
+        ]
+        for i, name in enumerate(driver_bones):
+            bone = master_armature.edit_bones.new(name)
+            bone.head = (i, 0, 1)
+            bone.tail = (i, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in master_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        master_action = bpy.data.actions.new("EasingMasterAction")
+        master_obj.animation_data_create()
+        master_obj.animation_data.action = master_action
+
+        for i, name in enumerate(driver_bones):
+            driver_pose = master_obj.pose.bones[name]
+            driver_pose.location = (0, 0, 0)
+            driver_pose.keyframe_insert(data_path="location", frame=1)
+            driver_pose.location = (0, 0, 3 + i)
+            driver_pose.keyframe_insert(data_path="location", frame=10)
+
+        self.set_action_interpolation(master_action, "LINEAR")
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(master_action):
+            for kp in fcurve.keyframe_points:
+                if "DriverLinear" in fcurve.data_path:
+                    kp.interpolation = "LINEAR"
+                    kp.easing = "EASE_IN"
+                elif "DriverCubic" in fcurve.data_path:
+                    kp.interpolation = "CUBIC"
+                    kp.easing = "EASE_IN_OUT"
+                elif "DriverConstant" in fcurve.data_path:
+                    kp.interpolation = "CONSTANT"
+                    kp.easing = "EASE_OUT"
+                elif "DriverBounce" in fcurve.data_path:
+                    kp.interpolation = "BOUNCE"
+                    kp.easing = "EASE_OUT"
+                elif "DriverElastic" in fcurve.data_path:
+                    kp.interpolation = "ELASTIC"
+                    kp.easing = "EASE_IN"
+
+        # --- SETUP: Puppet rig ---
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(2, 0, 0))
+        puppet_obj = bpy.context.object
+        puppet_obj.name = "EasingPuppetRig"
+        puppet_armature = puppet_obj.data
+        puppet_armature.name = "EasingPuppetArmature"
+
+        follower_bones = [
+            "FollowerLinear",
+            "FollowerCubic",
+            "FollowerConstant",
+            "FollowerBounce",
+            "FollowerElastic",
+        ]
+        for i, name in enumerate(follower_bones):
+            bone = puppet_armature.edit_bones.new(name)
+            bone.head = (i, 0, 1)
+            bone.tail = (i, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in puppet_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        for follower_name, driver_name in zip(follower_bones, driver_bones):
+            follower_pose = puppet_obj.pose.bones[follower_name]
+            constraint = follower_pose.constraints.new(type="COPY_TRANSFORMS")
+            constraint.target = master_obj
+            constraint.subtarget = driver_name
+
+        # Give puppet an action to force hybrid bake path
+        puppet_action = bpy.data.actions.new("EasingPuppetAction")
+        puppet_obj.animation_data_create()
+        puppet_obj.animation_data.action = puppet_action
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(puppet_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for constrained easing test.")
+        keyframes = result["kfs"]
+        self.assertEqual(len(keyframes), 10, "Expected a full 10 frames for constrained rig.")
+
+        first_kf = keyframes[0]["kf"]
+        last_kf = keyframes[-1]["kf"]
+
+        expected = {
+            "FollowerLinear": ("Linear", "In"),
+            "FollowerCubic": ("CubicV2", "InOut"),
+            "FollowerConstant": ("Constant", "Out"),
+            "FollowerBounce": ("Bounce", "Out"),
+            "FollowerElastic": ("Elastic", "In"),
+        }
+
+        for bone_name, (style, direction) in expected.items():
+            first_data = first_kf.get(bone_name)
+            last_data = last_kf.get(bone_name)
+            self.assertIsNotNone(first_data, f"{bone_name} missing from first keyframe.")
+            self.assertIsNotNone(last_data, f"{bone_name} missing from last keyframe.")
+            self.assertEqual(
+                first_data[1],
+                style,
+                f"Constrained easing style did not map correctly for {bone_name}.",
+            )
+            self.assertEqual(
+                first_data[2],
+                direction,
+                f"Constrained easing direction did not map correctly for {bone_name}.",
+            )
+            self.assertEqual(
+                last_data[1],
+                style,
+                f"Constrained easing style did not map correctly for {bone_name}.",
+            )
+            self.assertEqual(
+                last_data[2],
+                direction,
+                f"Constrained easing direction did not map correctly for {bone_name}.",
+            )
 
     def test_copy_transforms_no_keys(self):
         """
@@ -1161,6 +1630,97 @@ class TestAnimationSerialization(unittest.TestCase):
             independent_kf_count,
             2,
             "Sparsely animated 'Independent' bone should only have 2 keyframes.",
+        )
+
+    def test_constrained_constant_animation_stays_sparse(self):
+        """
+        Tests that constrained bones with CONSTANT interpolation do not bake every frame.
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "ConstantConstraintRig"
+        armature = armature_obj.data
+        armature.name = "ConstantConstraintArmature"
+
+        armature.edit_bones.new("Driver").head = (0, 0, 1)
+        armature.edit_bones[-1].tail = (0, 0, 0)
+        armature.edit_bones.new("Follower").head = (1, 0, 1)
+        armature.edit_bones[-1].tail = (1, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("ConstantConstraintAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        driver_pose = armature_obj.pose.bones["Driver"]
+        driver_pose.location = (0, 0, 0)
+        driver_pose.keyframe_insert(data_path="location", frame=1)
+        driver_pose.location = (0, 5, 0)
+        driver_pose.keyframe_insert(data_path="location", frame=20)
+
+        self.set_action_interpolation(action, "CONSTANT")
+
+        follower_pose = armature_obj.pose.bones["Follower"]
+        constraint = follower_pose.constraints.new(type="COPY_TRANSFORMS")
+        constraint.target = armature_obj
+        constraint.subtarget = "Driver"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for constant constraint test.")
+        keyframes = result["kfs"]
+
+        self.assertLessEqual(
+            len(keyframes),
+            3,
+            "Expected constant constrained animation to stay sparse (<= 3 keyframes).",
+        )
+
+        desired_fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+        baked_frames = {
+            bpy.context.scene.frame_start + int(round(kf["t"] * desired_fps))
+            for kf in keyframes
+        }
+        self.assertIn(
+            bpy.context.scene.frame_start,
+            baked_frames,
+            "Expected boundary start frame to be baked.",
+        )
+        self.assertIn(
+            bpy.context.scene.frame_end,
+            baked_frames,
+            "Expected boundary end frame to be baked.",
+        )
+
+        first_kf = keyframes[0]["kf"]
+        last_kf = keyframes[-1]["kf"]
+        self.assertIn("Follower", first_kf, "Follower missing from first keyframe.")
+        self.assertIn("Follower", last_kf, "Follower missing from last keyframe.")
+
+        self.assertEqual(
+            first_kf["Follower"][1],
+            "Constant",
+            "Follower should use Constant easing style on first keyframe.",
+        )
+        self.assertEqual(
+            first_kf["Follower"][2],
+            "Out",
+            "Follower should use Out easing direction on first keyframe.",
         )
 
     def test_constraint_driven_with_no_action(self):
@@ -1339,6 +1899,69 @@ class TestAnimationSerialization(unittest.TestCase):
             3,
             places=4,
             msg="Puppet bone was not in the correct final position.",
+        )
+
+    def test_driver_only_rig_is_baked(self):
+        """
+        Tests that a rig driven only by animation drivers is fully baked
+        even when it has no action.
+        """
+        # --- SETUP ---
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DriverOnlyRig"
+        armature_obj.data.name = "DriverOnlyArmature"
+
+        armature_obj.data.edit_bones.new("DrivenBone").head = (0, 0, 1)
+        armature_obj.data.edit_bones[-1].tail = (0, 0, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Add driver to Z location using frame number
+        driven_pose = armature_obj.pose.bones["DrivenBone"]
+        driver_fcurve = driven_pose.driver_add("location", 2)
+        driver = driver_fcurve.driver
+        driver.type = "SCRIPTED"
+        driver.expression = "frame / 10.0"
+
+        # Ensure no action is present but keep drivers
+        if armature_obj.animation_data is None:
+            armature_obj.animation_data_create()
+        armature_obj.animation_data.action = None
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 20
+        invalidate_armature_cache()
+
+        # --- EXECUTION ---
+        bpy.context.scene.frame_set(1)
+        result = serialize(armature_obj)
+
+        # --- ASSERTION ---
+        self.assertTrue(result, "Serialization returned no result for driver-only rig.")
+        keyframes = result["kfs"]
+
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Expected a full 20 frames for a rig driven by drivers.",
+        )
+
+        first_kf = keyframes[0]["kf"].get("DrivenBone")
+        last_kf = keyframes[-1]["kf"].get("DrivenBone")
+        self.assertIsNotNone(first_kf, "DrivenBone missing from first keyframe.")
+        self.assertIsNotNone(last_kf, "DrivenBone missing from last keyframe.")
+
+        self.assertNotEqual(
+            first_kf[0],
+            last_kf[0],
+            "Driven bone should change across frames.",
         )
 
     def test_deform_rig_detection_with_modifier(self):
@@ -1656,7 +2279,7 @@ class TestAnimationSerialization(unittest.TestCase):
         complex animation to test performance under heavy load.
         """
         # --- SETUP ---
-        BONE_COUNT = 100
+        BONE_COUNT = 200
         FRAME_COUNT = 100
 
         # 1. Create Armature
@@ -2425,6 +3048,8 @@ class TestAnimationSerialization(unittest.TestCase):
         pbone.location = (2, 0, 0)
         pbone.keyframe_insert(data_path="location", frame=4)
 
+        self.set_action_interpolation(action, "LINEAR")
+
         from ..core.utils import get_action_fcurves
 
         fcurves = get_action_fcurves(action)
@@ -2455,7 +3080,12 @@ class TestAnimationSerialization(unittest.TestCase):
                 for kf in result["kfs"]
             }
 
-            expected_frames = {0, 4, 8, 12}
+            # With keyframes at -4 and 4 (cycle_len=8), and frame_start=0, frame_end=12:
+            # - Frame 0: boundary (frame_start)
+            # - Frame 4: keyframe position
+            # - Frame 12: boundary (frame_end) and cycle repeat of frame 4
+            # Note: Frame 8 is not a keyframe position, so sparse baking doesn't include it
+            expected_frames = {0, 4, 12}
             self.assertSetEqual(baked_frames, expected_frames)
         finally:
             scene.render.fps = original_fps

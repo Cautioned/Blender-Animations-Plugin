@@ -3,6 +3,7 @@
 
 local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
 local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local State = require(script.Parent.Parent.Parent.state)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -36,31 +37,38 @@ return function(props: VerticalExpandingListProperties): Frame
 	local hydrateProps = stripProps(props, COMPONENT_ONLY_PROPERTIES)
 
 	local contentSize = Value(Vector2.new(0,0))
+	local rawSize = Computed(function()
+		local mode = unwrap(props.AutomaticSize or Enum.AutomaticSize.Y) -- Custom autosize since engine sizing is unreliable
+		if mode == Enum.AutomaticSize.Y then
+			local s = unwrap(contentSize)
+			if s then
+				return UDim2.new(1,0,0,s.Y)
+			else
+				return UDim2.new(1,0,0,0)
+			end
+		else
+			return props.Size or UDim2.new(1,0,0,0)
+		end
+	end)
+	local animatedSize = getMotionState(rawSize, "Spring", 40)
 
 	return Hydrate(
 		BoxBorder {
 			[Children] = Background {
 				ClipsDescendants = true,
-				Size = getMotionState(Computed(function()
-					local mode = unwrap(props.AutomaticSize or Enum.AutomaticSize.Y) -- Custom autosize since engine sizing is unreliable
-					if mode == Enum.AutomaticSize.Y then
-						local s = unwrap(contentSize)
-						if s then
-							return UDim2.new(1,0,0,s.Y)
-						else
-							return UDim2.new(1,0,0,0)
-						end
-					else
-						return props.Size or UDim2.new(1,0,0,0)
+				Size = Computed(function()
+					if State.reducedMotion:get() then
+						return rawSize:get()
 					end
-				end), "Spring", 40),
+					return animatedSize:get()
+				end),
 
 				[Children] = New "UIListLayout" {
 					SortOrder = Enum.SortOrder.LayoutOrder,
 					FillDirection = Enum.FillDirection.Vertical,
 
 					Padding = Computed(function()
-						return unwrap(props.Padding) or UDim.new(0, 10)
+						return unwrap(props.Padding) or UDim.new(0, 4)
 					end),
 
 					[Out "AbsoluteContentSize"] = contentSize,

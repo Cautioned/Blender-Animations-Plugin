@@ -68,7 +68,8 @@ function CameraManager:updatePartsList()
 
 	local newParts = {}
 	for _, rigPart in pairs(State.activeRig.bones) do
-		if rigPart.part:IsA("BasePart") then
+		-- Include all parts (Part, MeshPart, UnionOperation, etc.) - anything that's an Instance
+		if rigPart.part and typeof(rigPart.part) == "Instance" then
 			table.insert(newParts, rigPart.part.Name)
 		end
 	end

@@ -52,6 +52,8 @@ return function(props: LabelProperties): TextLabel
 		BorderSizePixel = 0,
 		BorderMode = Enum.BorderMode.Inset,
 		TextWrapped = true, -- Enable text wrapping
+		TextYAlignment = Enum.TextYAlignment.Top,
+		LineHeight = 1.05,
 		Font = themeProvider:GetFont("Default"),
 		TextColor3 = props.TextColor3 or getMotionState(themeProvider:GetColor(props.TextColorStyle or Enum.StudioStyleGuideColor.MainText, mainModifier), "Spring", 40),
 

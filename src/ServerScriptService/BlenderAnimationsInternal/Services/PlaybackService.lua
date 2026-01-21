@@ -37,9 +37,18 @@ function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect
 				local tracks = (animator :: any):GetPlayingAnimationTracks() :: { any }
 				if #tracks > 0 then
 					for _, track in ipairs(tracks) do
-						track:Stop(0.01)
+						local stopped = false
+						local stopConn = track.Stopped:Connect(function()
+							stopped = true
+						end)
+						track:Stop(0.05)
+						if track.IsPlaying then
+							track.Stopped:Wait()
+						elseif not stopped then
+							task.wait(0.1)
+						end
+						stopConn:Disconnect()
 					end
-					task.wait(0.1)
 					for _, track in ipairs(tracks) do
 						track:Destroy()
 					end
@@ -211,7 +220,9 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 	end
 
 	local kfs = kfsOverride or self.State.activeRig:ToRobloxAnimation()
-	if self.State.scaleFactor:get() ~= 1 then
+	-- only scale if we're creating a new animation from the rig (no kfsOverride)
+	-- if kfsOverride is provided, it's already been scaled by the caller
+	if not kfsOverride and self.State.scaleFactor:get() ~= 1 then
 		kfs = Utils.scaleAnimation(kfs, self.State.scaleFactor:get())
 	end
 	self.State.currentKeyframeSequence = kfs

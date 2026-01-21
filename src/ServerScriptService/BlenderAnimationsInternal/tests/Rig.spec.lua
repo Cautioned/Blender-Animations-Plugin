@@ -286,6 +286,42 @@ return function()
 			expect(head_encoded.jname).to.equal("Head")
 			expect(#head_encoded.children).to.equal(0)
 		end)
+
+		it("should include weld-connected parts with joint metadata", function()
+			local accessory = Instance.new("Part")
+			accessory.Name = "AccessoryPart"
+			accessory.Parent = mock_rig
+
+			local torso = mock_rig:FindFirstChild("Torso")
+			expect(torso).to.be.ok()
+
+			local weld = Instance.new("Weld")
+			weld.Name = "TorsoAccessoryWeld"
+			weld.Part0 = torso
+			weld.Part1 = accessory
+			weld.C0 = CFrame.new(0, 0.5, 0)
+			weld.Parent = torso
+
+			local rig = rig_module.new(mock_rig)
+			local encoded_rig = rig:EncodeRig()
+
+			local function findChildByName(node, target)
+				for _, child in ipairs(node.children) do
+					if child.jname == target then
+						return child
+					end
+				end
+				return nil
+			end
+
+			local torso_node = findChildByName(encoded_rig, "Torso")
+			expect(torso_node).to.be.ok()
+			local accessory_node = findChildByName(torso_node, "AccessoryPart")
+			expect(accessory_node).to.be.ok()
+			expect(accessory_node.jointType).to.equal("Weld")
+			expect(accessory_node.jointtransform0).to.be.ok()
+			expect(#accessory_node.jointtransform0).to.equal(12)
+		end)
 		it("should correctly set pose weights based on the 'enabled' property", function()
 			local rig = rig_module.new(mock_rig)
 

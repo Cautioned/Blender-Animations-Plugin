@@ -5,11 +5,12 @@ Utility functions for the Roblox Animations Blender Addon.
 import bpy
 import hashlib
 import time
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 from .constants import (
     get_blender_version,
     CACHE_DURATION,
     HASH_CACHE_DURATION,
+    get_transform_to_blender,
 )
 
 
@@ -24,15 +25,30 @@ armature_anim_hashes = {}
 
 
 def get_action_fcurves(action, slot=None):
-    """Return the channelbag F-Curves for an action (Blender 4.4+ API)."""
+    """Return the channelbag F-Curves for an action (Blender 4.4+ API).
+    
+    Handles legacy rigs imported into newer Blender versions by checking
+    multiple sources for fcurves and preferring non-empty results.
+    """
     blender_version = get_blender_version()
     channelbag = get_action_channelbag(action, slot=slot)
+    
+    # Try channelbag fcurves first
+    if channelbag and hasattr(channelbag, "fcurves"):
+        channelbag_fcurves = channelbag.fcurves
+        # Only use if it actually has fcurves
+        if channelbag_fcurves and len(channelbag_fcurves) > 0:
+            return channelbag_fcurves
+
+    # Fallback: check legacy action.fcurves directly
+    # This handles cases where older rigs have empty slots but valid legacy fcurves
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None and len(legacy_fcurves) > 0:
+        return legacy_fcurves
+    
+    # If channelbag exists but was empty, still return it (might be intentionally empty)
     if channelbag and hasattr(channelbag, "fcurves"):
         return channelbag.fcurves
-
-    legacy_fcurves = getattr(action, "fcurves", None)
-    if legacy_fcurves is not None:
-        return legacy_fcurves
 
     if blender_version >= (4, 4, 0):
         raise RuntimeError(
@@ -91,7 +107,11 @@ def pose_bone_set_selected(pose_bone, value):
 
 
 def get_action_channelbag(action, slot=None):
-    """Return the ensured channelbag for an action slot, with legacy fallbacks."""
+    """Return the ensured channelbag for an action slot, with legacy fallbacks.
+    
+    Handles the case where older rigs imported into Blender 4.4+ may have
+    empty legacy slots - this function will find a slot with actual animation data.
+    """
     if not action:
         return None
 
@@ -102,7 +122,36 @@ def get_action_channelbag(action, slot=None):
     if slots_attr is not None:
         target_slot = slot
         if target_slot is None:
-            if slots_attr:
+            # Instead of just taking the first slot, find one that has actual data
+            # This handles legacy rigs that may have empty slots from older Blender versions
+            best_slot = None
+            best_slot_fcurve_count = 0
+            
+            for candidate_slot in slots_attr:
+                # Try to get fcurve count for this slot
+                fcurve_count = 0
+                try:
+                    # Check via channelbag
+                    candidate_channelbag = getattr(candidate_slot, "channelbag", None)
+                    if candidate_channelbag and hasattr(candidate_channelbag, "fcurves"):
+                        fcurve_count = len(candidate_channelbag.fcurves)
+                    elif hasattr(candidate_slot, "fcurves"):
+                        fcurve_count = len(candidate_slot.fcurves)
+                except Exception:
+                    pass
+                
+                # Prefer slot with more fcurves
+                if fcurve_count > best_slot_fcurve_count:
+                    best_slot = candidate_slot
+                    best_slot_fcurve_count = fcurve_count
+                elif best_slot is None:
+                    # If no slot has fcurves yet, at least pick the first one
+                    best_slot = candidate_slot
+            
+            if best_slot is not None:
+                target_slot = best_slot
+            elif slots_attr:
+                # Fallback to first slot if our search found nothing
                 target_slot = slots_attr[0]
             else:
                 try:
@@ -333,6 +382,107 @@ def mat_to_cf(mat):
         mat[2][2],
     ]
     return r_mat
+
+
+def to_matrix(value):
+    """Safely convert IDProperty value to Matrix"""
+    if isinstance(value, Matrix):
+        return value
+    
+    # Handle IDPropertyArray or list
+    if hasattr(value, "to_list"):
+        value = value.to_list()
+    elif hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+        value = list(value)
+    
+    if isinstance(value, list):
+        if len(value) == 4:
+            # Assume list of lists (4x4)
+            try:
+                return Matrix(tuple(tuple(row) for row in value))
+            except:
+                pass
+        elif len(value) == 16:
+            # Assume flat list
+            try:
+                return Matrix([value[i:i+4] for i in range(0, 16, 4)])
+            except:
+                pass
+        elif len(value) == 12:
+             # Assume CFrame list
+            try:
+                return cf_to_mat(value)
+            except:
+                pass
+                
+    return Matrix.Identity(4)
+
+
+def get_rig_facing_direction(armature_obj):
+    """
+    Determine the facing direction of a rig by extracting the forward vector
+    from the root bone's transform.
+    
+    Args:
+        armature_obj: The armature object (bpy.types.Object with type='ARMATURE')
+    
+    Returns:
+        tuple: (forward_vector, root_bone_name) where:
+            - forward_vector: Vector in Blender space representing the forward direction
+            - root_bone_name: Name of the root bone used, or None if not found
+    
+    Returns None, None if the armature has no root bone or transform data.
+    """
+    if not armature_obj or armature_obj.type != "ARMATURE":
+        return None, None
+    
+    # Find root bone (no parent)
+    root_bone = None
+    for bone in armature_obj.data.bones:
+        if not bone.parent:
+            root_bone = bone
+            break
+    
+    if not root_bone:
+        return None, None
+    
+    t2b = get_transform_to_blender()
+    forward_vector = None
+    
+    # Try to get transform from Motor6D properties first
+    if "transform" in root_bone:
+        try:
+            transform_data = root_bone["transform"]
+            mat = to_matrix(transform_data)
+            
+            # Extract forward direction: in Roblox space, forward is +Z
+            # Convert to Blender space
+            roblox_forward = Vector((0, 0, 1))
+            forward_vector = (t2b @ mat).to_3x3().to_4x4() @ roblox_forward
+            forward_vector.normalize()
+        except (KeyError, TypeError, ValueError):
+            # Fall through to using bone matrix
+            pass
+    
+    # Fallback: use bone's rest pose matrix (for deform rigs or if transform not available)
+    if forward_vector is None:
+        try:
+            # Get the bone's matrix in object space
+            bone_matrix = root_bone.matrix_local.copy()
+            # Extract forward direction from the bone's Y-axis (Blender's forward)
+            # In Blender, bones point along their Y-axis, so this is the bone's actual forward direction
+            forward_vector = bone_matrix.to_3x3() @ Vector((0, 1, 0))
+            forward_vector.normalize()
+        except Exception:
+            return None, None
+    
+    # Transform to world space if we got it from bone matrix
+    # (transform from Motor6D is already in world space after t2b conversion
+    if forward_vector and "transform" not in root_bone:
+        # Convert from armature object space to world space
+        forward_vector = (armature_obj.matrix_world.to_3x3() @ forward_vector).normalized()
+    
+    return forward_vector, root_bone.name
 
 
 def get_unique_name(base_name):

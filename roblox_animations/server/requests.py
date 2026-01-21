@@ -11,6 +11,7 @@ from mathutils import Vector, Matrix
 from ..core.utils import get_action_hash, get_scene_fps, set_scene_fps, cf_to_mat
 from ..core import utils
 from ..animation.serialization import serialize, is_deform_bone_rig
+from ..animation.import_export import import_animation_preserve_ik
 
 
 # Global request queues
@@ -223,7 +224,7 @@ def execute_in_main_thread(task_id, armature_name):
 
 
 def execute_import_animation(task_id, animation_data, target_armature=None):
-    """Execute the animation import in the main thread"""
+    """Execute the animation import in the main thread with IK preservation."""
     try:
         # Use target armature if provided, otherwise fall back to scene selection
         if target_armature:
@@ -259,329 +260,328 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
         if ao.mode != "POSE":
             bpy.ops.object.mode_set(mode="POSE")
 
-        # Clear existing animation data
-        if ao.animation_data:
-            ao.animation_data_clear()
+        def _do_import():
+            # Clear existing animation data
+            if ao.animation_data:
+                ao.animation_data_clear()
 
-        # Reset pose to rest position to ensure a clean slate
-        if ao.pose:
-            for bone in ao.pose.bones:
-                bone.matrix_basis = Matrix.Identity(4)
-            bpy.context.view_layer.update()  # Ensure the pose update is registered
+            # Reset pose to rest position to ensure a clean slate
+            if ao.pose:
+                for bone in ao.pose.bones:
+                    bone.matrix_basis = Matrix.Identity(4)
+                bpy.context.view_layer.update()  # Ensure the pose update is registered
 
-        action = bpy.data.actions.new(name=f"{armature_name}_ImportedAnimation")
-        ao.animation_data_create()
-        ao.animation_data.action = action
+            action = bpy.data.actions.new(name=f"{armature_name}_ImportedAnimation")
+            ao.animation_data_create()
+            ao.animation_data.action = action
 
-        # Ensure a compatible action slot exists (Blender 4.4+)
-        active_slot = None
-        if hasattr(action, "slots"):
-            if action.slots:
-                active_slot = action.slots[0]
+            # Ensure a compatible action slot exists (Blender 4.4+)
+            active_slot = None
+            if hasattr(action, "slots"):
+                if action.slots:
+                    active_slot = action.slots[0]
+                else:
+                    try:
+                        active_slot = action.slots.new(
+                            id_type="OBJECT", name=f"OB{ao.name}"
+                        )
+                    except TypeError:
+                        active_slot = action.slots.new(id_type="OBJECT")
+                if active_slot and hasattr(ao.animation_data, "action_slot"):
+                    try:
+                        ao.animation_data.action_slot = active_slot
+                    except Exception:
+                        pass
             else:
-                try:
-                    active_slot = action.slots.new(
-                        id_type="OBJECT", name=f"OB{ao.name}"
-                    )
-                except TypeError:
-                    active_slot = action.slots.new(id_type="OBJECT")
-            if active_slot and hasattr(ao.animation_data, "action_slot"):
-                try:
-                    ao.animation_data.action_slot = active_slot
-                except Exception:
-                    pass
-        else:
-            pass
+                pass
 
-        fps = animation_data.get("export_info", {}).get("fps", get_scene_fps())
-        set_scene_fps(fps)
+            fps = animation_data.get("export_info", {}).get("fps", get_scene_fps())
+            set_scene_fps(fps)
 
-        scene = bpy.context.scene
-        scene.frame_start = 0
-        scene.frame_end = int(animation_data["t"] * fps)
+            scene = bpy.context.scene
+            scene.frame_start = 0
+            scene.frame_end = int(animation_data["t"] * fps)
 
-        is_deform_rig = animation_data.get("is_deform_bone_rig", False)
+            is_deform_rig = animation_data.get("is_deform_bone_rig", False)
 
-        # This will store all transform data for all bones across all frames before we create any keyframes.
-        # Format: { bone_name: { frame: {"location": Vector, "rotation": Quaternion, "scale": Vector}, ... }, ... }
-        all_bone_data = {}
+            # This will store all transform data for all bones across all frames before we create any keyframes.
+            # Format: { bone_name: { frame: {"location": Vector, "rotation": Quaternion, "scale": Vector}, ... }, ... }
+            all_bone_data = {}
 
-        # Reset pose to rest position and pre-populate all transformable bones
-        # with their rest pose at the start frame. This ensures a defined initial state.
-        if ao.pose:
-            for bone in ao.pose.bones:
-                bone.matrix_basis = Matrix.Identity(4)
-            bpy.context.view_layer.update()
+            # Reset pose to rest position and pre-populate all transformable bones
+            # with their rest pose at the start frame. This ensures a defined initial state.
+            if ao.pose:
+                for bone in ao.pose.bones:
+                    bone.matrix_basis = Matrix.Identity(4)
+                bpy.context.view_layer.update()
 
-            start_frame = scene.frame_start
-            for bone in ao.pose.bones:
-                is_transformable = (
-                    not is_deform_rig and "is_transformable" in bone.bone
-                ) or (is_deform_rig and bone.bone.use_deform)
-                if is_transformable:
-                    all_bone_data[bone.name] = {
-                        start_frame: {
-                            "location": bone.location.copy(),
-                            "rotation_quaternion": bone.rotation_quaternion.copy(),
-                            "scale": bone.scale.copy(),
-                        }
-                    }
-
-        for kf_data in animation_data["kfs"]:
-            frame = int(kf_data["t"] * fps)
-            state = kf_data["kf"]
-
-            bones_to_process = []
-            for bone_name in state.keys():
-                pose_bone = ao.pose.bones.get(bone_name)
-                if pose_bone:
-                    bones_to_process.append(pose_bone)
-
-            bones_to_process.sort(key=lambda b: len(b.parent_recursive))
-
-            # Simplified single-pass processing loop.
-            # By iterating through bones sorted by hierarchy (parents first), we ensure
-            # that when we calculate a child's matrix, the parent's matrix for the
-            # current frame has already been set.
-            for pose_bone in bones_to_process:
-                bone_name = pose_bone.name
-                pose_data = state.get(bone_name)
-                if not pose_data:
-                    continue
-
-                # Backwards compatibility: Handle old list-based format and new dict-based format.
-                easing_style = "Linear"  # Default easing
-                easing_direction = "In"  # Default easing
-
-                if isinstance(pose_data, list) and len(pose_data) == 3:
-                    # New, more robust format: [ [cframe_components], "EasingStyle", "EasingDirection" ]
-                    cframe_components = pose_data[0]
-                    easing_style = pose_data[1]
-                    easing_direction = pose_data[2]
-                elif isinstance(pose_data, dict):
-                    # old format with easing styles
-                    cframe_components = pose_data.get("components", [])
-                    easing_style = pose_data.get("easingStyle", "Linear")
-                    easing_direction = pose_data.get("easingDirection", "In")
-                elif isinstance(pose_data, list):
-                    # oldest format, just a list of cframe components
-                    cframe_components = pose_data
-
-                if not cframe_components:
-                    continue
-
-                bone_transform = cf_to_mat(cframe_components)
-
-                # --- Matrix Calculation ---
-                if is_deform_rig:
-                    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
-                    scale_factor = getattr(settings, "rbx_deform_rig_scale", 1.0)
-
-                    loc, rot, sca = bone_transform.decompose()
-                    loc_blender = Vector(
-                        (
-                            -loc.x * scale_factor,
-                            loc.y * scale_factor,
-                            -loc.z * scale_factor,
-                        )
-                    )
-                    sca_blender = Vector((sca.x, sca.z, sca.y))
-                    rot.x, rot.z = -rot.x, -rot.z
-                    loc_mat = Matrix.Translation(loc_blender)
-                    rot_mat = rot.to_matrix().to_4x4()
-                    sca_mat = Matrix.Diagonal(sca_blender).to_4x4()
-                    delta_transform = loc_mat @ rot_mat @ sca_mat
-                    rest_local_transform = pose_bone.bone.matrix_local
-                    final_matrix = rest_local_transform @ delta_transform
-                else:  # Motor6D rig
-                    back_trans = transform_to_blender.inverted()
-                    extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()
-
-                    orig_mat = Matrix(pose_bone.bone["transform"])
-                    orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
-
-                    if pose_bone.parent and "transform" in pose_bone.parent.bone:
-                        parent_orig_mat = Matrix(pose_bone.parent.bone["transform"])
-                        parent_orig_mat_tr1 = Matrix(
-                            pose_bone.parent.bone["transform1"]
-                        )
-
-                        orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
-                        parent_orig_base_mat = back_trans @ (
-                            parent_orig_mat @ parent_orig_mat_tr1
-                        )
-                        orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
-
-                        cur_transform = orig_transform @ bone_transform
-
-                        parent_extr_transform = Matrix(
-                            pose_bone.parent.bone["nicetransform"]
-                        ).inverted()
-
-                        # Use the parent's current matrix from the pose, which was set in the previous iteration
-                        parent_matrix = pose_bone.parent.matrix
-                        parent_obj_transform = back_trans @ (
-                            parent_matrix @ parent_extr_transform
-                        )
-
-                        cur_obj_transform = parent_obj_transform @ cur_transform
+                start_frame = scene.frame_start
+                for bone in ao.pose.bones:
+                    if is_deform_rig:
+                        is_transformable = bone.bone.use_deform
                     else:
-                        cur_obj_transform = bone_transform
+                        # Handle both boolean True and integer 1 for backward compatibility
+                        # We check truthiness to support both True (bool) and 1 (int)
+                        is_transformable = bool(bone.bone.get("is_transformable", False))
+                    if is_transformable:
+                        all_bone_data[bone.name] = {
+                            start_frame: {
+                                "location": bone.location.copy(),
+                                "rotation_quaternion": bone.rotation_quaternion.copy(),
+                                "scale": bone.scale.copy(),
+                            }
+                        }
 
-                    final_matrix = (
-                        transform_to_blender
-                        @ cur_obj_transform
-                        @ extr_transform.inverted()
+            for kf_data in animation_data["kfs"]:
+                frame = int(kf_data["t"] * fps)
+                state = kf_data["kf"]
+
+                bones_to_process = []
+                for bone_name in state.keys():
+                    pose_bone = ao.pose.bones.get(bone_name)
+                    if pose_bone:
+                        bones_to_process.append(pose_bone)
+
+                bones_to_process.sort(key=lambda b: len(b.parent_recursive))
+
+                # Simplified single-pass processing loop.
+                # By iterating through bones sorted by hierarchy (parents first), we ensure
+                # that when we calculate a child's matrix, the parent's matrix for the
+                # current frame has already been set.
+                for pose_bone in bones_to_process:
+                    bone_name = pose_bone.name
+                    pose_data = state.get(bone_name)
+                    if not pose_data:
+                        continue
+
+                    # Backwards compatibility: Handle old list-based format and new dict-based format.
+                    easing_style = "Linear"  # Default easing
+                    easing_direction = "In"  # Default easing
+
+                    if isinstance(pose_data, list) and len(pose_data) == 3:
+                        # New, more robust format: [ [cframe_components], "EasingStyle", "EasingDirection" ]
+                        cframe_components = pose_data[0]
+                        easing_style = pose_data[1]
+                        easing_direction = pose_data[2]
+                    elif isinstance(pose_data, dict):
+                        # old format with easing styles
+                        cframe_components = pose_data.get("components", [])
+                        easing_style = pose_data.get("easingStyle", "Linear")
+                        easing_direction = pose_data.get("easingDirection", "In")
+                    elif isinstance(pose_data, list):
+                        # oldest format, just a list of cframe components
+                        cframe_components = pose_data
+
+                    if not cframe_components:
+                        continue
+
+                    bone_transform = cf_to_mat(cframe_components)
+
+                    # --- Matrix Calculation ---
+                    # Check if this bone has Motor6D properties (from rig build)
+                    has_motor6d_props = (
+                        "nicetransform" in pose_bone.bone
+                        and "transform" in pose_bone.bone
+                        and "transform1" in pose_bone.bone
                     )
 
-                # --- Apply and Store ---
-                pose_bone.matrix = final_matrix
+                    if not has_motor6d_props:
+                        # Simple delta path - works for deform bones and any bone without Motor6D data
+                        # The transform is a LOCAL delta in the bone's own space.
+                        # Just apply it directly to the rest pose.
+                        final_matrix = pose_bone.bone.matrix_local @ bone_transform
+                    else:  # Motor6D rig
+                        back_trans = transform_to_blender.inverted()
+                        extr_transform = Matrix(pose_bone.bone["nicetransform"]).inverted()
 
-                if bone_name in all_bone_data:
-                    all_bone_data[bone_name][frame] = {
-                        "location": pose_bone.location.copy(),
-                        "rotation_quaternion": pose_bone.rotation_quaternion.copy(),
-                        "scale": pose_bone.scale.copy(),
-                        "easingStyle": easing_style,
-                        "easingDirection": easing_direction,
-                    }
+                        orig_mat = Matrix(pose_bone.bone["transform"])
+                        orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
 
-        for bone_name, frame_data in all_bone_data.items():
-            sorted_frames = sorted(frame_data.keys())
+                        if pose_bone.parent and "transform" in pose_bone.parent.bone:
+                            parent_orig_mat = Matrix(pose_bone.parent.bone["transform"])
+                            parent_orig_mat_tr1 = Matrix(
+                                pose_bone.parent.bone["transform1"]
+                            )
 
-            channelbag = utils.get_action_channelbag(action)
-            if channelbag is None or not hasattr(channelbag, "fcurves"):
-                legacy_fcurves = getattr(action, "fcurves", None)
-                if legacy_fcurves is None:
-                    raise RuntimeError(
-                        "Unable to access animation channelbag for import"
-                    )
+                            orig_base_mat = back_trans @ (orig_mat @ orig_mat_tr1)
+                            parent_orig_base_mat = back_trans @ (
+                                parent_orig_mat @ parent_orig_mat_tr1
+                            )
+                            orig_transform = parent_orig_base_mat.inverted() @ orig_base_mat
 
-                class _LegacyChannelbag:
-                    def __init__(self, fcurves, groups):
-                        self.fcurves = fcurves
-                        self.groups = groups
+                            cur_transform = orig_transform @ bone_transform
 
-                    def new(self, *args, **kwargs):
-                        return self.fcurves.new(*args, **kwargs)
+                            parent_extr_transform = Matrix(
+                                pose_bone.parent.bone["nicetransform"]
+                            ).inverted()
 
-                channelbag = _LegacyChannelbag(
-                    legacy_fcurves, getattr(action, "groups", [])
-                )
+                            # Use the parent's current matrix from the pose, which was set in the previous iteration
+                            parent_matrix = pose_bone.parent.matrix
+                            parent_obj_transform = back_trans @ (
+                                parent_matrix @ parent_extr_transform
+                            )
 
-            # Create fcurves with version-appropriate parameters
-            def create_fcurve(data_path, index, group_name):
-                try:
-                    return channelbag.fcurves.new(data_path, index=index)
-                except TypeError:
-                    if hasattr(channelbag.fcurves, "new"):
-                        for candidate in ("group_name", "action_group"):
-                            try:
-                                return channelbag.fcurves.new(
-                                    data_path, index=index, **{candidate: group_name}
-                                )
-                            except TypeError:
-                                continue
-                    return channelbag.fcurves.new(data_path, index=index)
+                            cur_obj_transform = parent_obj_transform @ cur_transform
+                        else:
+                            cur_obj_transform = bone_transform
 
-            # Location
-            loc_fcurves = [
-                create_fcurve(
-                    f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].location',
-                    i,
-                    bone_name,
-                )
-                for i in range(3)
-            ]
-            # Rotation
-            rot_fcurves = [
-                create_fcurve(
-                    f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].rotation_quaternion',
-                    i,
-                    bone_name,
-                )
-                for i in range(4)
-            ]
-            # Scale
-            scale_fcurves = [
-                create_fcurve(
-                    f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].scale',
-                    i,
-                    bone_name,
-                )
-                for i in range(3)
-            ]
-
-            # Most Roblox easings map to their corresponding interpolation type in Blender.
-            interpolation_map = {
-                "Linear": "LINEAR",
-                "Constant": "CONSTANT",
-                "Elastic": "ELASTIC",
-                "Bounce": "BOUNCE",
-                "Sine": "SINE",
-                "Quad": "QUAD",
-                "Cubic": "CUBIC",
-                "CubicV2": "CUBIC",
-                "Quart": "QUART",
-                "Quint": "QUINT",
-                "Expo": "EXPO",
-                "Circular": "CIRC",
-                "Back": "BACK",
-            }
-
-            num_frames = len(sorted_frames)
-            if num_frames == 0:
-                continue
-
-            for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                fcurve.keyframe_points.add(num_frames)
-
-            for idx, frame in enumerate(sorted_frames):
-                transforms = frame_data[frame]
-                loc = transforms["location"]
-                rot = transforms["rotation_quaternion"]
-                scl = transforms["scale"]
-
-                for axis in range(3):
-                    kp = loc_fcurves[axis].keyframe_points[idx]
-                    kp.co = (frame, loc[axis])
-                    kp.handle_left_type = kp.handle_right_type = "AUTO"
-                for axis in range(4):
-                    kp = rot_fcurves[axis].keyframe_points[idx]
-                    kp.co = (frame, rot[axis])
-                    kp.handle_left_type = kp.handle_right_type = "AUTO"
-                for axis in range(3):
-                    kp = scale_fcurves[axis].keyframe_points[idx]
-                    kp.co = (frame, scl[axis])
-                    kp.handle_left_type = kp.handle_right_type = "AUTO"
-
-            if num_frames > 1:
-                for idx in range(num_frames - 1):
-                    current_frame_time = sorted_frames[idx]
-                    current_transforms = frame_data[current_frame_time]
-                    easing_style = current_transforms.get("easingStyle", "Linear")
-                    easing_direction = current_transforms.get("easingDirection", "In")
-
-                    for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                        kp_current = fcurve.keyframe_points[idx]
-                        kp_current.interpolation = interpolation_map.get(
-                            easing_style, "LINEAR"
+                        final_matrix = (
+                            transform_to_blender
+                            @ cur_obj_transform
+                            @ extr_transform.inverted()
                         )
 
-                        if kp_current.interpolation not in ["LINEAR", "CONSTANT"]:
-                            if easing_direction == "In":
-                                kp_current.easing = "EASE_IN"
-                            elif easing_direction == "Out":
-                                kp_current.easing = "EASE_OUT"
-                            elif easing_direction == "InOut":
-                                kp_current.easing = "EASE_IN_OUT"
-                        else:
-                            kp_current.easing = "AUTO"
+                    # --- Apply and Store ---
+                    pose_bone.matrix = final_matrix
 
-            for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                fcurve.update()
+                    if bone_name in all_bone_data:
+                        all_bone_data[bone_name][frame] = {
+                            "location": pose_bone.location.copy(),
+                            "rotation_quaternion": pose_bone.rotation_quaternion.copy(),
+                            "scale": pose_bone.scale.copy(),
+                            "easingStyle": easing_style,
+                            "easingDirection": easing_direction,
+                        }
 
-        pending_responses[task_id] = (True, "Animation imported successfully")
+            for bone_name, frame_data in all_bone_data.items():
+                sorted_frames = sorted(frame_data.keys())
+
+                channelbag = utils.get_action_channelbag(action)
+                if channelbag is None or not hasattr(channelbag, "fcurves"):
+                    legacy_fcurves = getattr(action, "fcurves", None)
+                    if legacy_fcurves is None:
+                        raise RuntimeError(
+                            "Unable to access animation channelbag for import"
+                        )
+
+                    class _LegacyChannelbag:
+                        def __init__(self, fcurves, groups):
+                            self.fcurves = fcurves
+                            self.groups = groups
+
+                        def new(self, *args, **kwargs):
+                            return self.fcurves.new(*args, **kwargs)
+
+                    channelbag = _LegacyChannelbag(
+                        legacy_fcurves, getattr(action, "groups", [])
+                    )
+
+                # Create fcurves with version-appropriate parameters
+                def create_fcurve(data_path, index, group_name):
+                    try:
+                        return channelbag.fcurves.new(data_path, index=index)
+                    except TypeError:
+                        if hasattr(channelbag.fcurves, "new"):
+                            for candidate in ("group_name", "action_group"):
+                                try:
+                                    return channelbag.fcurves.new(
+                                        data_path, index=index, **{candidate: group_name}
+                                    )
+                                except TypeError:
+                                    continue
+                        return channelbag.fcurves.new(data_path, index=index)
+
+                # Location
+                loc_fcurves = [
+                    create_fcurve(
+                        f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].location',
+                        i,
+                        bone_name,
+                    )
+                    for i in range(3)
+                ]
+                # Rotation
+                rot_fcurves = [
+                    create_fcurve(
+                        f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].rotation_quaternion',
+                        i,
+                        bone_name,
+                    )
+                    for i in range(4)
+                ]
+                # Scale
+                scale_fcurves = [
+                    create_fcurve(
+                        f'pose.bones["{bpy.utils.escape_identifier(bone_name)}"].scale',
+                        i,
+                        bone_name,
+                    )
+                    for i in range(3)
+                ]
+
+                # Most Roblox easings map to their corresponding interpolation type in Blender.
+                interpolation_map = {
+                    "Linear": "LINEAR",
+                    "Constant": "CONSTANT",
+                    "Elastic": "ELASTIC",
+                    "Bounce": "BOUNCE",
+                    "Sine": "SINE",
+                    "Quad": "QUAD",
+                    "Cubic": "CUBIC",
+                    "CubicV2": "CUBIC",
+                    "Quart": "QUART",
+                    "Quint": "QUINT",
+                    "Expo": "EXPO",
+                    "Circular": "CIRC",
+                    "Back": "BACK",
+                }
+
+                num_frames = len(sorted_frames)
+                if num_frames == 0:
+                    continue
+
+                for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
+                    fcurve.keyframe_points.add(num_frames)
+
+                for idx, frame in enumerate(sorted_frames):
+                    transforms = frame_data[frame]
+                    loc = transforms["location"]
+                    rot = transforms["rotation_quaternion"]
+                    scl = transforms["scale"]
+
+                    for axis in range(3):
+                        kp = loc_fcurves[axis].keyframe_points[idx]
+                        kp.co = (frame, loc[axis])
+                        kp.handle_left_type = kp.handle_right_type = "AUTO"
+                    for axis in range(4):
+                        kp = rot_fcurves[axis].keyframe_points[idx]
+                        kp.co = (frame, rot[axis])
+                        kp.handle_left_type = kp.handle_right_type = "AUTO"
+                    for axis in range(3):
+                        kp = scale_fcurves[axis].keyframe_points[idx]
+                        kp.co = (frame, scl[axis])
+                        kp.handle_left_type = kp.handle_right_type = "AUTO"
+
+                if num_frames > 1:
+                    for idx in range(num_frames - 1):
+                        current_frame_time = sorted_frames[idx]
+                        current_transforms = frame_data[current_frame_time]
+                        easing_style = current_transforms.get("easingStyle", "Linear")
+                        easing_direction = current_transforms.get("easingDirection", "In")
+
+                        for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
+                            kp_current = fcurve.keyframe_points[idx]
+                            kp_current.interpolation = interpolation_map.get(
+                                easing_style, "LINEAR"
+                            )
+
+                            if kp_current.interpolation not in ["LINEAR", "CONSTANT"]:
+                                if easing_direction == "In":
+                                    kp_current.easing = "EASE_IN"
+                                elif easing_direction == "Out":
+                                    kp_current.easing = "EASE_OUT"
+                                elif easing_direction == "InOut":
+                                    kp_current.easing = "EASE_IN_OUT"
+                            else:
+                                kp_current.easing = "AUTO"
+
+                for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
+                    fcurve.update()
+
+            pending_responses[task_id] = (True, "Animation imported successfully")
+
+        # Run import wrapped with IK preservation (FK import then bake back to IK)
+        import_animation_preserve_ik(_do_import)
 
     except Exception as e:
         print(f"Error in main thread (import_animation): {str(e)}")

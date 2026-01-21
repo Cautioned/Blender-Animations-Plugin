@@ -17,7 +17,7 @@ type self = {
 	bonesByInstance: { [Instance]: RigPart.RigPart },
 	isDeformRig: boolean,
 	boneHierarchy: { [string]: string? },
-	_jointCache: { [Instance]: { Motor6D } },
+	_jointCache: { [Instance]: { Instance } }, -- Motor6D, Weld, or WeldConstraint
 	_duplicateBoneWarnings: { [string]: boolean }?,
 }
 
@@ -44,28 +44,52 @@ function Rig.new(model: Model)
 	for _, descendant in ipairs(model:GetDescendants()) do
 		if descendant:IsA("Bone") then
 			table.insert(allBones, descendant)
-		elseif descendant:IsA("Motor6D") then
+		elseif descendant:IsA("Motor6D") or descendant:IsA("Weld") or descendant:IsA("WeldConstraint") then
 			table.insert(allJoints, descendant)
 		end
 	end
 
 	self.isDeformRig = #allBones > 0
 
-	-- Pre-build the joint cache for fast lookups
+    -- Pre-build the joint cache for fast lookups, guarding duplicate Motor6D names under the same parent
 	self._jointCache = {}
-	for _, joint in ipairs(allJoints) do
-		local p0, p1 = joint.Part0, joint.Part1
+	local duplicateGuard: { [Instance]: { [string]: boolean } } = {}
+
+	local function addJointToCache(joint: Instance)
+		local p0 = (joint :: any).Part0
+		local p1 = (joint :: any).Part1
 		if p0 then
-			if not self._jointCache[p0] then
-				self._jointCache[p0] = {}
-			end
+			self._jointCache[p0] = self._jointCache[p0] or {}
 			table.insert(self._jointCache[p0], joint)
 		end
 		if p1 then
-			if not self._jointCache[p1] then
-				self._jointCache[p1] = {}
-			end
+			self._jointCache[p1] = self._jointCache[p1] or {}
 			table.insert(self._jointCache[p1], joint)
+		end
+	end
+
+	for _, joint in ipairs(allJoints) do
+		if joint:IsA("Motor6D") then
+			local parentInst = joint.Parent
+			if parentInst then
+				local nameSet = duplicateGuard[parentInst]
+				if not nameSet then
+					nameSet = {}
+					duplicateGuard[parentInst] = nameSet
+				end
+				if nameSet[joint.Name] then
+					warn("duplicate Motor6D name under same parent detected; ignoring subsequent joint:", parentInst:GetFullName(), joint.Name)
+					-- skip duplicate Motor6D to avoid ambiguity
+				else
+					nameSet[joint.Name] = true
+					addJointToCache(joint)
+				end
+			else
+				addJointToCache(joint)
+			end
+		else
+			-- Welds and WeldConstraints are indexed without duplicate-name filtering
+			addJointToCache(joint)
 		end
 	end
 
@@ -175,6 +199,66 @@ end
 function Rig:buildBoneHierarchy(allBones)
 	-- Find all bones in the model and create RigParts for them.
 	-- This now ADDS to the rig rather than creating it from scratch.
+    -- Guard against cyclic bone parenting (depth issues) using Kahn's algorithm (iterative, no recursion)
+    do
+        local boneSet: { [Instance]: boolean } = {}
+        for i = 1, #allBones do
+            boneSet[allBones[i]] = true
+        end
+        -- initialize all bones in graph with indegree 0
+        local graph: { [Instance]: { Instance } } = {}
+        local indegree: { [Instance]: number } = {}
+        for i = 1, #allBones do
+            local b = allBones[i]
+            indegree[b] = 0
+            graph[b] = {}
+        end
+        -- build edges: bone -> child bone
+        for i = 1, #allBones do
+            local b = allBones[i]
+            local p = b.Parent
+            -- only add edge if parent is also a bone (bone-to-bone cycle check)
+            if p and boneSet[p] then
+                if not graph[p] then
+                    graph[p] = {}
+                    indegree[p] = indegree[p] or 0
+                end
+                table.insert(graph[p], b)
+                indegree[b] = (indegree[b] or 0) + 1
+            end
+        end
+        -- kahn's: queue all zero-indegree nodes
+        local queue: { Instance } = {}
+        local qh, qt = 1, 0
+        for i = 1, #allBones do
+            local b = allBones[i]
+            if indegree[b] == 0 then
+                qt += 1
+                queue[qt] = b
+            end
+        end
+        local processed = 0
+        while qh <= qt do
+            local n = queue[qh]
+            qh += 1
+            processed += 1
+            local nbrs = graph[n]
+            if nbrs then
+                for i = 1, #nbrs do
+                    local m = nbrs[i]
+                    indegree[m] -= 1
+                    if indegree[m] == 0 then
+                        qt += 1
+                        queue[qt] = m
+                    end
+                end
+            end
+        end
+        -- if we didn't process all bones, there's a cycle
+        if processed < #allBones then
+            error("CIRCULAR BONE HIERARCHY DETECTED: remove the cycle in bone parenting.")
+        end
+    end
     -- intentionally unused local kept for readability when editing
     local _bones = self.bones
 
@@ -183,23 +267,9 @@ function Rig:buildBoneHierarchy(allBones)
 		unresolved[#unresolved + 1] = bone
 	end
 
-	local safetyCounter = 0
 	while #unresolved > 0 do
-		safetyCounter += 1
-		if safetyCounter > #unresolved + 5 then
-			for _, bone in ipairs(unresolved) do
-				local parentInstance = bone.Parent
-				warn(
-					"Could not resolve parent rig part for bone:",
-					bone.Name,
-					"Parent:",
-					parentInstance and parentInstance.Name or "<nil>"
-				)
-			end
-			break
-		end
-
 		local resolvedThisPass = false
+        -- attempt to resolve all items; if none resolved, break to avoid infinite loop
 		for i = #unresolved, 1, -1 do
 			local bone = unresolved[i]
 			local parentInstance = bone.Parent
@@ -220,7 +290,6 @@ function Rig:buildBoneHierarchy(allBones)
 		end
 
 		if not resolvedThisPass then
-			-- Avoid infinite loop if parents are missing entirely
 			for _, bone in ipairs(unresolved) do
 				local parentInstance = bone.Parent
 				warn(
@@ -241,20 +310,26 @@ function Rig:GetRigParts()
 	local parts = {}
 	local root = self.root
 
-	local function finder(part, depth)
-		if depth > 50 then -- Prevent stack overflow
-			warn("RigPart hierarchy too deep (>50 levels), stopping traversal at:", part.part.Name)
-			return
-		end
-		
-		for _, child in pairs(part.children) do
-			parts[#parts + 1] = child
-			finder(child, depth + 1)
-		end
-	end
+    if not root then
+        return parts
+    end
 
-	if root then
-		finder(root, 0)
+    -- iterative dfs to avoid recursion limits on deep hierarchies; guards cycles too
+    local stack = { root }
+    local visited = {}
+
+    while #stack > 0 do
+        local current = stack[#stack]
+        stack[#stack] = nil
+
+        if not visited[current] then
+            visited[current] = true
+		
+            for _, child in pairs(current.children) do
+			parts[#parts + 1] = child
+                stack[#stack + 1] = child
+            end
+		end
 	end
 
 	return parts
@@ -286,6 +361,10 @@ function Rig:LoadAnimation(data)
 
 	if not data.kfs or type(data.kfs) ~= "table" then
 		error("Animation data missing keyframes array (data.kfs)")
+	end
+
+	if data.t == nil or type(data.t) ~= "number" then
+		error("Animation data missing duration (data.t)")
 	end
 
 	self:ClearPoses()
@@ -470,8 +549,14 @@ function Rig:ToRobloxAnimation()
 	table.sort(sortedTimes)
 
 	local nextKfNameIdx = 1
+	local keyframeCount = 0
 
 	for _, t in ipairs(sortedTimes) do
+		keyframeCount = keyframeCount + 1
+		if keyframeCount % 100 == 0 then
+			task.wait()
+		end
+
 		-- Serialize t
 		local kf = Instance.new("Keyframe")
 		kf.Time = t

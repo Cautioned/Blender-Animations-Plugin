@@ -24,7 +24,7 @@ local New = Fusion.New
 local Ref = Fusion.Ref
 local Out = Fusion.Out
 
-local DEFAULT_SCROLL_BAR_THICKNESS = 18
+local DEFAULT_SCROLL_BAR_THICKNESS = 14
 local COMPONENT_ONLY_PROPERTIES = {
 	"ScrollingEnabled",
 	"VerticalScrollBarPosition",

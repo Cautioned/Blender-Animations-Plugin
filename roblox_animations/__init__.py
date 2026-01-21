@@ -14,7 +14,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 2, 0),
+    "version": (2, 3, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -28,7 +28,21 @@ CLASSES = (
     # Rig operators
     operators.OBJECT_OT_GenRig,
     operators.OBJECT_OT_GenIK,
+    operators.OBJECT_OT_ModifyIK,
     operators.OBJECT_OT_RemoveIK,
+    operators.OBJECT_OT_SetIKFK,
+    operators.OBJECT_OT_ToggleCOM,
+    operators.OBJECT_OT_ToggleCOMGrid,
+    operators.OBJECT_OT_EditCOMWeights,
+    operators.OBJECT_OT_ResetBoneWeight,
+    operators.OBJECT_OT_ApplyDefaultWeights,
+    operators.OBJECT_OT_ClearCOMWeights,
+    operators.OBJECT_OT_SetSelectedBoneWeight,
+    # AutoPhysics operators
+    operators.OBJECT_OT_ToggleAutoPhysics,
+    operators.OBJECT_OT_AnalyzePhysics,
+    operators.OBJECT_OT_TogglePhysicsGhost,
+    operators.OBJECT_OT_ToggleRotationMomentum,
     # Animation operators
     operators.OBJECT_OT_ApplyTransform,
     operators.OBJECT_OT_MapKeyframes,
@@ -112,6 +126,21 @@ def unregister():
             from .operators.validation_ops import cleanup_validation_draw_handlers
 
             cleanup_validation_draw_handlers()
+        except Exception:
+            pass
+        
+        # Clean up physics handlers and data
+        try:
+            from .rig.physics import cleanup_physics
+            cleanup_physics()
+        except Exception:
+            pass
+        
+        # Clean up COM visualization
+        try:
+            from .rig.com import enable_com_visualization, unregister_frame_handler
+            enable_com_visualization(False)
+            unregister_frame_handler()
         except Exception:
             pass
 

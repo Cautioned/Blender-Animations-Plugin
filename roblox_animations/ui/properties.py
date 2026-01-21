@@ -14,6 +14,38 @@ from ..core.utils import armature_items
 from ..core.constants import DEFAULT_SERVER_PORT
 
 
+def _on_gravity_update(self, context):
+    """Callback when gravity is changed - re-analyze physics if enabled."""
+    try:
+        from ..rig.physics import is_physics_enabled, analyze_animation
+        
+        if is_physics_enabled():
+            # Find the armature being analyzed
+            from ..rig.physics import _physics_data
+            armature_name = _physics_data.get("armature_name")
+            if armature_name:
+                armature = bpy.data.objects.get(armature_name)
+                if armature:
+                    analyze_animation(armature)
+    except Exception:
+        pass
+
+
+def _on_physics_param_update(self, context):
+    """Generic callback for physics parameter updates that re-runs analysis if enabled."""
+    try:
+        from ..rig.physics import is_physics_enabled, analyze_animation
+        if is_physics_enabled():
+            from ..rig.physics import _physics_data
+            armature_name = _physics_data.get("armature_name")
+            if armature_name:
+                armature = bpy.data.objects.get(armature_name)
+                if armature:
+                    analyze_animation(armature)
+    except Exception:
+        pass
+
+
 class RobloxAnimationSettings(PropertyGroup):
     rbx_anim_armature: EnumProperty(
         items=armature_items,
@@ -59,6 +91,40 @@ class RobloxAnimationSettings(PropertyGroup):
         name="Show validation overlay",
         description="toggle drawing of violation overlays in 3d view",
         default=False,
+    )
+
+    rbx_physics_gravity: FloatProperty(
+        name="Physics Gravity",
+        description=(
+            "Gravity for AutoPhysics simulation. "
+            "Default 50 works well for typical Roblox-scale rigs."
+        ),
+        default=50.0,
+        min=0.1,
+        max=500.0,
+        update=_on_gravity_update,
+    )
+
+    rbx_physics_landing_steer: FloatProperty(
+        name="Landing Steer",
+        description=(
+            "How aggressively the ghost will try to re-orient to an upright pose at landing."
+        ),
+        default=0.6,
+        update=_on_physics_param_update,
+        min=0.0,
+        max=1.0,
+    )
+
+    rbx_physics_landing_window: FloatProperty(
+        name="Landing Stick Window (s)",
+        description=(
+            "Time (seconds) before landing during which the ghost will blend towards an upright pose."
+        ),
+        default=0.25,
+        update=_on_physics_param_update,
+        min=0.0,
+        max=3.0,
     )
 
     rbx_full_range_bake: BoolProperty(

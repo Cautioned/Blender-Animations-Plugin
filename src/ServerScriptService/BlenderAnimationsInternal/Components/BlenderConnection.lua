@@ -25,17 +25,27 @@ function BlenderConnection.new(httpService: HttpService)
 end
 
 function BlenderConnection:ListArmatures(port: number)
+	if type(port) ~= "number" or port <= 0 then
+		warn("Invalid port for ListArmatures")
+		return nil
+	end
+
 	local success, response = pcall(function()
-		return self.HttpService:GetAsync(string.format("http://localhost:%d/list_armatures", port))
+		local url = string.format("http://localhost:%d/list_armatures", port)
+		return self.HttpService:RequestAsync({
+			Url = url,
+			Method = "GET" :: HttpMethod,
+			Compress = Enum.HttpCompression.None,
+		})
 	end)
 
-	if not success then
-		warn("Failed to get armatures:", response)
+	if not success or not response or not response.Success then
+		warn("Failed to get armatures:", response and response.StatusMessage or response)
 		return nil
 	end
 
 	local decodeSuccess, data = pcall(function()
-		return self.HttpService:JSONDecode(response)
+		return self.HttpService:JSONDecode(response.Body)
 	end)
 
 	if not decodeSuccess then
@@ -47,9 +57,19 @@ function BlenderConnection:ListArmatures(port: number)
 end
 
 function BlenderConnection:ImportAnimation(port: number, armatureName: string)
+	if type(port) ~= "number" or port <= 0 then
+		warn("Invalid port for ImportAnimation")
+		return nil
+	end
+	if type(armatureName) ~= "string" or #armatureName == 0 then
+		warn("Invalid armature name for ImportAnimation")
+		return nil
+	end
+
 	local success, response = pcall(function()
+		local url = string.format("http://localhost:%d/export_animation/%s", port, armatureName)
 		return self.HttpService:RequestAsync({
-			Url = string.format("http://localhost:%d/export_animation/%s", port, armatureName),
+			Url = url,
 			Method = "GET" :: HttpMethod,
 			Body = nil,
 			Headers = {
@@ -74,15 +94,25 @@ function BlenderConnection:ImportAnimation(port: number, armatureName: string)
 end
 
 function BlenderConnection:ExportAnimation(port: number, animationData: any, targetArmature: string?)
-	local encoded = self.HttpService:JSONEncode(animationData)
-	
-	-- Build URL with optional target armature parameter
-	local url = string.format("http://localhost:%d/import_animation", port)
-	if targetArmature then
-		url = url .. "?armature=" .. self.HttpService:UrlEncode(targetArmature)
+	if type(port) ~= "number" or port <= 0 then
+		warn("Invalid port for ExportAnimation")
+		return false
+	end
+
+	local encoded = nil
+	local okEncode, encodeErr = pcall(function()
+		encoded = self.HttpService:JSONEncode(animationData)
+	end)
+	if not okEncode or not encoded then
+		warn("Failed to encode animation data for export: " .. tostring(encodeErr))
+		return false
 	end
 
 	local success, response = pcall(function()
+		local url = string.format("http://localhost:%d/import_animation", port)
+		if targetArmature then
+			url = url .. "?armature=" .. self.HttpService:UrlEncode(targetArmature)
+		end
 		return self.HttpService:RequestAsync({
 			Url = url,
 			Method = "POST" :: HttpMethod,
@@ -110,28 +140,36 @@ function BlenderConnection:ExportAnimation(port: number, animationData: any, tar
 end
 
 function BlenderConnection:CheckAnimationStatus(port: number, armatureName: string, lastKnownHash: string)
-	local url = string.format(
-		"http://localhost:%d/animation_status?armature=%s&last_known_hash=%s",
-		port,
-		self.HttpService:UrlEncode(armatureName),
-		lastKnownHash
-	)
+	if type(port) ~= "number" or port <= 0 then
+		return nil
+	end
+	if type(armatureName) ~= "string" or #armatureName == 0 then
+		return nil
+	end
 
 	local success, response = pcall(function()
-		return self.HttpService:GetAsync(url)
+		local url = string.format(
+			"http://localhost:%d/animation_status?armature=%s&last_known_hash=%s",
+			port,
+			self.HttpService:UrlEncode(armatureName),
+			lastKnownHash or ""
+		)
+		return self.HttpService:RequestAsync({
+			Url = url,
+			Method = "GET" :: HttpMethod,
+			Compress = Enum.HttpCompression.None,
+		})
 	end)
 
-	if not success then
-		-- Don't warn on every poll failure, just return nil
+	if not success or not response or not response.Success then
 		return nil
 	end
 
 	local decodeSuccess, data = pcall(function()
-		return self.HttpService:JSONDecode(response)
+		return self.HttpService:JSONDecode(response.Body)
 	end)
 
 	if not decodeSuccess then
-		-- Don't warn on every poll failure
 		return nil
 	end
 
@@ -139,8 +177,18 @@ function BlenderConnection:CheckAnimationStatus(port: number, armatureName: stri
 end
 
 function BlenderConnection:GetBoneRest(port: number, armatureName: string)
+	if type(port) ~= "number" or port <= 0 then
+		warn("Invalid port for GetBoneRest")
+		return nil
+	end
+	if type(armatureName) ~= "string" or #armatureName == 0 then
+		warn("Invalid armature name for GetBoneRest")
+		return nil
+	end
+
 	local success, response = pcall(function()
-		return self.HttpService:GetAsync(string.format("http://localhost:%d/get_bone_rest/%s", port, self.HttpService:UrlEncode(armatureName)))
+		local url = string.format("http://localhost:%d/get_bone_rest/%s", port, self.HttpService:UrlEncode(armatureName))
+		return self.HttpService:GetAsync(url)
 	end)
 
 	if not success then

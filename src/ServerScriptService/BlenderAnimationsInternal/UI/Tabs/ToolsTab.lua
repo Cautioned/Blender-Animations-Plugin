@@ -13,7 +13,6 @@ local Children = Fusion.Children
 
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local Label = require(StudioComponents.Label)
-local Checkbox = require(StudioComponents.Checkbox)
 local LimitedTextInput = require(StudioComponents.LimitedTextInput)
 local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
 
@@ -24,6 +23,7 @@ local SharedComponents = require(script.Parent.Parent.SharedComponents)
 local PlaybackControls = require(script.Parent.Parent.Components.PlaybackControls)
 local CameraControls = require(script.Parent.Parent.Components.CameraControls)
 local KeyframeNaming = require(script.Parent.Parent.Components.KeyframeNaming)
+local BoneToggles = require(script.Parent.Parent.Components.BoneToggles)
 
 local ToolsTab = {}
 
@@ -116,59 +116,7 @@ function ToolsTab.create(services: any)
 	-- Add the Bone Toggles section
 	table.insert(
 		components,
-		VerticalCollapsibleSection({
-			Text = "Bone Toggles",
-			Collapsed = false,
-			LayoutOrder = 5,
-			Visible = State.activeRigExists,
-			[Children] = Computed(function()
-				local boneWeights = State.boneWeights:get()
-				local boneToggles = {}
-
-				for i, bone in ipairs(boneWeights) do
-					-- Create indented text based on depth
-					local indentText = string.rep("  ", bone.depth) .. bone.name
-					table.insert(
-						boneToggles,
-						Checkbox({
-							Value = bone.enabled,
-							Text = indentText,
-							LayoutOrder = i,
-							OnChange = function(enabled: boolean)
-								-- Update the bone weight
-								bone.enabled = enabled
-								State.boneWeights:set(boneWeights) -- Trigger reactivity
-
-								-- Update the rig animation if it exists
-								if State.activeRig and State.activeRig.bones then
-									-- Find the rig bone by name more reliably
-									local rigBone = State.activeRig.bones[bone.name]
-									if rigBone then
-										rigBone.enabled = enabled
-									else
-										-- Fallback: search by part name
-										for _, rb in pairs(State.activeRig.bones) do
-											if rb.part.Name == bone.name then
-												rb.enabled = enabled
-												break
-											end
-										end
-									end
-									
-									-- Reload the animation to see the effect immediately
-									if services.playbackService then
-										services.playbackService:stopAnimationAndDisconnect()
-										services.playbackService:playCurrentAnimation(State.activeAnimator)
-									end
-								end
-							end,
-						})
-					)
-				end
-
-				return boneToggles
-			end),
-		}) :: any
+		BoneToggles.create(services, 5) :: any
 	)
 
 	return components

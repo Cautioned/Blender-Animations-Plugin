@@ -75,7 +75,6 @@ def start_server(port: int = 31337) -> bool:
     """Start the live sync server using Blender timers instead of threads."""
     global server_instance, server_should_run, server_port, _timer_registered
 
-
     if server_instance is not None:
         stop_server()
 

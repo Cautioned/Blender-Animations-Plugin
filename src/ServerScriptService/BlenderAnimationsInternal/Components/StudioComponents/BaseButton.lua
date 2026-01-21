@@ -3,6 +3,7 @@
 
 local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
 local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local State = require(script.Parent.Parent.Parent.state)
 
 local StudioComponents = script.Parent
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
@@ -22,6 +23,7 @@ local New = Fusion.New
 local Value = Fusion.Value
 local Children = Fusion.Children
 local Computed = Fusion.Computed
+local Spring = Fusion.Spring
 local OnEvent = Fusion.OnEvent
 local Hydrate = Fusion.Hydrate
 
@@ -68,7 +70,8 @@ return function(props: BaseButtonProperties): TextButton
 			TextColor3 = getMotionState(themeProvider:GetColor(props.TextColorStyle or Enum.StudioStyleGuideColor.ButtonText, modifier), "Spring", 40),
 			BackgroundColor3 = getMotionState(themeProvider:GetColor(props.BackgroundColorStyle or Enum.StudioStyleGuideColor.Button, modifier), "Spring", 40),
 			AutoButtonColor = false,
-			TextWrapped = true,
+			TextWrapped = false,
+			TextTruncate = Enum.TextTruncate.AtEnd,
 
 			[OnEvent "InputBegan"] = function(inputObject)
 				if not unwrap(isEnabled) then
@@ -97,6 +100,23 @@ return function(props: BaseButtonProperties): TextButton
 					end
 				end
 			end)(),
+
+			[Children] = {
+				New("UIScale")({
+					Scale = Spring(Computed(function()
+						if State.reducedMotion:get() then
+							return 1
+						end
+						if unwrap(isPressed) then
+							return 0.97
+						end
+						if unwrap(isHovering) then
+							return 1.02
+						end
+						return 1
+					end), 25, 0.9),
+				}),
+			},
 		}
 	}
 

@@ -21,6 +21,7 @@ local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local _themeProvider = require(StudioComponentsUtil.themeProvider)
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
+local ExportBoneToggles = require(script.Parent.Parent.Components.ExportBoneToggles)
 
 local RiggingTab = {}
 
@@ -120,6 +121,7 @@ function RiggingTab.create(services: any)
 				}),
 			},
 		}),
+		ExportBoneToggles.create(services, 2),
 	}
 end
 

@@ -42,6 +42,7 @@ tasks/
 # Backup files
 *old*.lua
 *.backup
+backup.py
 *.bak
 
 # Build artifacts

@@ -17,9 +17,9 @@ local currentTheme = {}
 local themeProvider = {
 	Theme = Value(Studio.Theme.Name),
 	Fonts = {
-		Default = Enum.Font.SourceSans,
-		SemiBold = Enum.Font.SourceSansSemibold,
-		Bold = Enum.Font.SourceSansBold,
+		Default = Enum.Font.BuilderSans,
+		SemiBold = Enum.Font.BuilderSansMedium,
+		Bold = Enum.Font.BuilderSansBold,
 		Black = Enum.Font.GothamBlack,
 		Mono = Enum.Font.Code,
 	},
