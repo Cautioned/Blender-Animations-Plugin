@@ -62,7 +62,7 @@ def _build_match_context(parts_collection):
 
 
 def _find_matching_part(aux_name, aux_cf, match_ctx):
-    """Resolve an aux entry to a mesh by name first, then position fingerprint."""
+    """Resolve an aux entry to a mesh by name first, then conservative position fingerprint."""
     name_index = match_ctx["name_index"]
     used = match_ctx["used"]
     t2b = match_ctx["t2b"]
@@ -79,15 +79,25 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
         return candidates[0]
 
     # Position fingerprint fallback at multiple precision levels
+    # Only accept unambiguous matches within a small distance threshold.
     if aux_cf:
         try:
             expected_mat = t2b @ cf_to_mat(aux_cf)
+            expected_pos = expected_mat.to_translation()
+            parts_collection = match_ctx.get("parts_collection")
+            max_dist = 0.05
+
             for prec in [2, 1, 0]:
                 fp = _fingerprint_position(expected_mat, prec)
                 idx = match_ctx.get(f"position_index_p{prec}", {})
-                for obj in idx.get(fp, []):
-                    if obj not in used:
-                        return obj
+                candidates = [obj for obj in idx.get(fp, []) if obj not in used]
+                if len(candidates) != 1:
+                    continue
+
+                obj = candidates[0]
+                actual_pos = obj.matrix_world.to_translation()
+                if (actual_pos - expected_pos).length <= max_dist:
+                    return obj
         except Exception:
             pass
     return None
@@ -414,7 +424,22 @@ def create_rig(rigging_type, rig_meta_obj_name):
     
     # Auto-constraint parts by matching bone names to mesh names
     # This handles parts that were renamed by fingerprint matching during import
-    auto_constraint_parts(ao.name)
+    bpy.context.view_layer.update()
+    ok, msg = auto_constraint_parts(ao.name)
+
+    # If no parts matched, retry once on the next tick to allow depsgraph updates
+    if ok and msg and "No matching parts found" in msg:
+        def _retry_auto_constraint():
+            try:
+                auto_constraint_parts(ao.name)
+            except Exception:
+                pass
+            return None
+
+        try:
+            bpy.app.timers.register(_retry_auto_constraint, first_interval=0.0)
+        except Exception:
+            pass
     
     # Configure weld bones with custom display and lock them from animation
     _configure_weld_bones(ao)

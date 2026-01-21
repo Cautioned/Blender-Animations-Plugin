@@ -14,7 +14,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 3, 0),
+    "version": (2, 3, 1),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -63,6 +63,33 @@ CLASSES = (
 )
 
 
+def _safe_unregister_class(cls):
+    import bpy
+
+    try:
+        bpy.utils.unregister_class(cls)
+        return
+    except Exception:
+        pass
+
+    try:
+        existing = getattr(bpy.types, cls.__name__, None)
+        if existing:
+            bpy.utils.unregister_class(existing)
+    except Exception:
+        pass
+
+
+def _safe_register_class(cls):
+    import bpy
+
+    try:
+        bpy.utils.register_class(cls)
+    except ValueError:
+        _safe_unregister_class(cls)
+        bpy.utils.register_class(cls)
+
+
 def file_import_extend(self, context):
     """Add import options to the file menu"""
     self.layout.operator(
@@ -81,15 +108,7 @@ def register():
     try:
         # Register all classes
         for cls in CLASSES:
-            try:
-                bpy.utils.register_class(cls)
-            except ValueError:
-                # Class already registered, unregister first then re-register
-                try:
-                    bpy.utils.unregister_class(cls)
-                except Exception:
-                    pass
-                bpy.utils.register_class(cls)
+            _safe_register_class(cls)
 
         # Register properties
         try:
@@ -146,10 +165,7 @@ def unregister():
 
         # Unregister all classes in reverse order
         for cls in reversed(CLASSES):
-            try:
-                bpy.utils.unregister_class(cls)
-            except Exception:
-                pass
+            _safe_unregister_class(cls)
 
         # Unregister properties
         try:

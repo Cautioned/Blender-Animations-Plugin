@@ -20,7 +20,12 @@ def link_object_to_bone_rigid(obj, ao, bone):
     constraint = obj.constraints.new(type="CHILD_OF")
     constraint.target = ao
     constraint.subtarget = bone.name
-    constraint.inverse_matrix = (ao.matrix_world @ bone.matrix).inverted()
+    bone_mat = getattr(bone, "matrix_local", None)
+    if bone_mat is None:
+        bone_mat = bone.matrix
+    if hasattr(bone_mat, "to_4x4"):
+        bone_mat = bone_mat.to_4x4()
+    constraint.inverse_matrix = (ao.matrix_world @ bone_mat).inverted()
 
 
 def auto_constraint_parts(armature_name):
