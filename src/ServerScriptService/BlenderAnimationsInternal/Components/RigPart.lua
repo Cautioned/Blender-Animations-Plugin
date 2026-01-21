@@ -113,8 +113,14 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 		else
 			-- Traditional Motor6D joint
 			local joint: Instance? = connectingJoint
+			if joint and not joint:IsA("Motor6D") then
+				joint = nil
+			end
 			if not joint and rig._jointCache and rig._jointCache[part] then
 				for _, candidate in ipairs(rig._jointCache[part]) do
+					if not candidate:IsA("Motor6D") then
+						continue
+					end
 					if candidate.Part0 == parent.part and candidate.Part1 == part then
 						joint = candidate
 						break
@@ -137,8 +143,11 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 		end
 	end
 
-	-- Always look for joint-connected children (Motor6D or weld)
+	-- Always look for joint-connected children (Motor6D only)
 	for _, joint in pairs(rig._jointCache[part] or {}) do
+		if not joint:IsA("Motor6D") then
+			continue
+		end
 		if joint.Part0 and joint.Part1 then
 			local subpart
 			if joint.Part0 == part then

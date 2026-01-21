@@ -93,9 +93,11 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
 	local partCount = 0
 
 	local originalDescendants = State.activeRig.model:GetDescendants()
+	local primaryClone = rigModelToExport.PrimaryPart
 	for descIdx, desc in ipairs(rigModelToExport:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			partCount = partCount + 1
+			local isPrimary = desc == primaryClone
 
 			-- uniqify the name
 			local baseName = desc.Name :: string
@@ -106,7 +108,9 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
 			end
 
 			usedModelNames[desc.Name] = true
-			partNames[#partNames + 1] = desc.Name
+			if not isPrimary then
+				partNames[#partNames + 1] = desc.Name
+			end
 			partEncodeMap[originalDescendants[descIdx]] = desc.Name
 			desc.Name = rigModelToExport.Name .. partCount
 		elseif desc:IsA("Humanoid") or desc:IsA("AnimationController") then
@@ -131,12 +135,15 @@ function ExportManager:generateMetadataLegacy(rigModelToExport: Types.RigModelTy
 
 	local partRoles: { [string]: string } = {} -- Maps original part names to their roles/identifiers
 	local partEncodeMap: { [BasePart]: string } = {} -- Maps original parts to their roles for encoding
+	local primaryClone = rigModelToExport.PrimaryPart
 
 	for _, desc in ipairs(rigModelToExport:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			local partRole: string = desc.Name -- or any logic to determine the part's role/identifier
-			partRoles[desc.Name] = partRole
 			partEncodeMap[desc :: BasePart] = partRole
+			if desc ~= primaryClone then
+				partRoles[desc.Name] = partRole
+			end
 		end
 		-- No need to destroy Humanoid or AnimationController
 	end
