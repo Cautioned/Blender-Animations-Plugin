@@ -87,18 +87,25 @@ local State = {
     -- Bone weights for toggling bones on/off
     boneWeights = Value({} :: Types.BoneWeightsList),
 
+    -- Bone weights for rig export filtering
+    exportBoneWeights = Value({} :: Types.ExportBoneWeightsList),
+
     -- Settings
     enableFileExport = Value(true),
     enableClipboardExport = Value(true),
     enableLiveSync = Value(false),
     autoConnectToBlender = Value(false),
     showDebugInfo = Value(true),
+    reducedMotion = Value(false),
     
     -- Toolbar button image
     toolbarButtonImage = Value("rbxassetid://116041192227009"),
     
     -- Help widget
-    helpWidgetEnabled = Value(false)
+    helpWidgetEnabled = Value(false),
+    
+    -- Service references
+    rigManager = nil :: any?,
 }
 
 State.displayWarnings = Computed(function()

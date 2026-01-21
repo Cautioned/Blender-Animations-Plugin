@@ -62,7 +62,7 @@ return function(props: TextInputProperties): TextLabel
 
 		[Children] = New "TextBox" {
 			Name = "TextInput",
-			Size = UDim2.new(1, 0, 0, 25),
+			Size = UDim2.new(1, 0, 0, 22),
 			Text = "",
 			TextSize = constants.TextSize,
 			PlaceholderColor3 = PLACEHOLDER_TEXT_COLOR,
@@ -74,7 +74,7 @@ return function(props: TextInputProperties): TextLabel
 			TextEditable = isEnabled,
 
 			TextXAlignment = Computed(function()
-				local bounds = (unwrap(currentTextBounds) or Vector2.zero).X + 5 -- because of padding
+				local bounds = (unwrap(currentTextBounds) or Vector2.zero).X + 4 -- because of padding
 				local pixels = (unwrap(absoluteTextBoxSize) or Vector2.zero).X
 				return if bounds >= pixels then Enum.TextXAlignment.Right else Enum.TextXAlignment.Left
 			end),
@@ -108,8 +108,8 @@ return function(props: TextInputProperties): TextLabel
 			end,
 
 			[Children] = New "UIPadding" {
-				PaddingLeft = UDim.new(0, 5),
-				PaddingRight = UDim.new(0, 5),
+				PaddingLeft = UDim.new(0, 4),
+				PaddingRight = UDim.new(0, 4),
 			},
 		}
 	}

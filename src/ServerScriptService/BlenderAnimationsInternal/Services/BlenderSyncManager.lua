@@ -134,6 +134,8 @@ function BlenderSyncManager:startLiveSyncing()
 		local maxPollInterval = 2.0  -- Maximum 2 seconds between polls
 		local lastArmatureRefresh = 0
 		local armatureRefreshInterval = 5.0  -- Refresh armatures every 5 seconds
+		local failureCount = 0
+		local maxFailuresBeforeStop = 5
 		
 		while State.liveSyncEnabled:get() do
 			-- Skip polling if widget is not enabled to reduce performance impact
@@ -167,13 +169,19 @@ function BlenderSyncManager:startLiveSyncing()
 					)
 
 					if not status then
+						failureCount += 1
 						if State.serverStatus:get() ~= "Live Sync: Connection lost" then
 							State.serverStatus:set("Live Sync: Connection lost")
 						end
-						-- Reset polling on connection loss
-						pollInterval = 0.033
+						-- Back off polling on connection loss to avoid socket exhaustion
+						pollInterval = math.min(math.max(pollInterval * 2, 0.5), maxPollInterval)
 						noChangeCount = 0
+						if failureCount >= maxFailuresBeforeStop then
+							self:cleanupServerConnection()
+							break
+						end
 					else
+						failureCount = 0
 						if State.serverStatus:get() == "Live Sync: Connection lost" then
 							State.serverStatus:set("Connected") -- Restore status
 						end

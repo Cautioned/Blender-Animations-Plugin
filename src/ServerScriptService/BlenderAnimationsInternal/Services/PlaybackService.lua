@@ -37,9 +37,18 @@ function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect
 				local tracks = (animator :: any):GetPlayingAnimationTracks() :: { any }
 				if #tracks > 0 then
 					for _, track in ipairs(tracks) do
-						track:Stop(0.01)
+						local stopped = false
+						local stopConn = track.Stopped:Connect(function()
+							stopped = true
+						end)
+						track:Stop(0.05)
+						if track.IsPlaying then
+							track.Stopped:Wait()
+						elseif not stopped then
+							task.wait(0.1)
+						end
+						stopConn:Disconnect()
 					end
-					task.wait(0.1)
 					for _, track in ipairs(tracks) do
 						track:Destroy()
 					end

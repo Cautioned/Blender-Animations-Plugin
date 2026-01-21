@@ -50,12 +50,13 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 	local estimatedSize = math.min(#allKeyframes, 1000) -- Cap estimation to avoid huge allocations
 	local collected = table.create(estimatedSize)
 	local maxTime = 0
-	local startTime = (allKeyframes[1] :: any).Time
+	local startTime = 0
 
-	-- Sort in-place for better performance
+	-- Sort in-place for better performance, then set start time to earliest keyframe
 	table.sort(allKeyframes, function(a, b)
 		return (a :: any).Time < (b :: any).Time
 	end)
+	startTime = (allKeyframes[1] :: any).Time
 
 	-- Pre-cache common values to avoid repeated property access
 	local isDeformRig = rig.isDeformRig
@@ -150,10 +151,15 @@ function AnimationSerializer:deserialize(data: string, isBinary: boolean): any?
 	end
 	local bufferIndex = 1
 
-	-- Optimized byte collection function
+	-- Optimized byte collection function with yielding for large data
+	local byteCount = 0
 	local function collectByte(byte: number)
 		buffer[bufferIndex] = string.char(byte)
 		bufferIndex += 1
+		byteCount += 1
+		if byteCount % 10000 == 0 then
+			task.wait()
+		end
 	end
 
     -- Decompress the data
@@ -208,6 +214,10 @@ function AnimationSerializer:deserialize(data: string, isBinary: boolean): any?
 	end
 
 	-- Use table.concat with explicit length for better performance
+	-- Yield before concat if buffer is large
+	if bufferIndex > 100000 then
+		task.wait()
+	end
 	local jsonStr = table.concat(buffer, "", 1, bufferIndex - 1)
 
 	-- Clear buffer to help GC

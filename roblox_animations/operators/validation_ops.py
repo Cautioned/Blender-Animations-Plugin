@@ -319,10 +319,6 @@ def _validate_rotation_constraints(
                 f"Bone '{pbone.name}' has extreme rotation: {math.degrees(max_angle):.1f}°"
             )
 
-        # Check for gimbal lock conditions
-        if abs(rot.w) < 0.1:  # Very small w component indicates near gimbal lock
-            warnings.append(f"Bone '{pbone.name}' may be experiencing gimbal lock")
-
     return warnings
 
 
@@ -348,6 +344,29 @@ def _collect_bone_world_head(
         head_world = world_mat @ pbone.head
         positions[pbone.name] = head_world
     return positions
+
+
+def _get_root_world_pos(
+    armature_obj: "bpy.types.Object", evaluated_obj: "bpy.types.Object"
+) -> Vector:
+    """Return world-space root position based on pose bones (per-frame)."""
+    world_mat = evaluated_obj.matrix_world
+
+    # Prefer an explicit root bone name if present
+    for name in ("Root", "root"):
+        pbone = evaluated_obj.pose.bones.get(name)
+        if pbone is not None:
+            return world_mat @ pbone.head
+
+    # Fallback: first bone with no parent
+    for pbone in evaluated_obj.pose.bones:
+        if pbone.parent is None:
+            return world_mat @ pbone.head
+
+    # Final fallback: armature object origin (or parent if present)
+    if armature_obj.parent:
+        return armature_obj.parent.matrix_world.translation.copy()
+    return armature_obj.matrix_world.translation.copy()
 
 
 class OBJECT_OT_ValidateMotionPaths(Operator):
@@ -404,13 +423,6 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         duration_warnings = _validate_animation_duration(scene, fps)
         all_warnings.extend(duration_warnings)
 
-        # 2. Get root position for bounds checking
-        root_pos = None
-        if armature.parent:
-            root_pos = armature.parent.matrix_world.translation
-        else:
-            root_pos = armature.matrix_world.translation
-
         last_positions: Dict[str, Vector] = {}
         _violation_segments = []
         total_violations = 0
@@ -439,10 +451,11 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         for f in range(frame_start, frame_end + 1):
             scene.frame_set(f)
             arm_eval = armature.evaluated_get(depsgraph)
+            root_pos = _get_root_world_pos(armature, arm_eval)
             positions = _collect_bone_world_head(armature, arm_eval)
 
             # 3. Bounds validation (check every frame)
-            if root_pos:
+            if root_pos is not None:
                 bounds_violations = _validate_bounds(positions, root_pos, scale)
                 for bone_name, violation_msg in bounds_violations:
                     all_violations.append((f, bone_name, violation_msg))

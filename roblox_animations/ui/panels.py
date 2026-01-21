@@ -199,94 +199,83 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         
         com_actions = col.row(align=True)
         
-        # Check if selected bone is the current pivot
-        pivot_text = "Set Pivot"
-        try:
-            from ..rig.com import is_bone_com_pivot
-            obj = context.active_object
-            if context.mode == 'POSE' and obj and obj.pose and context.active_pose_bone:
-                if is_bone_com_pivot(context.active_pose_bone.name):
-                    pivot_text = "Unset Pivot"
-        except:
-            pass
-        
-        com_actions.operator("object.rbxanims_set_com_pivot", text=pivot_text)
+        # COM controls: only expose Weights editing (pivot control removed)
         com_actions.operator("object.rbxanims_edit_com_weights", text="Weights")
         
         # --- AutoPhysics Sub-section ---
         col.separator()
         physics_row = col.row(align=True)
-        physics_row.label(text="AutoPhysics:", icon="PHYSICS")
+        # physics_row.label(text="AutoPhysics:", icon="PHYSICS")
         
-        # Check if AutoPhysics is enabled
-        try:
-            from ..rig.physics import is_physics_enabled, is_ghost_enabled, get_frame_state
-            physics_enabled = is_physics_enabled()
-            ghost_enabled = is_ghost_enabled() if physics_enabled else False
-        except:
-            physics_enabled = False
-            ghost_enabled = False
+        # # Check if AutoPhysics is enabled
+        # try:
+        #     from ..rig.physics import is_physics_enabled, is_ghost_enabled, get_frame_state
+        #     physics_enabled = is_physics_enabled()
+        #     ghost_enabled = is_ghost_enabled() if physics_enabled else False
+        # except:
+        #     physics_enabled = False
+            # ghost_enabled = False
         
-        physics_row.operator(
-            "object.rbxanims_toggle_autophysics",
-            text="",
-            icon="PLAY" if not physics_enabled else "PAUSE",
-            depress=physics_enabled
-        )
+        # physics_row.operator(
+        #     "object.rbxanims_toggle_autophysics",
+        #     text="",
+        #     icon="PLAY" if not physics_enabled else "PAUSE",
+        #     depress=physics_enabled
+        # )
         
-        if physics_enabled:
-            # Ghost toggle
-            physics_row.operator(
-                "object.rbxanims_toggle_physics_ghost",
-                text="",
-                icon="GHOST_ENABLED" if ghost_enabled else "GHOST_DISABLED",
-                depress=ghost_enabled
-            )
+        # if physics_enabled:
+        #     # Ghost toggle
+        #     physics_row.operator(
+        #         "object.rbxanims_toggle_physics_ghost",
+        #         text="",
+        #         icon="GHOST_ENABLED" if ghost_enabled else "GHOST_DISABLED",
+        #         depress=ghost_enabled
+        #     )
             
-            # Gravity scale slider
-            if settings:
-                col.prop(settings, "rbx_physics_gravity", text="Gravity")
+        #     # Gravity scale slider
+        #     if settings:
+        #         col.prop(settings, "rbx_physics_gravity", text="Gravity")
             
-            # Show current frame state
-            try:
-                frame = context.scene.frame_current
-                state = get_frame_state(frame)
-                state_icons = {
-                    "grounded": "CHECKMARK",
-                    "airborne": "SORT_DESC",
-                    "invalid": "ERROR",
-                    "unknown": "QUESTION",
-                }
-                state_colors = {
-                    "grounded": "Grounded",
-                    "airborne": "Airborne",
-                    "invalid": "Invalid",
-                    "unknown": "Unknown",
-                }
-                col.label(text=f"Frame {frame}: {state_colors.get(state, state)}", 
-                         icon=state_icons.get(state, "QUESTION"))
-            except:
-                pass
+        #     # Show current frame state
+        #     try:
+        #         frame = context.scene.frame_current
+        #         state = get_frame_state(frame)
+        #         state_icons = {
+        #             "grounded": "CHECKMARK",
+        #             "airborne": "SORT_DESC",
+        #             "invalid": "ERROR",
+        #             "unknown": "QUESTION",
+        #         }
+        #         state_colors = {
+        #             "grounded": "Grounded",
+        #             "airborne": "Airborne",
+        #             "invalid": "Invalid",
+        #             "unknown": "Unknown",
+        #         }
+        #         col.label(text=f"Frame {frame}: {state_colors.get(state, state)}", 
+        #                  icon=state_icons.get(state, "QUESTION"))
+        #     except:
+        #         pass
             
-            # Re-analyze button
-            col.operator("object.rbxanims_analyze_physics", text="Re-analyze", icon="FILE_REFRESH")
+        #     # Re-analyze button
+        #     col.operator("object.rbxanims_analyze_physics", text="Re-analyze", icon="FILE_REFRESH")
             
-            # COM manipulation tools
-            col.separator()
-            com_tools = col.row(align=True)
-            com_tools.operator("rbx.com_gizmo_modal", text="Move COM", icon="ORIENTATION_CURSOR")
-            com_tools.operator("rbx.snap_rig_to_ground", text="", icon="IMPORT")
+        #     # COM manipulation tools
+        #     col.separator()
+        #     com_tools = col.row(align=True)
+        #     com_tools.operator("rbx.com_gizmo_modal", text="Move COM", icon="ORIENTATION_CURSOR")
+        #     com_tools.operator("rbx.snap_rig_to_ground", text="", icon="IMPORT")
         
-        col.separator()
-        if is_skinned_rig:
-            col.label(text="Mesh (Deform) Rig Detected", icon="BONE_DATA")
-        elif has_new_bones:
-            col.label(
-                text="Helper Bones Detected (treated as deform when exporting)",
-                icon="INFO",
-            )
-        else:
-            col.label(text="Motor-style Rig", icon="POSE_HLT")
+        # col.separator()
+        # if is_skinned_rig:
+        #     col.label(text="Mesh (Deform) Rig Detected", icon="BONE_DATA")
+        # elif has_new_bones:
+        #     col.label(
+        #         text="Helper Bones Detected (treated as deform when exporting)",
+        #         icon="INFO",
+        #     )
+        # else:
+        #     col.label(text="Motor-style Rig", icon="POSE_HLT")
 
         # --- Animation Sub-panel ---
         animation_box = inner_box.box()
@@ -303,12 +292,12 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col.operator("object.rbxanims_bake", text="Bake (Clipboard)", icon="EXPORT")
         col.operator("object.rbxanims_bake_file", text="Bake to File", icon="FILE")
 
-        # Add the force deform serialization checkbox for testing
-        dev_box = inner_box.box()
-        # Add test button to setup section so it's always visible
-        dev_box.label(text="Developer Options", icon='SCRIPT')
-        dev_box.separator()
-        dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
+        # # Add the force deform serialization checkbox for testing
+        # dev_box = inner_box.box()
+        # # Add test button to setup section so it's always visible
+        # dev_box.label(text="Developer Options", icon='SCRIPT')
+        # dev_box.separator()
+        # dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
         
         # dev_box.prop(scene, "force_deform_bone_serialization", text="Force Deform Serialization")
 

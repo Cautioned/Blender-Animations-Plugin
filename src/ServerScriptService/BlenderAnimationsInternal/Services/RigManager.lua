@@ -10,6 +10,8 @@ local Rig = require(script.Parent.Parent.Components.Rig)
 local RigManager = {}
 RigManager.__index = RigManager
 
+local EXTREME_DEPTH_LIMIT = 512 -- allow very deep rigs before triggering overflow guard
+
 function RigManager.new(playbackService: any, cameraManager: any?)
 	local self = setmetatable({}, RigManager)
 	
@@ -68,6 +70,7 @@ function RigManager:rebuildBoneWeights()
 	if not State.activeRig or not State.activeRig.root then
 		self.boneWeights = {}
 		State.boneWeights:set({})
+		State.exportBoneWeights:set({})
 		return
 	end
 
@@ -86,8 +89,8 @@ function RigManager:rebuildBoneWeights()
 		-- To avoid a full traversal to build a parent map, we can do a post-order traversal
 		-- to determine which nodes are ancestors of an enabled node.
 		local function findEnabledAndMarkAncestors(bone, depth)
-			if depth > 50 then -- Prevent stack overflow
-				warn("Bone hierarchy too deep (>50 levels), stopping traversal at:", bone.part.Name)
+			if depth > EXTREME_DEPTH_LIMIT then -- Prevent stack overflow
+				warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", bone.part.Name)
 				return false
 			end
 			
@@ -107,9 +110,10 @@ function RigManager:rebuildBoneWeights()
 
 	-- Build the list for the UI with a single traversal
 	local boneList: Types.BoneWeightsList = {}
+	local exportBoneList: Types.ExportBoneWeightsList = {}
 	local function buildBoneListRecursive(parent, depth)
-		if depth > 50 then -- Prevent stack overflow
-			warn("Bone hierarchy too deep (>50 levels), stopping traversal at:", parent.part.Name)
+		if depth > EXTREME_DEPTH_LIMIT then -- Prevent stack overflow
+			warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", parent.part.Name)
 			return
 		end
 		
@@ -126,9 +130,28 @@ function RigManager:rebuildBoneWeights()
 		end
 	end
 
+	local function buildExportBoneListRecursive(parent, depth)
+		if depth > EXTREME_DEPTH_LIMIT then -- Prevent stack overflow
+			warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", parent.part.Name)
+			return
+		end
+		
+		for _, child in ipairs(parent.children) do
+			table.insert(exportBoneList, {
+				name = child.part.Name,
+				enabled = child.exportEnabled ~= false,
+				depth = depth,
+				parentName = parent.part.Name,
+			})
+			buildExportBoneListRecursive(child, depth + 1)
+		end
+	end
+
 	buildBoneListRecursive(State.activeRig.root, 0)
+	buildExportBoneListRecursive(State.activeRig.root, 0)
 	self.boneWeights = boneList
 	State.boneWeights:set(boneList)
+	State.exportBoneWeights:set(exportBoneList)
 end
 
 function RigManager:updatePartsList()
@@ -175,10 +198,11 @@ function RigManager:updateSavedAnimationsList()
 
 	local animations = {}
 	for _, anim in ipairs(animSaves:GetChildren()) do
-		if anim:IsA("KeyframeSequence") then
+		if anim:IsA("KeyframeSequence") or anim:IsA("CurveAnimation") then
 			table.insert(animations, {
 				name = anim.Name,
 				instance = anim,
+				type = anim.ClassName,
 			})
 		end
 	end
@@ -226,7 +250,7 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 
 	local previousAnimator = State.activeAnimator
 	local previousRigModel = State.activeRigModel
-
+	
 	if rigModel == nil then
 		-- No new rig selected; keep playing on previous animator if it exists
 		State.loadingEnabled:set(false)

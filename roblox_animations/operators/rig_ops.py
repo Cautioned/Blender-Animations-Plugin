@@ -512,43 +512,6 @@ class OBJECT_OT_ToggleCOMGrid(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class OBJECT_OT_SetCOMPivot(bpy.types.Operator):
-    bl_label = "Set/Unset Pivot to COM"
-    bl_idname = "object.rbxanims_set_com_pivot"
-    bl_description = "Toggle 3D cursor at Center of Mass for pivot-based rotation"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == "ARMATURE"
-
-    def execute(self, context):
-        from ..rig.com import set_com_pivot, get_com_pivot_bone, set_com_pivot_bone, is_bone_com_pivot
-        
-        obj = context.active_object
-        
-        # Get the currently selected bone (if any)
-        selected_bone_name = None
-        if context.mode == 'POSE' and obj.pose and context.active_pose_bone:
-            selected_bone_name = context.active_pose_bone.name
-        
-        # Check if this bone is already the pivot
-        if selected_bone_name and is_bone_com_pivot(selected_bone_name):
-            # Unset the pivot
-            set_com_pivot_bone(None)
-            self.report({"INFO"}, f"COM pivot unset from '{selected_bone_name}'")
-        else:
-            # Set the pivot
-            set_com_pivot(obj, selected_bone_name)
-            context.scene.tool_settings.transform_pivot_point = 'CURSOR'
-            
-            if selected_bone_name:
-                self.report({"INFO"}, f"COM pivot set on '{selected_bone_name}'")
-            else:
-                self.report({"INFO"}, "3D cursor moved to Center of Mass")
-        
-        return {"FINISHED"}
 
 
 class OBJECT_OT_EditCOMWeights(bpy.types.Operator):
@@ -693,8 +656,11 @@ class OBJECT_OT_ApplyDefaultWeights(bpy.types.Operator):
         from ..rig.com import apply_default_weights
         
         obj = context.active_object
-        apply_default_weights(obj, overwrite=False)
-        self.report({"INFO"}, "Applied default COM weights")
+        applied = apply_default_weights(obj, overwrite=False)
+        if applied <= 0:
+            self.report({"INFO"}, "No defaults applied — rig type not recognized. Use Overwrite to force apply.")
+        else:
+            self.report({"INFO"}, f"Applied default COM weights to {applied} bones")
         
         return {"FINISHED"}
 

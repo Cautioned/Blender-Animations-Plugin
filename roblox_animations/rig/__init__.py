@@ -30,10 +30,6 @@ from .com import (
     is_com_visualization_enabled,
     is_com_for_armature,
     get_com_armature_name,
-    set_com_pivot,
-    get_com_pivot_bone,
-    set_com_pivot_bone,
-    is_bone_com_pivot,
     register_frame_handler,
     unregister_frame_handler,
 )
@@ -65,10 +61,6 @@ __all__ = [
     "is_com_visualization_enabled",
     "is_com_for_armature",
     "get_com_armature_name",
-    "set_com_pivot",
-    "get_com_pivot_bone",
-    "set_com_pivot_bone",
-    "is_bone_com_pivot",
     "register_frame_handler",
     "unregister_frame_handler",
     # Physics

@@ -25,7 +25,10 @@ function ExportManager:clearMetaParts()
 	end
 end
 
-function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Instance]: string })
+function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Instance]: string }, usedJointNames: { [string]: boolean }?)
+	-- Initialize usedJointNames on first call (root node)
+	usedJointNames = usedJointNames or {}
+	
 	-- round transform matrices (compresses data)
 	for _, transform in pairs({ "transform", "jointtransform0", "jointtransform1" }) do
 		if rigNode[transform] then
@@ -34,18 +37,49 @@ function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Ins
 			end
 		end
 	end
+	
+	-- Also round auxTransform arrays (each is a 12-value CFrame)
+	if rigNode.auxTransform then
+		for auxIdx, auxCf in pairs(rigNode.auxTransform) do
+			if auxCf and type(auxCf) == "table" then
+				for i = 1, #auxCf do
+					auxCf[i] = math.floor(auxCf[i] * 10000 + 0.5) / 10000
+				end
+			end
+		end
+	end
+	
+	-- Uniquify jname only for Welds (not Motor6Ds) to avoid collisions like multiple "Handle" bones
+	local originalJname = rigNode.jname
+	local jointType = rigNode.jointType
+	local isWeld = jointType == "Weld" or jointType == "WeldConstraint"
+	
+	if originalJname and isWeld then
+		local uniqueJname = originalJname
+		local retryCount = 0
+		while usedJointNames[uniqueJname] do
+			retryCount = retryCount + 1
+			uniqueJname = originalJname .. retryCount
+		end
+		usedJointNames[uniqueJname] = true
+		rigNode.jname = uniqueJname
+	elseif originalJname then
+		-- Track Motor6D names too so welds don't collide with them
+		usedJointNames[originalJname] = true
+	end
 
 	rigNode.pname = partEncodeMap[rigNode.inst]
 	rigNode.inst = nil
 	local realAux = rigNode.aux
 	rigNode.aux = {} -- named aux
+	rigNode.auxTransform = rigNode.auxTransform or {}
 
 	for _, aux in pairs(realAux) do
 		rigNode.aux[#rigNode.aux + 1] = partEncodeMap[aux]
 	end
 
 	for _, child in pairs(rigNode.children) do
-		self:reencodeJointMetadata(child, partEncodeMap)
+		self:reencodeJointMetadata(child, partEncodeMap, usedJointNames)
 	end
 end
 
@@ -82,6 +116,11 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
 	end
 
 	local encodedRig = State.activeRig:EncodeRig()
+	if not encodedRig then
+		warn("Export aborted: No encoded rig data (is the root export-disabled?).")
+		return nil
+	end
+
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 
 	return { rigName = State.activeRig.model.Name, parts = partNames, rig = encodedRig }
@@ -103,6 +142,12 @@ function ExportManager:generateMetadataLegacy(rigModelToExport: Types.RigModelTy
 	end
 
 	local encodedRig = State.activeRig:EncodeRig()
+	if not encodedRig then
+		warn("Export aborted: No encoded rig data (is the root export-disabled?).")
+		return nil
+	end
+
+	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 
 	return { rigName = State.activeRig.model.Name, parts = partRoles, rig = encodedRig }
 end
@@ -129,6 +174,9 @@ function ExportManager:exportRig()
 	State.metaParts = { rigModelToExport }
 
 	local meta = self:generateMetadata(rigModelToExport)
+	if not meta then
+		return
+	end
 
 	-- store encoded metadata in a bunch of auxiliary part names
 	local metaEncodedJson = game.HttpService:JSONEncode(meta)
@@ -169,6 +217,9 @@ function ExportManager:exportRigLegacy()
 	State.metaParts = { rigModelToExport }
 
 	local meta = self:generateMetadataLegacy(rigModelToExport)
+	if not meta then
+		return
+	end
 
 	-- store encoded metadata in a bunch of auxiliary part names
 	local metaEncodedJson = game.HttpService:JSONEncode(meta)

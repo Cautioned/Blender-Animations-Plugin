@@ -17,7 +17,7 @@ type self = {
 	bonesByInstance: { [Instance]: RigPart.RigPart },
 	isDeformRig: boolean,
 	boneHierarchy: { [string]: string? },
-	_jointCache: { [Instance]: { Motor6D } },
+	_jointCache: { [Instance]: { Instance } }, -- Motor6D, Weld, or WeldConstraint
 	_duplicateBoneWarnings: { [string]: boolean }?,
 }
 
@@ -44,7 +44,7 @@ function Rig.new(model: Model)
 	for _, descendant in ipairs(model:GetDescendants()) do
 		if descendant:IsA("Bone") then
 			table.insert(allBones, descendant)
-		elseif descendant:IsA("Motor6D") then
+		elseif descendant:IsA("Motor6D") or descendant:IsA("Weld") or descendant:IsA("WeldConstraint") then
 			table.insert(allJoints, descendant)
 		end
 	end
@@ -53,34 +53,43 @@ function Rig.new(model: Model)
 
     -- Pre-build the joint cache for fast lookups, guarding duplicate Motor6D names under the same parent
 	self._jointCache = {}
-    local duplicateGuard: { [Instance]: { [string]: boolean } } = {}
-	for _, joint in ipairs(allJoints) do
-        local parentInst = joint.Parent
-        if parentInst then
-            local nameSet = duplicateGuard[parentInst]
-            if not nameSet then
-                nameSet = {}
-                duplicateGuard[parentInst] = nameSet
-            end
-            if nameSet[joint.Name] then
-                warn("duplicate Motor6D name under same parent detected; ignoring subsequent joint:", parentInst:GetFullName(), joint.Name)
-                -- do not index this duplicate into caches to avoid ambiguity
-            else
-                nameSet[joint.Name] = true
-		local p0, p1 = joint.Part0, joint.Part1
+	local duplicateGuard: { [Instance]: { [string]: boolean } } = {}
+
+	local function addJointToCache(joint: Instance)
+		local p0 = (joint :: any).Part0
+		local p1 = (joint :: any).Part1
 		if p0 then
-			if not self._jointCache[p0] then
-				self._jointCache[p0] = {}
-			end
+			self._jointCache[p0] = self._jointCache[p0] or {}
 			table.insert(self._jointCache[p0], joint)
 		end
 		if p1 then
-			if not self._jointCache[p1] then
-				self._jointCache[p1] = {}
-			end
+			self._jointCache[p1] = self._jointCache[p1] or {}
 			table.insert(self._jointCache[p1], joint)
-                end
-            end
+		end
+	end
+
+	for _, joint in ipairs(allJoints) do
+		if joint:IsA("Motor6D") then
+			local parentInst = joint.Parent
+			if parentInst then
+				local nameSet = duplicateGuard[parentInst]
+				if not nameSet then
+					nameSet = {}
+					duplicateGuard[parentInst] = nameSet
+				end
+				if nameSet[joint.Name] then
+					warn("duplicate Motor6D name under same parent detected; ignoring subsequent joint:", parentInst:GetFullName(), joint.Name)
+					-- skip duplicate Motor6D to avoid ambiguity
+				else
+					nameSet[joint.Name] = true
+					addJointToCache(joint)
+				end
+			else
+				addJointToCache(joint)
+			end
+		else
+			-- Welds and WeldConstraints are indexed without duplicate-name filtering
+			addJointToCache(joint)
 		end
 	end
 
@@ -354,6 +363,10 @@ function Rig:LoadAnimation(data)
 		error("Animation data missing keyframes array (data.kfs)")
 	end
 
+	if data.t == nil or type(data.t) ~= "number" then
+		error("Animation data missing duration (data.t)")
+	end
+
 	self:ClearPoses()
 
 	local rigParts = self:GetRigParts()
@@ -536,8 +549,14 @@ function Rig:ToRobloxAnimation()
 	table.sort(sortedTimes)
 
 	local nextKfNameIdx = 1
+	local keyframeCount = 0
 
 	for _, t in ipairs(sortedTimes) do
+		keyframeCount = keyframeCount + 1
+		if keyframeCount % 100 == 0 then
+			task.wait()
+		end
+
 		-- Serialize t
 		local kf = Instance.new("Keyframe")
 		kf.Time = t

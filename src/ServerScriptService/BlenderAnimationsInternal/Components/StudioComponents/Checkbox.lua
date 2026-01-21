@@ -29,6 +29,7 @@ local COMPONENT_ONLY_PROPERTIES = {
 	"Enabled",
 	"Value",
 	"Text",
+	"TextColor3",
 }
 
 type CheckboxProperties = {
@@ -37,6 +38,7 @@ type CheckboxProperties = {
 	Enabled: (boolean | types.StateObject<boolean>)?,
 	Text: (string | types.StateObject<string>)?,
 	Value: (boolean | types.Value<boolean>)?,
+	TextColor3: (Color3 | types.StateObject<Color3>)?,
 	[any]: any,
 }
 
@@ -194,7 +196,7 @@ return function(props: CheckboxProperties): Frame
 						Text = props.Text,
 						Font = themeProvider:GetFont("Default"),
 						TextSize = constants.TextSize,
-						TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText, mainModifier),
+						TextColor3 = props.TextColor3 or themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText, mainModifier),
 					}
 				end
 			end, Fusion.cleanup)

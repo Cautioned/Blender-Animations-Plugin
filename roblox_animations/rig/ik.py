@@ -231,6 +231,14 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                 except:
                     pass
                 child_bone.constraints.remove(c)
+            
+            # Unhide the child bone if it was hidden by IK setup
+            if constraints_to_remove:
+                child_data_bone = ao.data.bones.get(child_bone.name)
+                if child_data_bone:
+                    child_pose_bone = ao.pose.bones.get(child_bone.name)
+                    if child_pose_bone:
+                        child_pose_bone.hide = False
     
     to_clear = []
     ik_target_names = []
@@ -629,9 +637,9 @@ def create_ik_config(
 
     # Hide stretch bone in pose mode (must be done via armature.bones, not pose.bones)
     if ik_stretch_name:
-        stretch_bone = ao.data.bones.get(ik_stretch_name)
-        if stretch_bone:
-            stretch_bone.hide = True
+        stretch_pose_bone = ao.pose.bones.get(ik_stretch_name)
+        if stretch_pose_bone:
+            stretch_pose_bone.hide = True
 
     pose_bone = ao.pose.bones.get(ik_target_bone_name)
     if not pose_bone:
@@ -674,6 +682,11 @@ def create_ik_config(
             copy_loc.head_tail = 0  # Use head of IK target
             copy_loc.owner_space = 'WORLD'
             copy_loc.target_space = 'WORLD'
+            
+            # Hide the controlled bone since the IK target now represents it
+            controlled_pose_bone = ao.pose.bones.get(copy_rot_bone_name)
+            if controlled_pose_bone:
+                controlled_pose_bone.hide = True
 
     # Set up stretch drivers if requested (prevents knee/elbow popping)
     if enable_stretch and ik_stretch_name:

@@ -14,7 +14,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 2, 1),
+    "version": (2, 3, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -33,7 +33,6 @@ CLASSES = (
     operators.OBJECT_OT_SetIKFK,
     operators.OBJECT_OT_ToggleCOM,
     operators.OBJECT_OT_ToggleCOMGrid,
-    operators.OBJECT_OT_SetCOMPivot,
     operators.OBJECT_OT_EditCOMWeights,
     operators.OBJECT_OT_ResetBoneWeight,
     operators.OBJECT_OT_ApplyDefaultWeights,

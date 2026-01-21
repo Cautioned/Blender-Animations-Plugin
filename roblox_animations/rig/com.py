@@ -14,24 +14,18 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, Matrix
 from typing import Optional, Dict, List, Tuple
 
-# Default bone weights based on human body proportions (biomechanics data)
-# Values represent approximate percentage of total body mass
-# Total sums to ~1.0 and gets normalized in calculate_com()
-DEFAULT_BONE_WEIGHTS = {
-    # Torso (~50% total)
-    "HumanoidRootPart": 0.12,  # Pelvis region
-    "LowerTorso": 0.18,        # Abdomen + lower back
-    "UpperTorso": 0.20,        # Chest + upper back
-    # Head (~8%)
+# Default bone weights for R15 rigs
+DEFAULT_BONE_WEIGHTS_R15 = {
+    "HumanoidRootPart": 0.0,
+    "LowerTorso": 0.18,
+    "UpperTorso": 0.20,
     "Head": 0.08,
-    # Arms (~5% each side = 10% total)
     "LeftUpperArm": 0.028,
     "LeftLowerArm": 0.016,
     "LeftHand": 0.006,
     "RightUpperArm": 0.028,
     "RightLowerArm": 0.016,
     "RightHand": 0.006,
-    # Legs (~16% each side = 32% total)
     "LeftUpperLeg": 0.10,
     "LeftLowerLeg": 0.047,
     "LeftFoot": 0.015,
@@ -39,6 +33,20 @@ DEFAULT_BONE_WEIGHTS = {
     "RightLowerLeg": 0.047,
     "RightFoot": 0.015,
 }
+
+# Default bone weights for R6 rigs
+DEFAULT_BONE_WEIGHTS_R6 = {
+    "HumanoidRootPart": 0.0,
+    "Torso": 0.46,
+    "Head": 0.08,
+    "Left Arm": 0.10,
+    "Right Arm": 0.10,
+    "Left Leg": 0.10,
+    "Right Leg": 0.10,
+}
+
+# Combined view (R15 prioritized during matching thanks to normalization/length checks)
+DEFAULT_BONE_WEIGHTS = {**DEFAULT_BONE_WEIGHTS_R15, **DEFAULT_BONE_WEIGHTS_R6}
 
 # Default weight for bones not in the default list and without custom weight
 DEFAULT_WEIGHT = 0.05
@@ -50,14 +58,47 @@ COM_WEIGHT_PROP = "com_weight"
 _IK_SUFFIXES = ("-IKTarget", "-IKPole", "-IKStretch")
 
 
+def _normalize_name(s: str) -> str:
+    """Normalize a bone/key name for robust matching.
+
+    Removes non-alphanumeric characters and lowercases the string so we can
+    compare 'Left Leg' with 'LeftLeg' or 'left_leg' reliably.
+    """
+    return ''.join(ch.lower() for ch in (s or "") if ch.isalnum())
+
+
+def detect_rig_type(armature: "bpy.types.Object") -> str:
+    """Detect whether an armature appears to be R6, R15, or unknown.
+
+    Returns: 'R6', 'R15', or 'unknown'
+    """
+    if not armature or armature.type != "ARMATURE":
+        return "unknown"
+
+    names = { _normalize_name(b.name) for b in armature.data.bones }
+
+    # R15 markers (more specific names)
+    r15_markers = ("lowertorso", "uppertorso", "leftupperarm", "rightupperarm", "leftupperleg", "rightupperleg")
+    if any(m in names for m in r15_markers):
+        return "R15"
+
+    # R6 markers
+    r6_markers = ("torso", "leftarm", "rightarm", "leftleg", "rightleg")
+    if any(m in names for m in r6_markers):
+        return "R6"
+
+    return "unknown"
+
+
 def get_bone_weight(bone: "bpy.types.Bone") -> float:
     """Get the COM weight for a bone.
     
     Priority order:
     1. Custom 'com_weight' property on the bone
-    2. Default weight from DEFAULT_BONE_WEIGHTS dict
-    3. Partial name match in DEFAULT_BONE_WEIGHTS
-    4. DEFAULT_WEIGHT constant
+    2. Root bones default to 0 (e.g., 'root' in name)
+    3. Default weight from DEFAULT_BONE_WEIGHTS dict
+    4. Partial name match in DEFAULT_BONE_WEIGHTS
+    5. DEFAULT_WEIGHT constant
     
     Args:
         bone: The bone to get weight for.
@@ -68,15 +109,21 @@ def get_bone_weight(bone: "bpy.types.Bone") -> float:
     # Check for custom weight property first
     if COM_WEIGHT_PROP in bone:
         return float(bone[COM_WEIGHT_PROP])
+
+    # Always default root-like bones to 0 (unless user explicitly set com_weight)
+    if "root" in bone.name.lower():
+        return 0.0
     
     # Check exact match in defaults
     if bone.name in DEFAULT_BONE_WEIGHTS:
         return DEFAULT_BONE_WEIGHTS[bone.name]
     
-    # Check partial match (case insensitive)
-    bone_name_lower = bone.name.lower()
-    for key, weight in DEFAULT_BONE_WEIGHTS.items():
-        if key.lower() in bone_name_lower:
+    # Check partial match using normalized names and prefer longer (more specific) keys
+    normalized_bone = _normalize_name(bone.name)
+    # Sort keys by length descending so specific keys (e.g., 'lower torso') are matched
+    # before generic ones (e.g., 'torso') to avoid R6->R15 overrides.
+    for key, weight in sorted(DEFAULT_BONE_WEIGHTS.items(), key=lambda kv: len(_normalize_name(kv[0])), reverse=True):
+        if _normalize_name(key) in normalized_bone:
             return weight
     
     return DEFAULT_WEIGHT
@@ -132,32 +179,73 @@ def clear_all_custom_weights(armature: "bpy.types.Object"):
             del bone[COM_WEIGHT_PROP]
 
 
-def apply_default_weights(armature: "bpy.types.Object", overwrite: bool = False):
+def apply_default_weights(armature: "bpy.types.Object", overwrite: bool = False) -> int:
     """Apply default weights as custom properties to all bones.
-    
-    This allows users to see and edit the default values.
-    
+
+    This chooses an appropriate defaults set for R6 vs R15 rigs and applies
+    weights only when we can confidently detect the rig format. Returns the
+    number of bones that were assigned weights.
+
     Args:
         armature: The armature object.
         overwrite: If True, overwrite existing custom weights.
+
+    Returns:
+        Number of bones that had default weights applied.
     """
     if not armature or armature.type != "ARMATURE":
-        return
-    
+        return 0
+
+    rig_type = detect_rig_type(armature)
+
+    # If rig type is unknown, avoid applying potentially incorrect R6 defaults
+    if rig_type == "unknown" and not overwrite:
+        return 0
+
+    # Select mapping based on rig type
+    if rig_type == "R6":
+        # Use normalized keys for matching
+        mapping = { _normalize_name(k): v for k, v in DEFAULT_BONE_WEIGHTS_R6.items() }
+    else:
+        # R15 or fallback: use the R15 mapping
+        mapping = { _normalize_name(k): v for k, v in DEFAULT_BONE_WEIGHTS_R15.items() }
+
+    applied = 0
+
     for bone in armature.data.bones:
-        if overwrite or COM_WEIGHT_PROP not in bone:
-            # Get the default weight for this bone
-            weight = DEFAULT_WEIGHT
-            if bone.name in DEFAULT_BONE_WEIGHTS:
-                weight = DEFAULT_BONE_WEIGHTS[bone.name]
-            else:
-                bone_name_lower = bone.name.lower()
-                for key, w in DEFAULT_BONE_WEIGHTS.items():
-                    if key.lower() in bone_name_lower:
-                        weight = w
-                        break
-            
+        # Skip if custom weight exists and we're not overwriting
+        if not overwrite and COM_WEIGHT_PROP in bone:
+            continue
+
+        # Root-like bones should default to 0
+        if "root" in bone.name.lower():
+            bone[COM_WEIGHT_PROP] = 0.0
+            applied += 1
+            continue
+
+        norm_name = _normalize_name(bone.name)
+
+        weight = None
+        # Exact normalized match
+        if norm_name in mapping:
+            weight = mapping[norm_name]
+        else:
+            # Partial match: prefer longer/more specific keys
+            for key, w in sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True):
+                if key in norm_name:
+                    weight = w
+                    break
+
+        if weight is None:
+            # Fallback: leave unset unless overwrite is True (in which case apply DEFAULT_WEIGHT)
+            if overwrite:
+                bone[COM_WEIGHT_PROP] = DEFAULT_WEIGHT
+                applied += 1
+        else:
             bone[COM_WEIGHT_PROP] = weight
+            applied += 1
+
+    return applied
 
 
 def calculate_com(armature: "bpy.types.Object") -> Vector:
@@ -266,7 +354,6 @@ _com_data = {
     "projection_color": (0.0, 0.8, 1.0, 0.5),  # Cyan, semi-transparent
     "grid_color": (0.5, 0.5, 0.5, 0.3),  # Gray, semi-transparent
     "size": 0.15,
-    "pivot_bone": None,  # Name of the bone currently set as COM pivot
 }
 
 
@@ -417,7 +504,6 @@ def enable_com_visualization(enable: bool = True):
         _com_draw_handler = None
         # Clear armature tracking when disabled
         _com_data["armature_name"] = None
-        _com_data["pivot_bone"] = None
     
     # Redraw viewports
     for area in bpy.context.screen.areas:
@@ -524,48 +610,6 @@ def get_com_grid_radius() -> float:
     return _com_data["grid_radius"]
 
 
-def get_com_pivot_bone() -> Optional[str]:
-    """Get the name of the bone currently set as COM pivot.
-    
-    Returns:
-        Bone name or None if no pivot is set.
-    """
-    return _com_data["pivot_bone"]
-
-
-def set_com_pivot_bone(bone_name: Optional[str]):
-    """Set or clear the COM pivot bone.
-    
-    Args:
-        bone_name: Name of the bone to set as pivot, or None to clear.
-    """
-    _com_data["pivot_bone"] = bone_name
-
-
-def is_bone_com_pivot(bone_name: str) -> bool:
-    """Check if a bone is currently set as the COM pivot.
-    
-    Args:
-        bone_name: Name of the bone to check.
-        
-    Returns:
-        True if this bone is the current pivot.
-    """
-    return _com_data["pivot_bone"] == bone_name
-
-
-def set_com_pivot(armature: "bpy.types.Object", bone_name: Optional[str] = None):
-    """Set the 3D cursor to the center of mass position.
-    
-    This allows rotating the rig around its COM using cursor pivot.
-    
-    Args:
-        armature: The armature object.
-        bone_name: Optional bone name to track as the pivot source.
-    """
-    com = calculate_com(armature)
-    bpy.context.scene.cursor.location = com
-    _com_data["pivot_bone"] = bone_name
 
 
 def rotate_around_com(

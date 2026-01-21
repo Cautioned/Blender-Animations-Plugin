@@ -22,6 +22,101 @@ def _matrix_to_idprop(value):
     return value
 
 
+def _strip_suffix(name: str) -> str:
+    """Strip .001/.002 style suffixes for stable matching."""
+    return re.sub(r"\.\d+$", "", name or "")
+
+
+def _fingerprint_position(matrix: Matrix, precision: int = 2) -> str:
+    """Create a position-only fingerprint for coarse matching."""
+    loc = matrix.to_translation()
+    return f"{round(loc.x, precision)},{round(loc.y, precision)},{round(loc.z, precision)}"
+
+
+def _build_match_context(parts_collection):
+    """Precompute lookup maps for matching imported meshes to rig metadata."""
+    name_index = {}
+    # Position indices at multiple precision levels
+    position_index_p2 = {}  # precision 2 (0.01 units)
+    position_index_p1 = {}  # precision 1 (0.1 units)
+    position_index_p0 = {}  # precision 0 (1 unit)
+    
+    for obj in parts_collection.objects:
+        if obj.type != "MESH":
+            continue
+        base = _strip_suffix(obj.name).lower()
+        name_index.setdefault(base, []).append(obj)
+        for prec, idx in [(2, position_index_p2), (1, position_index_p1), (0, position_index_p0)]:
+            fp = _fingerprint_position(obj.matrix_world, prec)
+            idx.setdefault(fp, []).append(obj)
+
+    return {
+        "name_index": name_index,
+        "position_index_p2": position_index_p2,
+        "position_index_p1": position_index_p1,
+        "position_index_p0": position_index_p0,
+        "used": set(),
+        "t2b": get_transform_to_blender(),
+        "parts_collection": parts_collection,
+    }
+
+
+def _find_matching_part(aux_name, aux_cf, match_ctx):
+    """Resolve an aux entry to a mesh by name first, then position fingerprint."""
+    name_index = match_ctx["name_index"]
+    used = match_ctx["used"]
+    t2b = match_ctx["t2b"]
+
+    # Name-based candidates (base name match, ignoring suffixes)
+    candidates = []
+    base_name = _strip_suffix(aux_name or "").lower()
+    if base_name and base_name in name_index:
+        for obj in name_index[base_name]:
+            if obj not in used:
+                candidates.append(obj)
+
+    if candidates:
+        return candidates[0]
+
+    # Position fingerprint fallback at multiple precision levels
+    if aux_cf:
+        try:
+            expected_mat = t2b @ cf_to_mat(aux_cf)
+            for prec in [2, 1, 0]:
+                fp = _fingerprint_position(expected_mat, prec)
+                idx = match_ctx.get(f"position_index_p{prec}", {})
+                for obj in idx.get(fp, []):
+                    if obj not in used:
+                        return obj
+        except Exception:
+            pass
+    return None
+
+
+def _apply_fingerprint_renames(rig_def, match_ctx):
+    """Rename meshes by comparing position fingerprints from rig metadata."""
+    name_index = match_ctx["name_index"]
+
+    def walk(node):
+        aux_list = node.get("aux") or []
+        aux_tf = node.get("auxTransform") or []
+        for idx, aux_name in enumerate(aux_list):
+            if not aux_name:
+                continue
+            aux_cf = aux_tf[idx] if idx < len(aux_tf) else None
+            if not aux_cf:
+                continue
+            obj = _find_matching_part(aux_name, aux_cf, match_ctx)
+            if obj and _strip_suffix(obj.name) != aux_name:
+                obj.name = aux_name
+                base = _strip_suffix(obj.name).lower()
+                name_index.setdefault(base, []).append(obj)
+        for child in node.get("children", []):
+            walk(child)
+
+    walk(rig_def)
+
+
 def get_unique_collection_name(basename):
     """Generate a unique collection name to avoid conflicts."""
     if basename not in bpy.data.collections:
@@ -52,10 +147,12 @@ def autoname_parts(partnames, basename, objects_to_rename):
                 print(f"Error renaming part {object.name}: {str(e)}")
 
 
-def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
+def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, match_ctx):
     """Load a single rig bone with its children"""
     amt = ao.data
     bone = amt.edit_bones.new(rigsubdef["jname"])
+    joint_type = rigsubdef.get("jointType") or "Motor6D"
+    is_weld = joint_type in ("Weld", "WeldConstraint")
 
     mat = cf_to_mat(rigsubdef["transform"])
     bone["transform"] = _matrix_to_idprop(mat)
@@ -64,6 +161,9 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
 
     # Check if this bone is marked as a deform bone from Studio export
     is_deform_bone = rigsubdef.get("isDeformBone", False)
+    if joint_type:
+        # Preserve joint type for downstream serialization/diagnostics (Motor6D/Weld/WeldConstraint/Bone)
+        bone["rbx_joint_type"] = joint_type
     if is_deform_bone:
         # Mark as a deform bone for proper animation import handling
         bone["rbx_is_deform_bone"] = True
@@ -146,28 +246,89 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection):
     # For RAW mode, this should be close to identity since we're not applying nice transforms
     bone["nicetransform"] = _matrix_to_idprop(o_trans.inverted() @ post_mat)
 
-    # link objects to bone by searching ONLY within the provided parts_collection
-    for aux_name in rigsubdef["aux"]:
-        # Skip if the aux name is null/None, which can happen for bones with no associated parts.
+    # link objects to bone by matching name, then fingerprint
+    aux_transform_list = rigsubdef.get("auxTransform") or []
+    for idx, aux_name in enumerate(rigsubdef["aux"]):
         if not aux_name:
             continue
 
-        # Find the object by its original name within the collection's objects
-        found_obj = None
-        for obj in parts_collection.objects:
-            # Match the base name, ignoring any .001 suffixes
-            if obj.name.startswith(aux_name):
-                found_obj = obj
-                break
+        local_cf = aux_transform_list[idx] if idx < len(aux_transform_list) else None
+        found_obj = _find_matching_part(aux_name, local_cf, match_ctx)
 
         if found_obj:
-            from .constraints import link_object_to_bone_rigid
-
-            link_object_to_bone_rigid(found_obj, ao, bone)
+            match_ctx["used"].add(found_obj)
+            # Queue constraint for later - can't apply in edit mode
+            pending = match_ctx.setdefault("pending_constraints", [])
+            pending.append((found_obj, bone.name))
 
     # handle child bones
     for child in rigsubdef["children"]:
-        load_rigbone(ao, rigging_type, child, bone, parts_collection)
+        load_rigbone(ao, rigging_type, child, bone, parts_collection, match_ctx)
+
+
+def _get_or_create_weld_bone_shape():
+    """Get or create a simple line curve to use as custom bone shape for welds."""
+    shape_name = "__WeldBoneShape"
+    
+    # Check if it already exists
+    if shape_name in bpy.data.objects:
+        return bpy.data.objects[shape_name]
+    
+    # Create a simple line curve
+    curve_data = bpy.data.curves.new(name=shape_name, type='CURVE')
+    curve_data.dimensions = '3D'
+    
+    # Create a simple straight line spline
+    spline = curve_data.splines.new('POLY')
+    spline.points.add(1)  # Start with 1 point, add 1 more = 2 points total
+    spline.points[0].co = (0, 0, 0, 1)
+    spline.points[1].co = (0, 1, 0, 1)  # Line along Y axis (bone direction)
+    
+    # Create the object
+    shape_obj = bpy.data.objects.new(shape_name, curve_data)
+    
+    # Don't link to any collection - it's just for bone display
+    shape_obj.hide_viewport = True
+    shape_obj.hide_render = True
+    
+    return shape_obj
+
+
+def _configure_weld_bones(armature_obj):
+    """Configure weld bones with custom display (wire/line) and lock them from animation."""
+    amt = armature_obj.data
+    
+    # Get or create the custom bone shape for welds
+    weld_shape = _get_or_create_weld_bone_shape()
+    
+    # Switch to pose mode to access pose bones
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode="POSE")
+    
+    for bone in amt.bones:
+        joint_type = bone.get("rbx_joint_type", "Motor6D")
+        if joint_type in ("Weld", "WeldConstraint"):
+            pose_bone = armature_obj.pose.bones.get(bone.name)
+            if pose_bone:
+                # Assign custom shape (line)
+                pose_bone.custom_shape = weld_shape
+                pose_bone.use_custom_shape_bone_size = True
+                
+                # Lock all transforms to prevent accidental animation
+                pose_bone.lock_location = (True, True, True)
+                pose_bone.lock_rotation = (True, True, True)
+                pose_bone.lock_rotation_w = True
+                pose_bone.lock_scale = (True, True, True)
+                
+                # Use custom bone color group to visually distinguish weld bones
+                if hasattr(pose_bone, "color"):
+                    # Blender 4.0+ bone colors
+                    pose_bone.color.palette = 'CUSTOM'
+                    pose_bone.color.custom.normal = (0.3, 0.3, 0.3)
+                    pose_bone.color.custom.select = (0.5, 0.5, 0.5)
+                    pose_bone.color.custom.active = (0.6, 0.6, 0.6)
+    
+    bpy.ops.object.mode_set(mode="OBJECT")
 
 
 def create_rig(rigging_type, rig_meta_obj_name):
@@ -200,6 +361,9 @@ def create_rig(rigging_type, rig_meta_obj_name):
         )
         return
 
+    # Build a matching context so we can resolve meshes even if Roblox renames them.
+    match_ctx = _build_match_context(parts_collection)
+
     # --- Deletion of old Armature ---
     # Find and delete any existing armature within this rig's master collection
     old_armature = None
@@ -215,6 +379,8 @@ def create_rig(rigging_type, rig_meta_obj_name):
     bpy.context.view_layer.objects.active = rig_meta_obj
 
     meta_loaded = json.loads(rig_meta_obj["RigMeta"])
+    # Try to restore correct part names using fingerprinting before building constraints.
+    _apply_fingerprint_renames(meta_loaded["rig"], match_ctx)
 
     bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
     ao = bpy.context.object
@@ -235,6 +401,20 @@ def create_rig(rigging_type, rig_meta_obj_name):
 
     bpy.ops.object.mode_set(mode="EDIT")
     # Pass the specific parts_collection to be used for constraining
-    load_rigbone(ao, rigging_type, meta_loaded["rig"], None, parts_collection)
+    load_rigbone(ao, rigging_type, meta_loaded["rig"], None, parts_collection, match_ctx)
 
     bpy.ops.object.mode_set(mode="OBJECT")
+    
+    # Apply pending constraints now that we're in object mode
+    from .constraints import link_object_to_bone_rigid, auto_constraint_parts
+    for obj, bone_name in match_ctx.get("pending_constraints", []):
+        bone = ao.data.bones.get(bone_name)
+        if bone:
+            link_object_to_bone_rigid(obj, ao, bone)
+    
+    # Auto-constraint parts by matching bone names to mesh names
+    # This handles parts that were renamed by fingerprint matching during import
+    auto_constraint_parts(ao.name)
+    
+    # Configure weld bones with custom display and lock them from animation
+    _configure_weld_bones(ao)
