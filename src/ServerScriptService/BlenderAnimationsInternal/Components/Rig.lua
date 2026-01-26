@@ -579,12 +579,12 @@ function Rig:ToRobloxAnimation()
 	return kfs
 end
 
-function Rig:EncodeRig()
-	-- Actually encoded the rig itself
+function Rig:EncodeRig(exportWelds: boolean?)
+	-- Actually encode the rig itself; exportWelds controls whether Weld/WeldConstraint joints are included
 	if not self.root then
 		return nil
 	end
-	return self.root:Encode({})
+	return self.root:Encode({}, { exportWelds = exportWelds == true })
 end
 
 function Rig:RebuildAsDeformRig()

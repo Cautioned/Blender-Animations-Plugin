@@ -70,7 +70,7 @@ function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Ins
 
 	rigNode.pname = partEncodeMap[rigNode.inst]
 	rigNode.inst = nil
-	local realAux = rigNode.aux
+	local realAux = rigNode.aux or {}
 	rigNode.aux = {} -- named aux
 	rigNode.auxTransform = rigNode.auxTransform or {}
 
@@ -119,7 +119,8 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
 		end
 	end
 
-	local encodedRig = State.activeRig:EncodeRig()
+	local exportWelds = State.exportWelds:get()
+	local encodedRig = State.activeRig:EncodeRig(exportWelds)
 	if not encodedRig then
 		warn("Export aborted: No encoded rig data (is the root export-disabled?).")
 		return nil
@@ -136,11 +137,12 @@ function ExportManager:generateMetadataLegacy(rigModelToExport: Types.RigModelTy
 	local partRoles: { [string]: string } = {} -- Maps original part names to their roles/identifiers
 	local partEncodeMap: { [BasePart]: string } = {} -- Maps original parts to their roles for encoding
 	local primaryClone = rigModelToExport.PrimaryPart
+	local originalDescendants = State.activeRig.model:GetDescendants()
 
-	for _, desc in ipairs(rigModelToExport:GetDescendants()) do
+	for descIdx, desc in ipairs(rigModelToExport:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			local partRole: string = desc.Name -- or any logic to determine the part's role/identifier
-			partEncodeMap[desc :: BasePart] = partRole
+			partEncodeMap[originalDescendants[descIdx] :: BasePart] = partRole
 			if desc ~= primaryClone then
 				partRoles[desc.Name] = partRole
 			end
@@ -148,7 +150,8 @@ function ExportManager:generateMetadataLegacy(rigModelToExport: Types.RigModelTy
 		-- No need to destroy Humanoid or AnimationController
 	end
 
-	local encodedRig = State.activeRig:EncodeRig()
+	local exportWelds = State.exportWelds:get()
+	local encodedRig = State.activeRig:EncodeRig(exportWelds)
 	if not encodedRig then
 		warn("Export aborted: No encoded rig data (is the root export-disabled?).")
 		return nil

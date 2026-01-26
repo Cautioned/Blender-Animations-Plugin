@@ -3258,6 +3258,204 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertAlmostEqual(helper_loc[1], 2.5, places=4)
         self.assertAlmostEqual(helper_loc[2], 3.5, places=4)
 
+    def test_linear_animation_carry_forward(self):
+        """
+        Test that carry-forward logic doesn't break linear animations.
+        
+        Setup:
+        - Bone1 animates linearly from frame 1 to 10
+        - Bone2 is held constant at identity throughout
+        - No constraints (pure Motor6D rig)
+        
+        Expected behavior:
+        - Bone1 should have Linear easing at its keyframes
+        - Bone2 should have Constant easing when carried forward
+        - No extra in-between keyframes should be added to Bone1 that break interpolation
+        """
+        # Create a motor rig with two bones
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "LinearTestRig"
+        arm = armature_obj.data
+        arm.name = "LinearTestArmature"
+
+        # Create two bones
+        bone1_edit = arm.edit_bones.new("Bone1")
+        bone1_edit.head = (0, 0, 0)
+        bone1_edit.tail = (0, 1, 0)
+
+        bone2_edit = arm.edit_bones.new("Bone2")
+        bone2_edit.head = (1, 0, 0)
+        bone2_edit.tail = (1, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        bone1_pose = armature_obj.pose.bones["Bone1"]
+        bone2_pose = armature_obj.pose.bones["Bone2"]
+
+        # Mark both bones with motor6d properties
+        for bone_pose in [bone1_pose, bone2_pose]:
+            bone_pose.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone_pose.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone_pose.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone_pose.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        # Create animation
+        action = bpy.data.actions.new("LinearTestAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Bone1: animates linearly from (0,0,0) to (2,0,0)
+        bone1_pose.location = (0, 0, 0)
+        bone1_pose.keyframe_insert(data_path="location", frame=1)
+        bone1_pose.location = (2, 0, 0)
+        bone1_pose.keyframe_insert(data_path="location", frame=10)
+
+        # Bone2: stays at identity (no keyframes = held)
+        bone2_pose.location = (0, 0, 0)
+
+        # Ensure Linear interpolation
+        fcurves = utils.get_action_fcurves(action)
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                kp.interpolation = "LINEAR"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+
+        # Test BOTH modes
+        for full_range in [False, True]:
+            with self.subTest(full_range_bake=full_range):
+                settings = bpy.context.scene.rbx_anim_settings
+                settings.rbx_full_range_bake = full_range
+
+                result = serialize(armature_obj)
+                
+                self._validate_linear_animation_result(result, full_range)
+
+    def _validate_linear_animation_result(self, result, full_range_bake):
+        """Helper to validate linear animation results"""
+
+    def _validate_linear_animation_result(self, result, full_range_bake):
+        """Helper to validate linear animation results"""
+        # Verify we have keyframes
+        self.assertGreater(len(result["kfs"]), 0, "Should have keyframes")
+
+        # Check that Bone1's first and last keyframes have Linear easing
+        first_kf = result["kfs"][0]["kf"]
+        last_kf = result["kfs"][-1]["kf"]
+
+        # Bone1 should be in the first keyframe with Linear easing
+        if "Bone1" in first_kf:
+            bone1_first = first_kf["Bone1"]
+            self.assertEqual(
+                bone1_first[1],
+                "Linear",
+                f"[full_range={full_range_bake}] Bone1 first keyframe should have Linear easing, got {bone1_first[1]}"
+            )
+
+        # Bone1 should be in the last keyframe with Linear easing
+        self.assertIn("Bone1", last_kf, f"[full_range={full_range_bake}] Bone1 should be in last keyframe")
+        bone1_last = last_kf["Bone1"]
+        self.assertEqual(
+            bone1_last[1],
+            "Linear",
+            f"[full_range={full_range_bake}] Bone1 last keyframe should have Linear easing, got {bone1_last[1]}"
+        )
+
+        # Check positions to ensure proper interpolation
+        bone1_last_pos = bone1_last[0][:3]
+        self.assertAlmostEqual(bone1_last_pos[0], 2.0, places=3, 
+                               msg=f"[full_range={full_range_bake}] Bone1 should reach position 2.0 at last frame")
+
+        # Collect all Bone1 keyframes and their details
+        bone1_keyframes = []
+        bone2_keyframes = []
+        for i, kf in enumerate(result["kfs"]):
+            if "Bone1" in kf["kf"]:
+                bone1_data = kf["kf"]["Bone1"]
+                bone1_keyframes.append({
+                    "index": i,
+                    "time": kf["t"],
+                    "position": bone1_data[0][:3],
+                    "easing": bone1_data[1],
+                    "direction": bone1_data[2]
+                })
+            if "Bone2" in kf["kf"]:
+                bone2_data = kf["kf"]["Bone2"]
+                bone2_keyframes.append({
+                    "index": i,
+                    "time": kf["t"],
+                    "easing": bone2_data[1]
+                })
+
+        # Debug output
+        print(f"\n=== Linear Animation Test (full_range={full_range_bake}) ===")
+        print(f"Total keyframes: {len(result['kfs'])}")
+        print(f"Bone1 keyframes: {len(bone1_keyframes)}")
+        print(f"Bone2 keyframes: {len(bone2_keyframes)}")
+        
+        print("\nBone1 keyframe details:")
+        for kf in bone1_keyframes:
+            print(f"  KF {kf['index']}, time={kf['time']:.3f}, "
+                  f"pos=({kf['position'][0]:.3f}, {kf['position'][1]:.3f}, {kf['position'][2]:.3f}), "
+                  f"easing={kf['easing']}")
+        
+        print("\nBone2 keyframe details:")
+        for kf in bone2_keyframes:
+            print(f"  KF {kf['index']}, time={kf['time']:.3f}, easing={kf['easing']}")
+
+        # Critical checks depend on mode
+        if full_range_bake:
+            # full_range_bake means "bake sparse keys up to timeline end", not "bake every frame"
+            # So we should still only have keyframes at explicit keys (frame 1 and 10)
+            # Plus potentially the end frame hold
+            self.assertLessEqual(
+                len(bone1_keyframes),
+                3,
+                f"Full-range bake should still be sparse (≤3 keyframes for Bone1), got {len(bone1_keyframes)}"
+            )
+        else:
+            # In sparse mode, Bone1 should have at most 3 keyframes
+            self.assertLessEqual(
+                len(bone1_keyframes),
+                3,
+                f"Sparse mode: Bone1 should have ≤3 keyframes, got {len(bone1_keyframes)}"
+            )
+
+        # 2. All Bone1 keyframes MUST have Linear easing (this is the key test)
+        for kf in bone1_keyframes:
+            self.assertEqual(
+                kf["easing"],
+                "Linear",
+                f"[full_range={full_range_bake}] Bone1 keyframe at index {kf['index']} "
+                f"should have Linear easing, got {kf['easing']}"
+            )
+
+        # 3. Bone1 positions should progress linearly
+        if len(bone1_keyframes) >= 2:
+            first_pos = bone1_keyframes[0]["position"][0]
+            last_pos = bone1_keyframes[-1]["position"][0]
+            first_time = bone1_keyframes[0]["time"]
+            last_time = bone1_keyframes[-1]["time"]
+            
+            # Check intermediate keyframes (if any) follow linear progression
+            for kf in bone1_keyframes[1:-1]:
+                expected_pos = first_pos + (last_pos - first_pos) * (kf["time"] - first_time) / (last_time - first_time)
+                self.assertAlmostEqual(
+                    kf["position"][0],
+                    expected_pos,
+                    places=2,
+                    msg=f"Bone1 at time {kf['time']} should be at {expected_pos:.3f} (linear), got {kf['position'][0]:.3f}"
+                )
+
+        # 4. If Bone2 appears in any keyframes (carry-forward), it should use Constant easing
+        for kf in bone2_keyframes:
+            self.assertEqual(
+                kf["easing"],
+                "Constant",
+                f"Bone2 in keyframe {kf['index']} should have Constant easing (it's held), got {kf['easing']}"
+            )
+
 
 # This allows running the tests from the Blender text editor
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ def _fingerprint_position(loc, precision=2) -> str:
 def _rename_parts_by_fingerprint(rig_def, parts_collection):
     """Rename meshes using transform position matching from rig metadata.
     
-    Uses fingerprint matching first, then falls back to nearest-neighbor for collisions.
+    Uses name matching first, then fingerprint matching, then falls back to nearest-neighbor.
     Computes geometric center of meshes (from vertices) since OBJ import places objects at origin.
     """
     if not rig_def:
@@ -59,6 +59,23 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
     t2b = get_transform_to_blender()
     used = set()
     
+    # Build a set of all bone/part names in the rig definition (case-insensitive)
+    # This prevents position matching from stealing meshes that are already correctly named
+    all_rig_names = set()
+    def collect_names(node):
+        if not node:
+            return
+        jname = node.get("jname") or node.get("pname") or ""
+        if jname:
+            all_rig_names.add(jname.lower())
+        for aux_name in (node.get("aux") or []):
+            if aux_name:
+                all_rig_names.add(aux_name.lower())
+        for child in (node.get("children") or []):
+            collect_names(child)
+    collect_names(rig_def)
+    print(f"[RigImport] Rig contains {len(all_rig_names)} named parts")
+    
     # Build position index with multiple precision levels for fallback
     position_index_p2 = {}  # precision 2 (0.01 units)
     position_index_p1 = {}  # precision 1 (0.1 units)
@@ -66,6 +83,12 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
     
     mesh_objects = [obj for obj in parts_collection.objects if obj.type == "MESH"]
     print(f"[RigImport] Building position index for {len(mesh_objects)} mesh objects (using geometric centers)")
+    
+    # Build name index for direct name matching (case-insensitive)
+    name_index = {}
+    for obj in mesh_objects:
+        base_name = _strip_suffix(obj.name).lower()
+        name_index.setdefault(base_name, []).append(obj)
     
     # Precompute geometric centers for all meshes
     mesh_centers = {}
@@ -88,12 +111,28 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
     # Log fingerprint index stats
     print(f"[RigImport] Position index sizes: p2={len(position_index_p2)}, p1={len(position_index_p1)}, p0={len(position_index_p0)}")
     
-    def find_nearest_unused(target_loc, max_distance=0.5):
+    def is_reserved_name(obj, target_name):
+        """Check if obj's current name matches a rig bone name (other than target_name).
+        
+        This prevents position matching from stealing meshes that are already correctly
+        named for another bone in the rig.
+        """
+        base_name = _strip_suffix(obj.name).lower()
+        # If the mesh is already named for a rig bone, and it's not the bone we're looking for,
+        # don't allow position matching to steal it
+        if base_name in all_rig_names and base_name != target_name.lower():
+            return True
+        return False
+    
+    def find_nearest_unused(target_loc, target_name, max_distance=0.5):
         """Find the nearest unused mesh within max_distance."""
         best_obj = None
         best_dist = max_distance
         for obj in mesh_objects:
             if obj in used:
+                continue
+            # Skip meshes that are already correctly named for another bone
+            if is_reserved_name(obj, target_name):
                 continue
             loc = mesh_centers[obj]
             dist = (loc - target_loc).length
@@ -102,8 +141,20 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
                 best_obj = obj
         return best_obj, best_dist
     
-    def match_by_position(cf, aux_name_for_log):
-        """Try to match by position fingerprint, then nearest neighbor."""
+    def match_by_name(target_name):
+        """Try to match by name first (case-insensitive)."""
+        candidates = name_index.get(target_name.lower(), [])
+        available = [o for o in candidates if o not in used]
+        if available:
+            return available[0]
+        return None
+    
+    def match_by_position(cf, target_name):
+        """Try to match by position fingerprint only - no fuzzy fallback.
+        
+        Only matches if the mesh is at the EXACT expected position (within 0.01 units).
+        This prevents incorrect matches between bones that are close but not the same.
+        """
         if not cf:
             return None
         
@@ -112,88 +163,88 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
             expected_mat = t2b @ raw_mat
             expected_loc = expected_mat.to_translation()
         except Exception as e:
-            print(f"[RigImport]   '{aux_name_for_log}' Failed to convert CFrame: {e}")
+            print(f"[RigImport]   '{target_name}' Failed to convert CFrame: {e}")
             return None
         
-        # Try each precision level from finest to coarsest
-        for prec, idx in [(2, position_index_p2), (1, position_index_p1), (0, position_index_p0)]:
-            fp = _fingerprint_position(expected_loc, prec)
-            candidates = idx.get(fp, [])
-            available = [o for o in candidates if o not in used]
-            if available:
-                print(f"[RigImport]   '{aux_name_for_log}' MATCHED at precision {prec} fp='{fp}' -> '{available[0].name}'")
-                return available[0]
+        # Only use precision 2 (0.01 units) - no coarse matching
+        fp = _fingerprint_position(expected_loc, 2)
+        candidates = position_index_p2.get(fp, [])
+        # Filter out used meshes AND meshes reserved for other bone names
+        available = [o for o in candidates if o not in used and not is_reserved_name(o, target_name)]
+        if available:
+            print(f"[RigImport]   '{target_name}' MATCHED at position fp='{fp}' -> '{available[0].name}'")
+            return available[0]
         
-        # Fallback: find nearest unused mesh within tolerance
-        nearest, dist = find_nearest_unused(expected_loc)
-        if nearest:
-            print(f"[RigImport]   '{aux_name_for_log}' NEAREST match (dist={dist:.4f}) -> '{nearest.name}'")
-            return nearest
-        
-        print(f"[RigImport]   '{aux_name_for_log}' NO MATCH at ({expected_loc.x:.4f}, {expected_loc.y:.4f}, {expected_loc.z:.4f})")
+        print(f"[RigImport]   '{target_name}' NO POSITION MATCH at ({expected_loc.x:.4f}, {expected_loc.y:.4f}, {expected_loc.z:.4f})")
         return None
 
     matched_count = 0
     unmatched_names = []
-    # Collect renames first, then apply in two passes to avoid name collisions
     pending_renames = []  # List of (obj, target_name)
-
-    def walk(node, depth=0):
-        nonlocal matched_count
+    
+    # Collect all nodes that need matching (excluding root)
+    nodes_to_match = []  # List of (jname, transform, is_aux)
+    
+    def collect_nodes(node, depth=0):
+        """First pass: collect all bone/part names and their transforms."""
         jname = node.get("jname") or node.get("pname") or ""
         children = node.get("children") or []
-        indent = "  " * depth
-        
-        # Get the node's own transform (the part's world CFrame)
         node_transform = node.get("transform")
-        
-        # Also check auxTransform - first entry is typically the part itself
         aux_transforms = node.get("auxTransform") or []
         aux_names = node.get("aux") or []
         
-        # Skip root part (HumanoidRootPart) - it conflicts with UpperTorso position
-        # and doesn't need fingerprint matching
         is_root = (depth == 0)
         
-        # Try to match this node's part using its transform (skip root)
-        if jname and node_transform and not is_root:
-            print(f"[RigImport] {indent}Matching node '{jname}' using transform")
-            obj = match_by_position(node_transform, jname)
-            if obj:
-                current_base = _strip_suffix(obj.name)
-                if current_base != jname:
-                    print(f"[RigImport] {indent}  WILL RENAME: '{obj.name}' -> '{jname}'")
-                    pending_renames.append((obj, jname))
-                    matched_count += 1
-                else:
-                    print(f"[RigImport] {indent}  '{jname}' already correctly named")
-                used.add(obj)
-            else:
-                unmatched_names.append(jname)
-        elif is_root:
-            print(f"[RigImport] {indent}Skipping root node '{jname}' (no fingerprint match needed)")
+        if jname and not is_root:
+            nodes_to_match.append((jname, node_transform, False))
         
-        # Also process aux entries if they have names
-        for idx, aux_name in enumerate(aux_names):
-            if not aux_name:
-                continue
-            cf = aux_transforms[idx] if idx < len(aux_transforms) else None
-            if not cf:
-                continue
-            
-            obj = match_by_position(cf, aux_name)
-            if obj:
-                current_base = _strip_suffix(obj.name)
-                if current_base != aux_name:
-                    print(f"[RigImport] {indent}  AUX WILL RENAME: '{obj.name}' -> '{aux_name}'")
-                    pending_renames.append((obj, aux_name))
-                    matched_count += 1
-                used.add(obj)
+        if not is_root:
+            for idx, aux_name in enumerate(aux_names):
+                if aux_name:
+                    cf = aux_transforms[idx] if idx < len(aux_transforms) else None
+                    nodes_to_match.append((aux_name, cf, True))
         
         for child in children:
-            walk(child, depth + 1)
-
-    walk(rig_def)
+            collect_nodes(child, depth + 1)
+    
+    collect_nodes(rig_def)
+    print(f"[RigImport] Collected {len(nodes_to_match)} nodes to match")
+    
+    # Check if meshes already have names matching the rig bones
+    # If so, use name-based matching. If not, use position-based matching.
+    meshes_with_rig_names = 0
+    for obj in mesh_objects:
+        base_name = _strip_suffix(obj.name).lower()
+        if base_name in all_rig_names:
+            meshes_with_rig_names += 1
+    
+    use_name_matching = meshes_with_rig_names > 0
+    print(f"[RigImport] Found {meshes_with_rig_names} meshes with rig bone names - using {'NAME' if use_name_matching else 'POSITION'} matching")
+    
+    for target_name, transform, is_aux in nodes_to_match:
+        obj = None
+        prefix = "AUX " if is_aux else ""
+        
+        if use_name_matching:
+            # Use name matching
+            obj = match_by_name(target_name)
+            if obj:
+                print(f"[RigImport] {prefix}'{target_name}' matched by NAME -> '{obj.name}'")
+        else:
+            # Use position matching
+            if transform:
+                obj = match_by_position(transform, target_name)
+                if obj:
+                    print(f"[RigImport] {prefix}'{target_name}' matched by POSITION -> '{obj.name}'")
+        
+        if obj:
+            current_base = _strip_suffix(obj.name)
+            if current_base != target_name:
+                pending_renames.append((obj, target_name))
+                matched_count += 1
+            used.add(obj)
+        else:
+            unmatched_names.append(target_name)
     
     # Two-pass rename to avoid name collisions (e.g., Handle2->Handle1 when Handle1 exists)
     # Pass 1: Rename all to temporary unique names

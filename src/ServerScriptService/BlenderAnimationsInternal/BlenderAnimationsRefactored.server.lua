@@ -80,16 +80,9 @@ local services = {
 }
 
 local function cleanupAll()
-	-- 1. Stop running processes (mirror setRig pattern: background stop, then foreground stop)
-	local currentAnimator = State.activeAnimator
-	if currentAnimator then
-		playbackService:stopAnimationAndDisconnect({
-			background = true,
-			animatorOverride = currentAnimator,
-		})
-	else
-		playbackService:stopAnimationAndDisconnect()
-	end
+	-- 1. Stop running processes (synchronously so it finishes before unload)
+	playbackService:stopAnimationAndDisconnect( { background = false } )
+	
 	blenderSyncManager:cleanup()
 
 	-- 2. Disconnect UI-related connections
@@ -117,6 +110,7 @@ local function cleanupAll()
 	State.isFinished:set(false)
 	rigManager:clearWarnings()
 end
+
 
 local function cleanupRigSelection()
 	-- This function is a subset of cleanupAll, intended for when a rig is deselected.
@@ -194,8 +188,29 @@ table.insert(
 	end)
 )
 
+-- Prevent autoconnect from continuously retrying on state changes
+local autoConnectAttemptedThisSession = false
+table.insert(
+	State.observers,
+	Observer(State.autoConnectToBlender):onChange(function()
+		if State.autoConnectToBlender:get() and not autoConnectAttemptedThisSession then
+			-- Only allow autoconnect to attempt once per session to prevent continuous retries
+			autoConnectAttemptedThisSession = true
+			blenderSyncManager.autoConnectAttempts = 0 -- Reset for manual attempt
+			task.spawn(function()
+				task.wait(0.5)
+				if blenderSyncManager.autoConnectAttempts < blenderSyncManager.maxAutoConnectAttempts then
+					blenderSyncManager.autoConnectAttempts = (blenderSyncManager.autoConnectAttempts or 0) + 1
+					blenderSyncManager:toggleServerConnection()
+				end
+			end)
+		end
+	end)
+)
+
 do -- Creates the plugin
 	local pluginToolbar = Toolbar({
+		Plugin = Plugin,
 		Name = "Blender Animations",
 	})
 
@@ -217,6 +232,7 @@ do -- Creates the plugin
 	updateToolbarImage()
 	
 	local enableButton = ToolbarButton({
+		Plugin = Plugin,
 		Toolbar = pluginToolbar,
 		ClickableWhenViewportHidden = true,
 		Name = "Open",
@@ -229,6 +245,7 @@ do -- Creates the plugin
 	})
 	
 	local helpButton = ToolbarButton({
+		Plugin = Plugin,
 		Toolbar = pluginToolbar,
 		ClickableWhenViewportHidden = true,
 		Name = "READ!!!",
@@ -251,26 +268,24 @@ do -- Creates the plugin
 
 	-- Handle plugin unloading
 	Plugin.Unloading:Connect(function()
-		-- Run cleanup async so playbackService background stop can finish gracefully
-		task.spawn(function()
-			-- Disconnect observers first to prevent them from firing during cleanup
-			for _, obs in ipairs(State.observers) do
-				obs()
-			end
-			table.clear(State.observers)
+		-- Disconnect observers first to prevent them from firing during cleanup
+		for _, obs in ipairs(State.observers) do
+			obs()
+		end
+		table.clear(State.observers)
 
-			cleanupAll()
+		-- Run cleanup synchronously to ensure stopAnimationAndDisconnect finishes before unload
+		cleanupAll()
 
-			if State.selectionConnection then
-				State.selectionConnection:Disconnect()
-				State.selectionConnection = nil
-			end
+		if State.selectionConnection then
+			State.selectionConnection:Disconnect()
+			State.selectionConnection = nil
+		end
 
-			for _, conn in ipairs(State.connections) do
-				conn:Disconnect()
-			end
-			table.clear(State.connections)
-		end)
+		for _, conn in ipairs(State.connections) do
+			conn:Disconnect()
+		end
+		table.clear(State.connections)
 	end)
 
 	-- Handle widget enabled/disabled
@@ -367,6 +382,12 @@ do -- Creates the plugin
     if State.autoConnectToBlender:get() then
         task.spawn(function()
             task.wait(1) -- Wait a bit for everything to initialize
+            -- Add safeguard to prevent continuous retry attempts
+            blenderSyncManager.autoConnectAttempts = (blenderSyncManager.autoConnectAttempts or 0) + 1
+            if blenderSyncManager.autoConnectAttempts > blenderSyncManager.maxAutoConnectAttempts then
+                warn("Auto-connect to Blender failed after " .. blenderSyncManager.maxAutoConnectAttempts .. " attempts. Giving up.")
+                return
+            end
             blenderSyncManager:toggleServerConnection()
         end)
     end
@@ -538,6 +559,7 @@ do -- Creates the plugin
 	-- Create the main widget
 	local function pluginWidget(tabChildren)
 		return Widget({
+			Plugin = Plugin,
 			Id = game:GetService("HttpService"):GenerateGUID(),
 			Name = "Blender Animations",
 			InitialDockTo = State.dockSide:get(),
@@ -609,6 +631,7 @@ do -- Creates the plugin
 	
 	-- Create the help widget
 	local _helpWidget = Widget({
+		Plugin = Plugin,
 		Id = game:GetService("HttpService"):GenerateGUID(),
 		Name = "IMPORTANT READ ME!!!",
 		InitialDockTo = Enum.InitialDockState.Float,

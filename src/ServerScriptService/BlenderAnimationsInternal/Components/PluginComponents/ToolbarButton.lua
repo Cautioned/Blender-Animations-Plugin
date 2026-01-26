@@ -1,5 +1,4 @@
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
 
 local PluginComponents = script.Parent
 local StudioComponents = PluginComponents.Parent:FindFirstChild("StudioComponents")
@@ -17,6 +16,7 @@ local COMPONENT_ONLY_PROPERTIES = {
 	"Image",
 	"Toolbar",
 	"Active",
+	"Plugin",
 }
 
 type ToolbarProperties = {
@@ -25,10 +25,14 @@ type ToolbarProperties = {
 	ToolTip: string,
 	Image: string,
 	Name: string,
+	Plugin: Plugin,
 	[any]: any,
 }
 
 return function(props: ToolbarProperties)
+	local PluginInstance = props.Plugin
+	assert(PluginInstance, "ToolbarButton requires a 'Plugin' property to be passed")
+	
 	local toolbarButton = props.Toolbar:CreateButton(
 		props.Name,
 		props.ToolTip,
@@ -38,7 +42,7 @@ return function(props: ToolbarProperties)
 	if props.Active~=nil then
 		toolbarButton:SetActive(unwrap(props.Active))
 		if unwrap(props.Active)~=props.Active then
-			Plugin.Unloading:Connect(Observer(props.Active):onChange(function()
+			PluginInstance.Unloading:Connect(Observer(props.Active):onChange(function()
 				toolbarButton:SetActive(unwrap(props.Active, false))
 			end))
 		end

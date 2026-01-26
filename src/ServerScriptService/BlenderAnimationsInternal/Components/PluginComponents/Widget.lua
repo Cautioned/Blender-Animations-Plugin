@@ -1,5 +1,4 @@
-local Plugin = script:FindFirstAncestorWhichIsA("Plugin")
-local Fusion = require(Plugin:FindFirstChild("Fusion", true))
+local Fusion = require(script:FindFirstAncestor("BlenderAnimationsInternal").Packages.Fusion)
 
 local Hydrate = Fusion.Hydrate
 
@@ -21,11 +20,15 @@ type PluginGuiProperties = {
 	ForceInitialEnabled: boolean,
 	FloatingSize: Vector2,
 	MinimumSize: Vector2,
+	Plugin: Plugin, -- Required: the plugin instance
 	[any]: any,
 }
 
-return function(props: PluginGuiProperties)	
-	local newWidget = Plugin:CreateDockWidgetPluginGui(
+return function(props: PluginGuiProperties)
+	local PluginInstance = props.Plugin
+	assert(PluginInstance, "Widget requires a 'Plugin' property to be passed")
+	
+	local newWidget = PluginInstance:CreateDockWidgetPluginGui(
 		props.Id, 
 		DockWidgetPluginGuiInfo.new(
 			if typeof(props.InitialDockTo) == "string" then Enum.InitialDockState[props.InitialDockTo] else props.InitialDockTo,

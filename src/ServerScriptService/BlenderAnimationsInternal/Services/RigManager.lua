@@ -86,69 +86,133 @@ function RigManager:rebuildBoneWeights()
 
 	if hasAnimatedBones then
 		bonesToShow = {}
-		-- To avoid a full traversal to build a parent map, we can do a post-order traversal
-		-- to determine which nodes are ancestors of an enabled node.
-		local function findEnabledAndMarkAncestors(bone, depth)
-			if depth > EXTREME_DEPTH_LIMIT then -- Prevent stack overflow
-				warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", bone.part.Name)
-				return false
-			end
-			
-			local isOrHasEnabledDescendant = bone.enabled
-			for _, child in ipairs(bone.children) do
-				if findEnabledAndMarkAncestors(child, depth + 1) then
-					isOrHasEnabledDescendant = true
+		-- Iterative post-order traversal with cycle guard
+		local stack = { { node = State.activeRig.root, depth = 0, visited = false } }
+		local visited = {}
+		local hasEnabled: { [any]: boolean } = {}
+		local processed = 0
+		while #stack > 0 do
+			local current = stack[#stack]
+			stack[#stack] = nil
+			local node = current.node
+			local depth = current.depth
+			if current.visited then
+				local isOrHasEnabledDescendant = node.enabled
+				for _, child in ipairs(node.children) do
+					if hasEnabled[child] then
+						isOrHasEnabledDescendant = true
+					end
+				end
+				if isOrHasEnabledDescendant then
+					bonesToShow[node] = true
+				end
+				hasEnabled[node] = isOrHasEnabledDescendant
+			else
+				if visited[node] then
+					continue
+				end
+				visited[node] = true
+				processed += 1
+				if processed > EXTREME_DEPTH_LIMIT * 8 then
+					warn("Bone traversal exceeded safe node count; stopping at:", node.part.Name)
+					break
+				end
+				if depth > EXTREME_DEPTH_LIMIT then
+					warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", node.part.Name)
+					continue
+				end
+				-- Post-order: push marker, then children
+				stack[#stack + 1] = { node = node, depth = depth, visited = true }
+				for _, child in ipairs(node.children) do
+					stack[#stack + 1] = { node = child, depth = depth + 1, visited = false }
 				end
 			end
-			if isOrHasEnabledDescendant then
-				bonesToShow[bone] = true
-			end
-			return isOrHasEnabledDescendant
 		end
-		findEnabledAndMarkAncestors(State.activeRig.root, 0)
 	end
 
 	-- Build the list for the UI with a single traversal
 	local boneList: Types.BoneWeightsList = {}
 	local exportBoneList: Types.ExportBoneWeightsList = {}
-	local function buildBoneListRecursive(parent, depth)
-		if depth > EXTREME_DEPTH_LIMIT then -- Prevent stack overflow
-			warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", parent.part.Name)
-			return
-		end
-		
-		for _, child in ipairs(parent.children) do
-			if not hasAnimatedBones or (bonesToShow and bonesToShow[child]) then
-				table.insert(boneList, {
-					name = child.part.Name,
-					enabled = child.enabled,
-					depth = depth,
-					parentName = parent.part.Name,
-				})
-				buildBoneListRecursive(child, depth + 1)
+	local function buildBoneListIterative(root)
+		local stack = { { node = root, depth = 0 } }
+		local visited = {}
+		local processed = 0
+		while #stack > 0 do
+			local current = stack[#stack]
+			stack[#stack] = nil
+			local node = current.node
+			local depth = current.depth
+			if visited[node] then
+				continue
+			end
+			visited[node] = true
+			processed += 1
+			if processed > EXTREME_DEPTH_LIMIT * 8 then
+				warn("Bone traversal exceeded safe node count; stopping at:", node.part.Name)
+				break
+			end
+			if depth > EXTREME_DEPTH_LIMIT then
+				warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", node.part.Name)
+				continue
+			end
+			for _, child in ipairs(node.children) do
+				if child.jointType == "Weld" or child.jointType == "WeldConstraint" then
+					-- Skip welds in bone toggles
+					continue
+				end
+				if not hasAnimatedBones or (bonesToShow and bonesToShow[child]) then
+					table.insert(boneList, {
+						name = child.part.Name,
+						enabled = child.enabled,
+						depth = depth,
+						parentName = node.part.Name,
+					})
+				end
+				stack[#stack + 1] = { node = child, depth = depth + 1 }
 			end
 		end
 	end
 
-	local function buildExportBoneListRecursive(parent, depth)
-		if depth > EXTREME_DEPTH_LIMIT then -- Prevent stack overflow
-			warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", parent.part.Name)
-			return
-		end
-		
-		for _, child in ipairs(parent.children) do
-			table.insert(exportBoneList, {
-				name = child.part.Name,
-				enabled = child.exportEnabled ~= false,
-				depth = depth,
-				parentName = parent.part.Name,
-			})
-			buildExportBoneListRecursive(child, depth + 1)
+	local function buildExportBoneListIterative(root)
+		local stack = { { node = root, depth = 0 } }
+		local visited = {}
+		local processed = 0
+		while #stack > 0 do
+			local current = stack[#stack]
+			stack[#stack] = nil
+			local node = current.node
+			local depth = current.depth
+			if visited[node] then
+				continue
+			end
+			visited[node] = true
+			processed += 1
+			if processed > EXTREME_DEPTH_LIMIT * 8 then
+				warn("Export bone traversal exceeded safe node count; stopping at:", node.part.Name)
+				break
+			end
+			if depth > EXTREME_DEPTH_LIMIT then
+				warn("Bone hierarchy too deep (>", EXTREME_DEPTH_LIMIT, " levels), stopping traversal at:", node.part.Name)
+				continue
+			end
+			for _, child in ipairs(node.children) do
+				if child.jointType == "Weld" or child.jointType == "WeldConstraint" then
+					-- Skip welds in export toggles
+					continue
+				end
+				table.insert(exportBoneList, {
+					name = child.part.Name,
+					enabled = child.exportEnabled ~= false,
+					depth = depth,
+					parentName = node.part.Name,
+				})
+				stack[#stack + 1] = { node = child, depth = depth + 1 }
+			end
 		end
 	end
 
-	buildBoneListRecursive(State.activeRig.root, 0)
-	buildExportBoneListRecursive(State.activeRig.root, 0)
+	buildBoneListIterative(State.activeRig.root)
+	buildExportBoneListIterative(State.activeRig.root)
 	self.boneWeights = boneList
 	State.boneWeights:set(boneList)
 	State.exportBoneWeights:set(exportBoneList)
