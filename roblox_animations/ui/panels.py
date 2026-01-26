@@ -298,8 +298,6 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         # dev_box.label(text="Developer Options", icon='SCRIPT')
         # dev_box.separator()
         # dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
-        
-        # dev_box.prop(scene, "force_deform_bone_serialization", text="Force Deform Serialization")
 
         # --- Validation Sub-panel ---
         validation_box = inner_box.box()

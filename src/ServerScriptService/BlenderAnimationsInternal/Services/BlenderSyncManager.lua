@@ -19,36 +19,46 @@ function BlenderSyncManager.new(playbackService: any, animationManager: any)
 	self.blenderConnectionService = BlenderConnection.new(game:GetService("HttpService")) :: any
 	self.liveSyncCoroutine = nil :: thread?
 	self.periodicRefreshCoroutine = nil :: thread?
+	self.autoConnectAttempts = 0
+	self.maxAutoConnectAttempts = 3
+	self.autoConnectLastAttemptTime = 0
+	self.autoConnectCooldown = 5 -- seconds between retry attempts
 	
 	return self
 end
 
 function BlenderSyncManager:updateAvailableArmatures()
-	local armatures = self.blenderConnectionService:ListArmatures(State.serverPort:get())
+	local status, result = pcall(function()
+		return self.blenderConnectionService:ListArmatures(State.serverPort:get())
+	end)
 
-	if armatures then
-		State.availableArmatures:set(armatures)
-		State.serverStatus:set("Connected")
-		print("Auto-refreshed armatures:", #armatures, "found")
-		
-		-- Auto-select if there's only one armature and none is currently selected
-		if #armatures == 1 and not State.selectedArmature:get() then
-			State.selectedArmature:set(armatures[1])
-			print("Auto-selected single armature:", armatures[1].name)
-			
-			-- Auto-start live sync if enabled and there's only one armature
-			if State.liveSyncEnabled:get() and State.isServerConnected:get() then
-				print("Auto-starting live sync for single armature:", armatures[1].name)
-				self:startLiveSyncing()
-			end
-		end
-		
-		return true
-	else
+	if not status or not result then
 		State.availableArmatures:set({})
 		State.serverStatus:set("Disconnected")
+		if not status then
+			warn("Error listing armatures:", result)
+		end
 		return false
 	end
+
+	local armatures = result
+	State.availableArmatures:set(armatures)
+	State.serverStatus:set("Connected")
+	print("Auto-refreshed armatures:", #armatures, "found")
+	
+	-- Auto-select if there's only one armature and none is currently selected
+	if #armatures == 1 and not State.selectedArmature:get() then
+		State.selectedArmature:set(armatures[1])
+		print("Auto-selected single armature:", armatures[1].name)
+		
+		-- Auto-start live sync if enabled and there's only one armature
+		if State.liveSyncEnabled:get() and State.isServerConnected:get() then
+			print("Auto-starting live sync for single armature:", armatures[1].name)
+			self:startLiveSyncing()
+		end
+	end
+	
+	return true
 end
 
 function BlenderSyncManager:importAnimationFromBlender()
@@ -136,6 +146,8 @@ function BlenderSyncManager:startLiveSyncing()
 		local armatureRefreshInterval = 5.0  -- Refresh armatures every 5 seconds
 		local failureCount = 0
 		local maxFailuresBeforeStop = 5
+		local consecutiveCrashCount = 0
+		local maxConsecutiveCrashes = 10
 		
 		while State.liveSyncEnabled:get() do
 			-- Skip polling if widget is not enabled to reduce performance impact
@@ -143,6 +155,14 @@ function BlenderSyncManager:startLiveSyncing()
 				task.wait(1) -- Wait longer when widget is hidden
 				continue
 			end
+			
+			-- Check if we've had too many consecutive crashes
+			if consecutiveCrashCount >= maxConsecutiveCrashes then
+				warn("Live sync had too many consecutive errors. Stopping to prevent instability.")
+				self:cleanupServerConnection()
+				break
+			end
+			
 			local isConnected = State.isServerConnected:get()
 			local selectedArmature = State.selectedArmature:get()
 
@@ -151,7 +171,14 @@ function BlenderSyncManager:startLiveSyncing()
 				local currentTime = tick()
 				if currentTime - lastArmatureRefresh > armatureRefreshInterval then
 					print("Auto-refreshing armatures...")
-					self:updateAvailableArmatures()
+					local refreshSuccess = pcall(function()
+						self:updateAvailableArmatures()
+					end)
+					if not refreshSuccess then
+						consecutiveCrashCount += 1
+					else
+						consecutiveCrashCount = 0
+					end
 					lastArmatureRefresh = currentTime
 				end
 				
@@ -170,6 +197,7 @@ function BlenderSyncManager:startLiveSyncing()
 
 					if not status then
 						failureCount += 1
+						consecutiveCrashCount += 1
 						if State.serverStatus:get() ~= "Live Sync: Connection lost" then
 							State.serverStatus:set("Live Sync: Connection lost")
 						end
@@ -182,16 +210,23 @@ function BlenderSyncManager:startLiveSyncing()
 						end
 					else
 						failureCount = 0
+						consecutiveCrashCount = 0
 						if State.serverStatus:get() == "Live Sync: Connection lost" then
 							State.serverStatus:set("Connected") -- Restore status
 						end
 						
 						if (err :: any) and (err :: any).has_update then
-							self:importAnimationFromBlender()
-							State.lastKnownBlenderAnimHash:set((err :: any).hash)
-							-- Reset to fast polling when changes detected
-							pollInterval = 0.033
-							noChangeCount = 0
+							local importSuccess = pcall(function()
+								self:importAnimationFromBlender()
+							end)
+							if importSuccess then
+								State.lastKnownBlenderAnimHash:set((err :: any).hash)
+								-- Reset to fast polling when changes detected
+								pollInterval = 0.033
+								noChangeCount = 0
+							else
+								consecutiveCrashCount += 1
+							end
 						else
 							-- No changes detected, gradually increase polling interval
 							noChangeCount += 1
@@ -230,6 +265,7 @@ function BlenderSyncManager:toggleServerConnection()
 			self:cleanupServerConnection()
 		else
 			print("Successfully connected to Blender server")
+			self.autoConnectAttempts = 0 -- Reset attempts on success
 		end
 	else
 		self:cleanupServerConnection()

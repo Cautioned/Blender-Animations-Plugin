@@ -32,6 +32,7 @@ type BuildState = {
 	maxDepth: number?,
 	path: { Instance },
 	pathSet: { [Instance]: boolean },
+	visitedAll: { [Instance]: boolean },
 }
 
 local function formatCycle(state: BuildState, repeated: Instance)
@@ -58,11 +59,16 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 				maxDepth = MAX_MOTOR6D_DEPTH,
 				path = {},
 				pathSet = {},
+				visitedAll = {},
 			}
 	end
 
 	local state = buildState
-	if state then
+	local trackCycle = (connectingJoint == nil) or (connectingJoint:IsA("Motor6D"))
+	if state and state.visitedAll[part] then
+		return nil
+	end
+	if state and trackCycle then
 		local nextDepth = (state.depth or 0) + 1
 		local maxDepth = state.maxDepth or MAX_MOTOR6D_DEPTH
 		if nextDepth > maxDepth then
@@ -100,6 +106,9 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 
 	rig.bonesByInstance = rig.bonesByInstance or {}
 	rig.bonesByInstance[part] = self
+	if state then
+		state.visitedAll[part] = true
+	end
 	
 	-- Debug print to check part type
 	
@@ -111,16 +120,10 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 			self.jointType = "Bone"
 			-- print("Setting bone for", part.Name)
 		else
-			-- Traditional Motor6D joint
+			-- Traditional joint (Motor6D/Weld/WeldConstraint)
 			local joint: Instance? = connectingJoint
-			if joint and not joint:IsA("Motor6D") then
-				joint = nil
-			end
 			if not joint and rig._jointCache and rig._jointCache[part] then
 				for _, candidate in ipairs(rig._jointCache[part]) do
-					if not candidate:IsA("Motor6D") then
-						continue
-					end
 					if candidate.Part0 == parent.part and candidate.Part1 == part then
 						joint = candidate
 						break
@@ -143,11 +146,8 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 		end
 	end
 
-	-- Always look for joint-connected children (Motor6D only)
+	-- Always look for joint-connected children (Motor6D/Weld/WeldConstraint)
 	for _, joint in pairs(rig._jointCache[part] or {}) do
-		if not joint:IsA("Motor6D") then
-			continue
-		end
 		if joint.Part0 and joint.Part1 then
 			local subpart
 			if joint.Part0 == part then
@@ -156,7 +156,10 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 				subpart = joint.Part0
 			end
 			if subpart and (not parent or subpart ~= parent.part) then
-				table.insert(self.children, RigPart.new(rig, subpart, self, isDeformRig, joint, state))
+				local child = RigPart.new(rig, subpart, self, isDeformRig, joint, state)
+				if child then
+					table.insert(self.children, child)
+				end
 			end
 		end
 	end
@@ -193,7 +196,7 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 		end
 	end
 
-	if state then
+	if state and trackCycle then
 		state.depth = state.depth - 1
 		state.pathSet[part] = nil
 		state.path[#state.path] = nil
@@ -230,6 +233,51 @@ function RigPart:PoseToRobloxAnimation(t)
 	local pose = Instance.new("Pose")
 	pose.Name = part.Name
 	pose.Weight = enabled and 1 or 0
+
+	-- If we have children but no pose at this time, we need to fill in a value
+	-- so Roblox doesn't interpolate to identity. The approach depends on easing:
+	-- - Constant: hold the previous keyframe's value
+	-- - Linear/other: interpolate between previous and next keyframes
+	if not poseToApply and #childrenPoses > 0 then
+		-- Find previous and next keyframes
+		local prevTime, nextTime = nil, nil
+		for poseTime, _ in pairs(poses) do
+			if poseTime < t then
+				if prevTime == nil or poseTime > prevTime then
+					prevTime = poseTime
+				end
+			end
+			if poseTime > t then
+				if nextTime == nil or poseTime < nextTime then
+					nextTime = poseTime
+				end
+			end
+		end
+
+		local prevPose = prevTime and poses[prevTime] or nil
+		local nextPose = nextTime and poses[nextTime] or nil
+
+		-- Determine easing style from the previous keyframe (that's what controls interpolation TO next)
+		local easingStyle = prevPose and prevPose.easingStyle or "Linear"
+
+		if easingStyle == "Constant" then
+			-- For Constant, just hold the previous pose
+			poseToApply = prevPose or nextPose
+		elseif prevPose and nextPose and prevTime ~= nil and nextTime ~= nil then
+			-- For Linear (and others), interpolate between prev and next
+			local alpha = (t - prevTime) / (nextTime - prevTime)
+			local interpCFrame = prevPose.transform:Lerp(nextPose.transform, alpha)
+			-- Create a synthetic pose with the interpolated value
+			poseToApply = {
+				transform = interpCFrame,
+				easingStyle = easingStyle,
+				easingDirection = prevPose.easingDirection or "Out",
+			}
+		else
+			-- Fallback: use whichever keyframe we have
+			poseToApply = prevPose or nextPose
+		end
+	end
 
 	if poseToApply then
 		local transform = poseToApply.transform
@@ -306,7 +354,7 @@ function RigPart:ApplyPose(t)
 	end
 end
 
-function RigPart:FindAuxParts()
+function RigPart:FindAuxPartsLegacy()
 	-- For Bone objects, we don't need to find auxiliary parts
 	local bone = self.bone
 	if bone then
@@ -314,15 +362,13 @@ function RigPart:FindAuxParts()
 	end
 
 	local part = self.part
-	local rig = self.rig
-	local model = rig.model
-	local primaryJoint = self.joint
+	local model = self.rig.model
 
 	local jointSet = {}
 	for _, joint in ipairs(model:GetDescendants()) do
-		local isSupportedAux = (joint:IsA("JointInstance") and not joint:IsA("Motor6D")) or joint:IsA("WeldConstraint")
-		if isSupportedAux and (((joint :: any).Part0 == part) or ((joint :: any).Part1 == part)) then
-			if primaryJoint == nil or joint ~= primaryJoint then
+		local asJoint = joint :: any
+		if joint:IsA("JointInstance") and not joint:IsA("Motor6D") then
+			if asJoint.Part0 == part or asJoint.Part1 == part then
 				table.insert(jointSet, joint)
 			end
 		end
@@ -330,19 +376,29 @@ function RigPart:FindAuxParts()
 
 	local instSet = {}
 	for i, joint in pairs(jointSet) do
-		instSet[i] = joint.Part0 == part and joint.Part1 or joint.Part0
+		local asJoint = joint :: any
+		instSet[i] = asJoint.Part0 == part and asJoint.Part1 or asJoint.Part0
 	end
 	instSet[#instSet + 1] = part
 
 	return instSet
 end
 
-function RigPart:Encode(handledParts)
+function RigPart:Encode(handledParts, opts)
 	if self.exportEnabled == false then
 		return nil
 	end
 
 	handledParts = handledParts or {}
+	opts = opts or {}
+	local exportWelds = opts.exportWelds == true
+	
+	-- Skip parts connected by Weld/WeldConstraint when exportWelds is disabled
+	local joint = self.joint
+	if not exportWelds and joint and (joint:IsA("Weld") or joint:IsA("WeldConstraint")) then
+		return nil
+	end
+
 	local part = self.part
 	handledParts[part] = true
 
@@ -356,15 +412,17 @@ function RigPart:Encode(handledParts)
 		auxTransform = {},
 	}
 
-	local auxInsts = self:FindAuxParts()
-	for i = 1, #auxInsts do
-		local auxInst = auxInsts[i]
-		elem.aux[i] = auxInst
-		local cframe = nil
-		if auxInst:IsA("BasePart") then
-			cframe = auxInst.CFrame
+	-- Legacy aux parts export (now controlled by exportWelds since it was used for the same purpose)
+	if exportWelds then
+		local auxInsts = self:FindAuxPartsLegacy()
+		elem.aux = auxInsts
+		for i, auxInst in ipairs(auxInsts) do
+			local cframe = nil
+			if auxInst:IsA("BasePart") then
+				cframe = auxInst.CFrame
+			end
+			elem.auxTransform[i] = cframe and { cframe:GetComponents() } or nil
 		end
-		elem.auxTransform[i] = cframe and { cframe:GetComponents() } or nil
 	end
 
 	local bone = self.bone
@@ -408,7 +466,7 @@ function RigPart:Encode(handledParts)
 		end
 
 		if not handledParts[subrigpart.part] then
-			local encodedChild = (subrigpart :: any):Encode(handledParts)
+			local encodedChild = (subrigpart :: any):Encode(handledParts, opts)
 			if encodedChild then
 				table.insert(elem.children, encodedChild)
 			end

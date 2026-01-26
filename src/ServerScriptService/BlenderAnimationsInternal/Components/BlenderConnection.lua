@@ -15,18 +15,43 @@ BlenderConnection.__index = BlenderConnection
 
 type self = {
 	HttpService: HttpService,
+	_inFlight: { [string]: boolean },
+	_lastRequestTime: { [string]: number },
 }
 
 function BlenderConnection.new(httpService: HttpService)
 	local self: self = {
 		HttpService = httpService,
+		_inFlight = {},
+		_lastRequestTime = {},
 	}
 	return setmetatable(self, BlenderConnection)
+end
+
+function BlenderConnection:_beginRequest(key: string, cooldown: number?): boolean
+	local now = os.clock()
+	local last = self._lastRequestTime[key]
+	if self._inFlight[key] then
+		return false
+	end
+	if cooldown and last and (now - last) < cooldown then
+		return false
+	end
+	self._inFlight[key] = true
+	self._lastRequestTime[key] = now
+	return true
+end
+
+function BlenderConnection:_endRequest(key: string)
+	self._inFlight[key] = nil
 end
 
 function BlenderConnection:ListArmatures(port: number)
 	if type(port) ~= "number" or port <= 0 then
 		warn("Invalid port for ListArmatures")
+		return nil
+	end
+	if not self:_beginRequest("list_armatures", 1.0) then
 		return nil
 	end
 
@@ -38,6 +63,7 @@ function BlenderConnection:ListArmatures(port: number)
 			Compress = Enum.HttpCompression.None,
 		})
 	end)
+	self:_endRequest("list_armatures")
 
 	if not success or not response or not response.Success then
 		warn("Failed to get armatures:", response and response.StatusMessage or response)
@@ -146,6 +172,9 @@ function BlenderConnection:CheckAnimationStatus(port: number, armatureName: stri
 	if type(armatureName) ~= "string" or #armatureName == 0 then
 		return nil
 	end
+	if not self:_beginRequest("animation_status", 0.1) then
+		return nil
+	end
 
 	local success, response = pcall(function()
 		local url = string.format(
@@ -160,6 +189,7 @@ function BlenderConnection:CheckAnimationStatus(port: number, armatureName: stri
 			Compress = Enum.HttpCompression.None,
 		})
 	end)
+	self:_endRequest("animation_status")
 
 	if not success or not response or not response.Success then
 		return nil

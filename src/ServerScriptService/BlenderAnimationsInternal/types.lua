@@ -42,7 +42,7 @@ export type RigType = {
 	root: any,
 	bones: { [string]: any },
 	keyframeNames: { any }?,
-	EncodeRig: (self: RigType) -> any,
+	EncodeRig: (self: RigType, exportWelds: boolean?) -> any,
 	LoadAnimation: (self: RigType, animData: any) -> (),
 	ToRobloxAnimation: (self: RigType) -> KeyframeSequence,
 	isDeformRig: boolean,

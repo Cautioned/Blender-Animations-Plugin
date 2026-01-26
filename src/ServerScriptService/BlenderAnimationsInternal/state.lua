@@ -97,6 +97,7 @@ local State = {
     autoConnectToBlender = Value(false),
     showDebugInfo = Value(true),
     reducedMotion = Value(false),
+    exportWelds = Value(false),
     
     -- Toolbar button image
     toolbarButtonImage = Value("rbxassetid://116041192227009"),

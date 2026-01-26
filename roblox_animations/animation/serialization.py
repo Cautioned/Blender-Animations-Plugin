@@ -755,6 +755,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
         # 4. Single Baking Pass
         collected = []
+        collected_frames: List[int] = []
         # --- OPTIMIZATION: Avoid redundant set/list conversions. ---
         frame_start = ctx.scene.frame_start
         frame_end = ctx.scene.frame_end
@@ -798,10 +799,15 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                 for keyframe_point in fcurve.keyframe_points:
                     frame_idx = int(round(keyframe_point.co.x))
-                    if frame_idx < frame_start or frame_idx > frame_end:
-                        continue
+                    
+                    # Track keyframes within range for sparse emission
+                    if frame_start <= frame_idx <= frame_end:
+                        keyframe_set.add(frame_idx)
 
-                    keyframe_set.add(frame_idx)
+                    # But capture interpolation data even for keys just outside range
+                    # so shifted keys still get correct easing
+                    if frame_idx < frame_start - 1 or frame_idx > frame_end + 1:
+                        continue
 
                     existing = frame_map.get(frame_idx)
                     # Prefer non-constant interpolation over constant when multiple curves share the same frame
@@ -1091,7 +1097,9 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     bone_name in per_bone_interpolation
                     or bone_name in constraint_target_easing
                 )
-                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and frame in keyframe_times
+                # For cyclic bones, we only care about frames where THIS bone has keyframes
+                bone_kfs = per_bone_keyframes.get(bone_name, set())
+                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and frame in bone_kfs
                 if (
                     (bone_keyframes and frame in bone_keyframes)
                     or (constraint_keyframes and frame in constraint_keyframes)
@@ -1114,21 +1122,25 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 is_animated = bone_name in animated_bones
                 bone_keyframes = per_bone_keyframes.get(bone_name)
                 constraint_keyframes = constraint_target_easing.get(bone_name)
-                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and frame in keyframe_times
+                # For cyclic bones, only consider frames where THIS bone has keyframes
+                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and (bone_keyframes and frame in bone_keyframes)
                 is_sparse_key = (
                     (bone_keyframes and frame in bone_keyframes)
                     or (constraint_keyframes and frame in constraint_keyframes)
                     or is_cyclic_key
                 )
 
+                # When full_range is enabled, bake ALL animated bones at start and end frames
+                is_boundary_bake = full_range and is_animated and (frame == frame_start or frame == frame_end)
+
                 # Determine whether this bone should be baked on this frame
                 should_bake = False
 
                 if is_constrained:
                     should_bake = True
-                elif is_animated and is_sparse_key:
+                elif is_boundary_bake:
                     should_bake = True
-                elif is_animated and is_boundary_frame:
+                elif is_animated and is_sparse_key:
                     should_bake = True
                 elif is_animated:
                     # Check whether this frame falls within any BEZIER segment for this bone
@@ -1141,11 +1153,23 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     continue
 
                 # Look up interpolation from pre-cached fcurve data
+                # Check exact frame first, then look for the most recent keyframe before this one
                 interpolation, easing = None, None
                 if bone_name in per_bone_interpolation:
-                    cached = per_bone_interpolation[bone_name].get(frame)
+                    bone_interp_map = per_bone_interpolation[bone_name]
+                    cached = bone_interp_map.get(frame)
                     if cached:
                         interpolation, easing = cached
+                    else:
+                        # Find the most recent keyframe before this frame to get its interpolation
+                        # This handles shifted keys where we're between keyframes
+                        most_recent_frame = None
+                        for kf_frame in bone_interp_map.keys():
+                            if kf_frame < frame:
+                                if most_recent_frame is None or kf_frame > most_recent_frame:
+                                    most_recent_frame = kf_frame
+                        if most_recent_frame is not None:
+                            interpolation, easing = bone_interp_map[most_recent_frame]
 
                 # Respect explicit keyframe interpolation when available. Fall back to Linear only when
                 # Blender does not provide interpolation data (e.g. constraint-only output).
@@ -1262,12 +1286,34 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 time_in_seconds = (frame - frame_start) / fps
                 # Store a copy of the frame state to avoid reuse mutation across frames
                 collected.append({"t": time_in_seconds, "kf": dict(final_kf_state)})
+                collected_frames.append(frame)
                 for baked_bone, state in final_kf_state.items():
                     last_baked_states[baked_bone] = state
 
+        # Ensure we end with a hold keyframe at the final frame to prevent early resets
+        # Only add bones that don't already have a key at the end frame
+        if collected and last_baked_states:
+            last_recorded_frame = collected_frames[-1] if collected_frames else None
+            if last_recorded_frame is None or last_recorded_frame < frame_end:
+                end_time = (frame_end - frame_start) / fps
+                hold_state = {}
+                for baked_bone, state in last_baked_states.items():
+                    # Check if this bone already has a key at the end frame
+                    bone_kfs = per_bone_keyframes.get(baked_bone, set())
+                    if frame_end not in bone_kfs:
+                        # Only add end hold for bones that don't have a key there
+                        hold_state[baked_bone] = [list(state[0]), state[1], state[2]]
+                if hold_state:
+                    collected.append({"t": end_time, "kf": hold_state})
+                    collected_frames.append(frame_end)
+
         # 4.5. Safety sort to ensure keyframes are always ordered correctly
         # This prevents rare floating point precision issues from causing unordered keyframes
-        collected.sort(key=lambda kf: kf["t"])
+        if collected:
+            combined = list(zip(collected, collected_frames))
+            combined.sort(key=lambda item: item[0]["t"])
+            collected = [item[0] for item in combined]
+            collected_frames = [item[1] for item in combined]
 
         # 5. Optimization - remove consecutive duplicate keyframes.
         if len(collected) > 2:
@@ -1290,21 +1336,23 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                 return True
 
-            optimized_kfs = [collected[0]]
+            optimized_entries = [(collected[0], collected_frames[0])]
             for i in range(1, len(collected) - 1):
                 kf_data = collected[i]
-                frame_from_time = int(round(kf_data["t"] * desired_fps + frame_start))
-                is_explicit_key = frame_from_time in keyframe_times
+                frame_idx = collected_frames[i]
+                is_explicit_key = frame_idx in keyframe_times
 
                 if is_explicit_key:
-                    optimized_kfs.append(kf_data)
+                    optimized_entries.append((kf_data, frame_idx))
                     continue
 
-                if not _kf_states_equivalent(optimized_kfs[-1]["kf"], kf_data["kf"]):
-                    optimized_kfs.append(kf_data)
+                prev_kf_state = optimized_entries[-1][0]["kf"]
+                if not _kf_states_equivalent(prev_kf_state, kf_data["kf"]):
+                    optimized_entries.append((kf_data, frame_idx))
 
-            optimized_kfs.append(collected[-1])
-            collected = optimized_kfs
+            optimized_entries.append((collected[-1], collected_frames[-1]))
+            collected = [entry for entry, _ in optimized_entries]
+            collected_frames = [frame for _, frame in optimized_entries]
 
         final_duration = (
             (frame_end - frame_start) / desired_fps if frame_end >= frame_start else 0

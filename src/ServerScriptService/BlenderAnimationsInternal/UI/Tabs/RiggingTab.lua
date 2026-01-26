@@ -1,6 +1,8 @@
 --!native
 --!strict
 --!optimize 2
+local ServerScriptService = game:GetService("ServerScriptService")
+
 
 local State = require(script.Parent.Parent.Parent.state)
 local Fusion = require(script.Parent.Parent.Parent.Packages.Fusion)
@@ -13,6 +15,7 @@ local Value = Fusion.Value
 local Computed = Fusion.Computed
 
 local StudioComponents = script.Parent.Parent.Parent.Components:FindFirstChild("StudioComponents")
+local Label = require(StudioComponents.Label)
 local Button = require(StudioComponents.Button)
 local Checkbox = require(StudioComponents.Checkbox)
 local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
@@ -88,6 +91,10 @@ function RiggingTab.create(services: any)
 						activeHint:set("")
 					end,
 				}) :: any,
+				-- Label{
+				-- 	LayoutOrder = 2,
+				-- 	Text = "Rig building was almost completely fixed and weld support was added, it's highly recommended you update to the latest blender addon and use the legacy export with it."
+				-- },
 				Button({
 					Text = "Clean Meta Parts",
 					Size = UDim2.new(1, 0, 0, 30),
@@ -107,6 +114,14 @@ function RiggingTab.create(services: any)
 					Text = "Center Rig to Origin for Export",
 					OnChange = function(newValue: boolean): nil
 						State.setRigOrigin:set(newValue)
+						return nil
+					end,
+				}) :: any,
+				Checkbox({
+					Value = State.exportWelds,
+					Text = "Export Welds (experimental)",
+					OnChange = function(newValue: boolean): nil
+						State.exportWelds:set(newValue)
 						return nil
 					end,
 				}) :: any,

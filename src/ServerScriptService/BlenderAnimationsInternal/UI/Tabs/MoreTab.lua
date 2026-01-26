@@ -41,7 +41,9 @@ local DONATION_SUPPORTERS = {
 	[116174560] = "#fc0398", -- N4Animation
 	[1129195252] = "#6a71ba", -- Wingboy0
 	[1552097906] = "#e8c5e3", -- megeservice
-	[7180198] = "#7b5bbd" -- ZacAttackk
+	[7180198] = "#7b5bbd", -- ZacAttackk
+	[2038901944] = "#9900ff" -- Aeresei
+
 	
 	
 }
