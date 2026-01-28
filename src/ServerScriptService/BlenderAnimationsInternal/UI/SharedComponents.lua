@@ -16,6 +16,7 @@ local Spring = Fusion.Spring
 
 local StudioComponents = script.Parent.Parent.Components:FindFirstChild("StudioComponents")
 local Label = require(StudioComponents.Label)
+local Checkbox = require(StudioComponents.Checkbox)
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local themeProvider = require(StudioComponentsUtil.themeProvider)
 
@@ -86,8 +87,16 @@ function SharedComponents.createHeaderUI()
 				Font = Enum.Font.SourceSansBold,
 				TextXAlignment = Enum.TextXAlignment.Left,
 			}),
-			Label({
+			Checkbox({
 				LayoutOrder = 2,
+				Value = State.isSelectionLocked,
+				Text = "Lock Rig Selection",
+				OnChange = function(newValue)
+					State.isSelectionLocked:set(newValue)
+				end,
+			}),
+			Label({
+				LayoutOrder = 3,
 				Text = Computed(function()
 					local warnings = State.activeWarnings:get()
 					return table.concat(warnings, "\n")
