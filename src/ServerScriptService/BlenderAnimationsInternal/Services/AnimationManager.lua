@@ -477,6 +477,33 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 
 	applyBoneWeights(kfs)
 
+	-- Extract KeyframeMarkers and keyframe names from the loaded animation
+	local extractedKeyframes = {}
+	for _, keyframe in ipairs(kfs:GetKeyframes()) do
+		-- Check for KeyframeMarkers (Events) using proper Roblox API
+		local markers = keyframe:GetMarkers()
+		for _, marker in ipairs(markers) do
+			table.insert(extractedKeyframes, {
+				name = marker.Name,
+				time = keyframe.Time,
+				value = marker.Value,
+				type = "Event"
+			})
+		end
+		-- Check for keyframe name (Name type)
+		if keyframe.Name ~= "Keyframe" then
+			table.insert(extractedKeyframes, {
+				name = keyframe.Name,
+				time = keyframe.Time,
+				type = "Name"
+			})
+		end
+	end
+	table.sort(extractedKeyframes, function(a, b)
+		return a.time < b.time
+	end)
+	State.keyframeNames:set(extractedKeyframes)
+
 	State.animationData = (kfs:GetKeyframes() :: any) :: { Types.KeyframeType }?
 	State.animationLength:set(Utils.getAnimDuration(State.animationData))
 	
@@ -544,6 +571,49 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 	return true
 end
 
+-- Helper function to add markers from State.keyframeNames to a KeyframeSequence
+local function addMarkersToKeyframeSequence(kfs: KeyframeSequence)
+	local keyframeNames = State.keyframeNames:get()
+	if not keyframeNames or #keyframeNames == 0 then
+		return
+	end
+	
+	local keyframesByTime = {}
+	for _, keyframe in ipairs(kfs:GetKeyframes()) do
+		keyframesByTime[keyframe.Time] = keyframe
+	end
+	
+	local epsilon = 0.0001
+	for _, kfData in ipairs(keyframeNames) do
+		-- Find or create keyframe at this time
+		local targetKeyframe = nil
+		for time, keyframe in pairs(keyframesByTime) do
+			if math.abs(time - kfData.time) < epsilon then
+				targetKeyframe = keyframe
+				break
+			end
+		end
+		
+		-- If no keyframe exists at this time, create one
+		if not targetKeyframe then
+			targetKeyframe = Instance.new("Keyframe")
+			targetKeyframe.Time = kfData.time
+			targetKeyframe.Parent = kfs
+			keyframesByTime[kfData.time] = targetKeyframe
+		end
+		
+		local markerType = kfData.type or "Name"
+		if markerType == "Event" then
+			local marker = Instance.new("KeyframeMarker")
+			marker.Name = kfData.name
+			marker.Value = (kfData.value and kfData.value ~= "") and kfData.value or ""
+			targetKeyframe:AddMarker(marker)
+		else
+			targetKeyframe.Name = kfData.name
+		end
+	end
+end
+
 function AnimationManager:createKeyframeSequenceFromState(): KeyframeSequence?
 	if not State.activeRig then
 		return nil
@@ -574,10 +644,11 @@ function AnimationManager:saveAnimationRig()
 		return
 	end
 
-	-- Prefer the currently loaded/playing sequence (from saved or curve animations) to avoid blank exports.
+	-- Use currentKeyframeSequence for animation data, but add markers from State.keyframeNames
 	local kfs
 	if State.currentKeyframeSequence then
 		kfs = State.currentKeyframeSequence:Clone()
+		addMarkersToKeyframeSequence(kfs)
 	else
 		kfs = self:createKeyframeSequenceFromState()
 	end
@@ -642,8 +713,18 @@ function AnimationManager:saveAnimationFolder(name: string)
 		folder.Name = "Imported Animations Folder"
 		folder.Parent = game.Workspace
 	end
-	assert(State.activeRig)
-	local kfs = State.activeRig:ToRobloxAnimation()
+	
+	-- Use currentKeyframeSequence for animation data, but add markers from State.keyframeNames
+	local kfs
+	if State.currentKeyframeSequence then
+		kfs = State.currentKeyframeSequence:Clone()
+		addMarkersToKeyframeSequence(kfs)
+	else
+		assert(State.activeRig)
+		State.activeRig.keyframeNames = State.keyframeNames:get() :: { any }?
+		kfs = State.activeRig:ToRobloxAnimation()
+	end
+	
 	if State.scaleFactor:get() ~= 1 then
 		kfs = Utils.scaleAnimation(kfs, State.scaleFactor:get()) -- Scale the animation
 	end
@@ -668,7 +749,14 @@ function AnimationManager:uploadAnimation()
 		return
 	end
 
-	local kfs = self:createKeyframeSequenceFromState()
+	-- Use currentKeyframeSequence for animation data, but add markers from State.keyframeNames
+	local kfs
+	if State.currentKeyframeSequence then
+		kfs = State.currentKeyframeSequence:Clone()
+		addMarkersToKeyframeSequence(kfs)
+	else
+		kfs = self:createKeyframeSequenceFromState()
+	end
 	if not kfs then
 		return
 	end

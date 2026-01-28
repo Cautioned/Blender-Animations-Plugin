@@ -20,6 +20,8 @@ local State = {
     activeWarnings = Value({} :: { string }),
     keyframeNames = Value({} :: { Types.KeyframeName }),
     keyframeNameInput = Value("Name"),
+    keyframeValueInput = Value(""),
+    keyframeMarkerType = Value("Event"),
     animationPriorityOptions = { "Action", "Action2", "Action3", "Action4", "Core", "Idle", "Movement" },
 
     isFinished = Value(false),
