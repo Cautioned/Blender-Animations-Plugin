@@ -219,6 +219,11 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 		return
 	end
 
+	-- Sync keyframe names/markers before creating animation (when not using override)
+	if not kfsOverride then
+		self.State.activeRig.keyframeNames = self.State.keyframeNames:get() :: { any }?
+	end
+
 	local kfs = kfsOverride or self.State.activeRig:ToRobloxAnimation()
 	-- only scale if we're creating a new animation from the rig (no kfsOverride)
 	-- if kfsOverride is provided, it's already been scaled by the caller

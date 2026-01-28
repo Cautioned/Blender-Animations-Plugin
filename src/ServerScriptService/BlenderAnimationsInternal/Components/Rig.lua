@@ -12,7 +12,7 @@ type self = {
 	animTime: number,
 	loop: boolean,
 	priority: Enum.AnimationPriority,
-	keyframeNames: { { t: number, name: string } },
+	keyframeNames: { { t: number, name: string, value: string?, type: string? } },
 	bones: { [string]: RigPart.RigPart },
 	bonesByInstance: { [Instance]: RigPart.RigPart },
 	isDeformRig: boolean,
@@ -28,7 +28,7 @@ function Rig.new(model: Model)
 		animTime = 10,
 		loop = true,
 		priority = Enum.AnimationPriority.Action,
-		keyframeNames = {}, -- table with values each in the format: {t = number, name = string}
+		keyframeNames = {}, -- table with values each in the format: {t = number, name = string, value = string?, type = string?}
 		bones = {}, -- Initialize bones property
 		bonesByInstance = {},
 		isDeformRig = false, -- Flag to indicate if this is a deform bone rig
@@ -44,7 +44,7 @@ function Rig.new(model: Model)
 	for _, descendant in ipairs(model:GetDescendants()) do
 		if descendant:IsA("Bone") then
 			table.insert(allBones, descendant)
-		elseif descendant:IsA("Motor6D") or descendant:IsA("Weld") or descendant:IsA("WeldConstraint") then
+		elseif descendant:IsA("Motor6D") or descendant:IsA("Weld") or descendant:IsA("WeldConstraint") or descendant:IsA("AnimationConstraint") then
 			table.insert(allJoints, descendant)
 		end
 	end
@@ -69,7 +69,7 @@ function Rig.new(model: Model)
 	end
 
 	for _, joint in ipairs(allJoints) do
-		if joint:IsA("Motor6D") then
+		if joint:IsA("Motor6D") or joint:IsA("AnimationConstraint") then
 			local parentInst = joint.Parent
 			if parentInst then
 				local nameSet = duplicateGuard[parentInst]
@@ -78,8 +78,8 @@ function Rig.new(model: Model)
 					duplicateGuard[parentInst] = nameSet
 				end
 				if nameSet[joint.Name] then
-					warn("duplicate Motor6D name under same parent detected; ignoring subsequent joint:", parentInst:GetFullName(), joint.Name)
-					-- skip duplicate Motor6D to avoid ambiguity
+					warn("duplicate Motor6D/AnimationConstraint name under same parent detected; ignoring subsequent joint:", parentInst:GetFullName(), joint.Name)
+					-- skip duplicate Motor6D/AnimationConstraint to avoid ambiguity
 				else
 					nameSet[joint.Name] = true
 					addJointToCache(joint)
@@ -118,12 +118,12 @@ function Rig:checkCyclicMotor6D(model: Model)
 	local motor6dGraph: { [BasePart]: { BasePart } } = {}
 	local allParts: { BasePart } = {}
 	
-	-- Collect all motor6d joints and build the graph
+	-- Collect all motor6d and animation constraint joints and build the graph
 	for _, descendant in ipairs(model:GetDescendants()) do
-		if descendant:IsA("Motor6D") then
-			local motor6d = descendant :: Motor6D
-			local part0 = motor6d.Part0
-			local part1 = motor6d.Part1
+		if descendant:IsA("Motor6D") or descendant:IsA("AnimationConstraint") then
+			local joint = descendant :: Motor6D | AnimationConstraint
+			local part0 = joint.Part0
+			local part1 = joint.Part1
 			
 			if part0 and part1 then
 				if not motor6dGraph[part0] then
@@ -173,8 +173,8 @@ function Rig:checkCyclicMotor6D(model: Model)
 				end
 				table.insert(cycleDescription, neighbor.Name) -- Close the cycle
 				
-				error("CIRCULAR MOTOR6D CHAIN DETECTED: " .. table.concat(cycleDescription, " -> ") .. 
-					". This creates an infinite loop that will break rigs. Fix by removing one of the motor6d connections in this chain.")
+				error("CIRCULAR JOINT CHAIN DETECTED: " .. table.concat(cycleDescription, " -> ") .. 
+					". This creates an infinite loop that will break rigs. Fix by removing one of the motor6d/animation constraint connections in this chain.")
 			end
 		end
 		
@@ -563,9 +563,28 @@ function Rig:ToRobloxAnimation()
 		kf.Parent = kfs
 
 		-- This loop handles multiple named keyframes at the exact same time point
-		while keyframeNames[nextKfNameIdx] and keyframeNames[nextKfNameIdx].time <= t do
-			if keyframeNames[nextKfNameIdx].time == t then
-				kf.Name = keyframeNames[nextKfNameIdx].name
+		-- Use epsilon comparison for floating point times
+		local epsilon = 0.0001
+		while keyframeNames[nextKfNameIdx] and keyframeNames[nextKfNameIdx].time <= t + epsilon do
+			local timeDiff = math.abs(keyframeNames[nextKfNameIdx].time - t)
+			if timeDiff < epsilon then
+				local kfData = keyframeNames[nextKfNameIdx]
+				local markerType = kfData.type or "Name"
+				
+				-- If type is "Event", create a KeyframeMarker
+				if markerType == "Event" then
+					local marker = Instance.new("KeyframeMarker")
+					marker.Name = kfData.name
+					if kfData.value and kfData.value ~= "" then
+						marker.Value = kfData.value
+					else
+						marker.Value = ""
+					end
+					kf:AddMarker(marker)
+				else
+					-- Type is "Name", set the keyframe name directly
+					kf.Name = kfData.name
+				end
 			end
 			nextKfNameIdx = nextKfNameIdx + 1
 		end

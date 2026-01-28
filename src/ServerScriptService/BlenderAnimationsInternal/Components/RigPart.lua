@@ -64,7 +64,7 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 	end
 
 	local state = buildState
-	local trackCycle = (connectingJoint == nil) or (connectingJoint:IsA("Motor6D"))
+	local trackCycle = (connectingJoint == nil) or (connectingJoint:IsA("Motor6D")) or (connectingJoint:IsA("AnimationConstraint"))
 	if state and state.visitedAll[part] then
 		return nil
 	end
@@ -120,7 +120,7 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 			self.jointType = "Bone"
 			-- print("Setting bone for", part.Name)
 		else
-			-- Traditional joint (Motor6D/Weld/WeldConstraint)
+			-- Traditional joint (Motor6D/Weld/WeldConstraint/AnimationConstraint)
 			local joint: Instance? = connectingJoint
 			if not joint and rig._jointCache and rig._jointCache[part] then
 				for _, candidate in ipairs(rig._jointCache[part]) do
@@ -328,9 +328,14 @@ function RigPart:ApplyPose(t)
 		local joint = self.joint
 		local enabled = self.enabled
 
-		if bone and enabled then
-			-- For all deform bones, the transform from the addon is the delta to apply directly.
-			bone.Transform = transform
+		if (bone or (joint and joint:IsA("AnimationConstraint"))) and enabled then
+			-- For deform bones and AnimationConstraints, the transform from the addon is applied directly
+			if bone then
+				bone.Transform = transform
+			else
+				-- AnimationConstraint uses Transform property directly like bones
+				(joint :: any).Transform = transform
+			end
 		elseif joint and joint:IsA("Motor6D") and enabled then
 			if self.jointParentIsPart0 then
 				joint.C0 = transform * joint.C1:Inverse()
@@ -338,11 +343,13 @@ function RigPart:ApplyPose(t)
 				joint.C1 = transform * joint.C0
 			end
 		elseif not enabled then
-			-- Debug: log when a bone is disabled
+			-- Debug: log when a bone or joint is disabled
 			if bone then
 				print("Skipping disabled bone:", self.part.Name)
+			elseif joint and joint:IsA("AnimationConstraint") then
+				print("Skipping disabled AnimationConstraint:", self.part.Name)
 			elseif joint and joint:IsA("Motor6D") then
-				print("Skipping disabled motor6d:", self.part.Name)
+				print("Skipping disabled Motor6D:", self.part.Name)
 			end
 		end
 	end
@@ -394,6 +401,7 @@ function RigPart:Encode(handledParts, opts)
 	local exportWelds = opts.exportWelds == true
 	
 	-- Skip parts connected by Weld/WeldConstraint when exportWelds is disabled
+	-- AnimationConstraint is treated like Motor6D and always exported
 	local joint = self.joint
 	if not exportWelds and joint and (joint:IsA("Weld") or joint:IsA("WeldConstraint")) then
 		return nil
@@ -448,6 +456,10 @@ function RigPart:Encode(handledParts, opts)
 			if joint:IsA("Motor6D") or joint:IsA("Weld") then
 				elem.jointtransform0 = { (joint :: any).C0:GetComponents() }
 				elem.jointtransform1 = { (joint :: any).C1:GetComponents() }
+			elseif joint:IsA("AnimationConstraint") then
+				-- For AnimationConstraint, the Transform property acts like C0, C1 is identity
+				elem.jointtransform0 = { (joint :: any).Transform:GetComponents() }
+				elem.jointtransform1 = { CFrame.new():GetComponents() }
 			elseif joint:IsA("WeldConstraint") then
 				local parentToChild = parent.part.CFrame:ToObjectSpace(part.CFrame)
 				elem.jointtransform0 = { parentToChild:GetComponents() }

@@ -60,7 +60,14 @@ local function getBoneIconData(boneName: string)
 	if State.activeRig and State.activeRig.bones then
 		local rigBone = State.activeRig.bones[boneName]
 		if rigBone and rigBone.joint then
-			className = "Motor6D"
+			if rigBone.joint:IsA("Motor6D") then
+				className = "Motor6D"
+			elseif rigBone.joint:IsA("AnimationConstraint") then
+				className = "AnimationConstraint"
+			else
+				-- For other joint types (Weld, WeldConstraint), use Motor6D icon
+				className = "Motor6D"
+			end
 		end
 	end
 

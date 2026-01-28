@@ -65,6 +65,8 @@ export type SavedAnimation = {
 export type KeyframeName = {
 	name: string,
 	time: number,
+	value: string?,
+	type: string?,
 }
 
 export type BoneWeight = {
