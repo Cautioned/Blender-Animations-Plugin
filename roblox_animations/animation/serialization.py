@@ -876,30 +876,55 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         for bone in ao.pose.bones:
             if bone.name in constrained_bones:
                 for constraint in bone.constraints:
-                    if (
+                    # Handle IK constraints where target is the same armature
+                    if constraint.type == "IK" and constraint.chain_count > 0:
+                        target_bones = [bone.name]
+                        current_bone = bone
+                        for _ in range(constraint.chain_count):
+                            if current_bone.parent:
+                                current_bone = current_bone.parent
+                                target_bones.append(current_bone.name)
+                            else:
+                                break
+                        
+                        # Look for IK target bone's keyframes in the current action
+                        subtarget = getattr(constraint, "subtarget", None)
+                        if subtarget and action:
+                            found_fcurves = 0
+                            for fcurve in all_fcurves:
+                                if not fcurve.data_path.startswith("pose.bones"):
+                                    continue
+                                match = bone_name_pattern.search(fcurve.data_path)
+                                if match and match.group(1) == subtarget:
+                                    found_fcurves += 1
+                                    for kp in fcurve.keyframe_points:
+                                        frame_idx = int(round(kp.co.x))
+                                        if frame_start <= frame_idx <= frame_end:
+                                            for target_bone_name in target_bones:
+                                                frame_map = constraint_target_easing.setdefault(
+                                                    target_bone_name, {}
+                                                )
+                                                if frame_idx not in frame_map:
+                                                    frame_map[frame_idx] = (
+                                                        kp.interpolation,
+                                                        kp.easing,
+                                                    )
+                    
+                    # Handle other constraints with external targets
+                    elif (
                         hasattr(constraint, "target")
                         and constraint.target
+                        and constraint.target != ao
                         and constraint.target.animation_data
                         and constraint.target.animation_data.action
                     ):
                         target_action = constraint.target.animation_data.action
                         target_fcurves = get_action_fcurves(target_action)
-                        target_bones: List[str]
-                        if constraint.type == "IK" and constraint.chain_count > 0:
-                            # Apply IK target easing to entire chain
-                            target_bones = [bone.name]
-                            current_bone = bone
-                            for _ in range(constraint.chain_count):
-                                if current_bone.parent:
-                                    current_bone = current_bone.parent
-                                    target_bones.append(current_bone.name)
-                                else:
-                                    break
-                        else:
-                            target_bones = [bone.name]
+                        target_bones = [bone.name]
                         for fcurve in target_fcurves:
                             if (
                                 fcurve.data_path.startswith("pose.bones")
+                                and hasattr(constraint, "subtarget")
                                 and constraint.subtarget
                             ):
                                 match = bone_name_pattern.search(fcurve.data_path)
@@ -916,6 +941,49 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                                                         kp.interpolation,
                                                         kp.easing,
                                                     )
+        
+        # Collect all IK target keyframes as a global easing reference for constrained bones
+        # This handles complex rigs where export bones are indirectly driven through parenting/constraints
+        global_ik_easing: Dict[int, Tuple[str, str]] = {}
+        for bone_frames in constraint_target_easing.values():
+            for frame_idx, easing_data in bone_frames.items():
+                if frame_idx not in global_ik_easing:
+                    global_ik_easing[frame_idx] = easing_data
+
+        # Propagate constraint_target_easing through COPY constraints
+        # If bone A copies from bone B, and B has easing info, A should inherit it
+        copy_constraint_types = {"COPY_TRANSFORMS", "COPY_LOCATION", "COPY_ROTATION", "COPY_SCALE"}
+        
+        # Build a map of copy relationships: bone -> source bone
+        copy_source_map: Dict[str, str] = {}
+        for bone in ao.pose.bones:
+            for constraint in bone.constraints:
+                if constraint.type in copy_constraint_types:
+                    source_bone = getattr(constraint, "subtarget", None)
+                    if source_bone:
+                        copy_source_map[bone.name] = source_bone
+                        break  # take first copy constraint
+        
+        # Now propagate easing through the chain iteratively
+        changed = True
+        iterations = 0
+        max_iterations = 20  # prevent infinite loops
+        while changed and iterations < max_iterations:
+            changed = False
+            iterations += 1
+            for bone_name, source_bone in copy_source_map.items():
+                if bone_name in constraint_target_easing:
+                    continue  # already has easing info
+                if source_bone in constraint_target_easing:
+                    # Inherit easing from source bone
+                    constraint_target_easing[bone_name] = dict(constraint_target_easing[source_bone])
+                    changed = True
+        
+        # For constrained bones that still don't have easing info, apply global IK easing
+        # This handles bones driven indirectly through bone parenting rather than constraints
+        for bone_name in constrained_bones:
+            if bone_name not in constraint_target_easing and global_ik_easing:
+                constraint_target_easing[bone_name] = dict(global_ik_easing)
 
         def _uses_cyclic(fc):
             try:
