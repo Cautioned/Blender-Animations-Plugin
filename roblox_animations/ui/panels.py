@@ -5,6 +5,7 @@ UI panels for the Roblox Animations Blender Addon.
 import bpy
 from ..animation.serialization import is_deform_bone_rig
 from ..server.server import get_server_status
+from ..core.utils import get_object_by_name
 
 
 class OBJECT_PT_RbxAnimations(bpy.types.Panel):
@@ -27,9 +28,11 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         setup_box = layout.box()
         setup_box.label(text="Setup", icon="TOOL_SETTINGS")
 
+        scene_objects = context.scene.objects if context.scene else []
+
         rig_meta_exists = any(
             "RigMeta" in obj and obj.name.startswith("__") and "Meta" in obj.name
-            for obj in bpy.data.objects
+            for obj in scene_objects
         )
 
         # Also check for armatures with Motor6D properties
@@ -39,7 +42,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                 "transform" in bone and "transform1" in bone and "nicetransform" in bone
                 for bone in obj.data.bones
             )
-            for obj in bpy.data.objects
+            for obj in scene_objects
         )
 
         roblox_rig_exists = rig_meta_exists or motor6d_rig_exists
@@ -78,7 +81,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
 
         # --- 3. ARMATURE OPERATIONS ---
         layout.separator()
-        armatures_exist = any(obj.type == "ARMATURE" for obj in bpy.data.objects)
+        armatures_exist = any(obj.type == "ARMATURE" for obj in scene_objects)
 
         # Check if any armatures have Motor6D properties (Roblox rigs)
         any(
@@ -100,7 +103,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         armature_ops_box.prop(settings, "rbx_anim_armature", text="Target")
 
         selected_armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature) if settings else None
         )
 
         inner_box = armature_ops_box.box()
@@ -133,6 +136,14 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         )
         col.operator(
             "object.rbxanims_manualconstraint", text="Manual Constraint Editor"
+        )
+        # Toggle weld bone visibility
+        weld_row = col.row(align=True)
+        weld_row.operator(
+            "object.rbxanims_toggle_weld_bones",
+            text="Hide Weld Bones" if settings.rbx_hide_weld_bones else "Show Weld Bones",
+            icon="HIDE_ON" if settings.rbx_hide_weld_bones else "HIDE_OFF",
+            depress=settings.rbx_hide_weld_bones
         )
         ik_row = col.row(align=True)
         # check if selected bones have IK constraints
@@ -177,11 +188,11 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             obj = context.active_object
             com_enabled = is_com_for_armature(obj) if obj else False
             grid_enabled = is_com_grid_enabled() if com_enabled else False
-        except:
+        except Exception:
             com_enabled = False
             grid_enabled = False
         
-        com_toggle = com_row.operator(
+        com_row.operator(
             "object.rbxanims_toggle_com", 
             text="", 
             icon="HIDE_OFF" if com_enabled else "HIDE_ON",
@@ -204,7 +215,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         
         # --- AutoPhysics Sub-section ---
         col.separator()
-        physics_row = col.row(align=True)
+        col.row(align=True)
         # physics_row.label(text="AutoPhysics:", icon="PHYSICS")
         
         # # Check if AutoPhysics is enabled
@@ -341,13 +352,14 @@ class OBJECT_PT_RbxAnimations_Tool(bpy.types.Panel):
 
         layout.separator()
 
-        armatures_exist = any(obj.type == "ARMATURE" for obj in bpy.data.objects)
+        scene_objects = context.scene.objects if context.scene else []
+        armatures_exist = any(obj.type == "ARMATURE" for obj in scene_objects)
         if not armatures_exist:
             return
 
         layout.prop(settings, "rbx_anim_armature", text="Rig")
         selected_armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature) if settings else None
         )
 
         row = layout.row(align=True)

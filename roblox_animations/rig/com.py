@@ -12,7 +12,7 @@ import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector, Matrix
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, Tuple
 
 # Default bone weights for R15 rigs
 DEFAULT_BONE_WEIGHTS_R15 = {
@@ -357,6 +357,13 @@ _com_data = {
 }
 
 
+def _get_com_shader():
+    try:
+        return gpu.shader.from_builtin('UNIFORM_COLOR')
+    except Exception:
+        return gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+
+
 def _draw_com_callback():
     """OpenGL callback to draw the COM indicator."""
     if not _com_data["enabled"]:
@@ -375,8 +382,7 @@ def _draw_com_callback():
     size = _com_data["size"]
     color = _com_data["color"]
     
-    # Get shader
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    shader = _get_com_shader()
     
     # Draw COM sphere (approximated with lines)
     vertices = []
@@ -624,18 +630,9 @@ def rotate_around_com(
         axis: Rotation axis ('X', 'Y', or 'Z').
         angle: Rotation angle in radians.
     """
-    import mathutils
     
     # Calculate COM
     com = calculate_com(armature)
-    
-    # Create rotation matrix
-    if axis == 'X':
-        rot_matrix = Matrix.Rotation(angle, 4, 'X')
-    elif axis == 'Y':
-        rot_matrix = Matrix.Rotation(angle, 4, 'Y')
-    else:
-        rot_matrix = Matrix.Rotation(angle, 4, 'Z')
     
     # Store original cursor location and pivot
     original_cursor = bpy.context.scene.cursor.location.copy()

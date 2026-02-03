@@ -303,7 +303,7 @@ return function()
 			weld.Parent = torso
 
 			local rig = rig_module.new(mock_rig)
-			local encoded_rig = rig:EncodeRig()
+			local encoded_rig = rig:EncodeRig(true) -- exportWelds=true to include weld-connected parts
 
 			local function findChildByName(node, target)
 				for _, child in ipairs(node.children) do
@@ -589,6 +589,550 @@ return function()
 
 			-- The test passes if we get here without errors
 			expect(success).to.be.ok()
+		end)
+	end)
+
+	describe("Weld Support", function()
+		local weld_rig
+
+		beforeEach(function()
+			weld_rig = Instance.new("Model")
+			weld_rig.Name = "WeldTestRig"
+
+			local hrp = Instance.new("Part")
+			hrp.Name = "HumanoidRootPart"
+			hrp.Size = Vector3.new(2, 2, 1)
+			hrp.CFrame = CFrame.new(0, 5, 0)
+			hrp.Parent = weld_rig
+			weld_rig.PrimaryPart = hrp
+		end)
+
+		afterEach(function()
+			if weld_rig then
+				weld_rig:Destroy()
+			end
+		end)
+
+		describe("Part0/Part1 Directionality", function()
+			it("should correctly traverse weld where Part0 is parent and Part1 is child", function()
+				-- Standard case: Part0 = parent, Part1 = child
+				local child = Instance.new("Part")
+				child.Name = "ChildPart_P0Parent"
+				child.Size = Vector3.new(1, 1, 1)
+				child.CFrame = CFrame.new(0, 6, 0)
+				child.Parent = weld_rig
+
+				local weld = Instance.new("Weld")
+				weld.Name = "StandardWeld"
+				weld.Part0 = weld_rig.PrimaryPart
+				weld.Part1 = child
+				weld.C0 = CFrame.new(0, 1, 0)
+				weld.C1 = CFrame.new()
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				expect(encoded).to.be.ok()
+				expect(encoded.jname).to.equal("HumanoidRootPart")
+				expect(#encoded.children).to.equal(1)
+				expect(encoded.children[1].jname).to.equal("ChildPart_P0Parent")
+				expect(encoded.children[1].jointType).to.equal("Weld")
+			end)
+
+			it("should correctly traverse weld where Part1 is parent and Part0 is child", function()
+				-- Reversed case: Part1 = parent, Part0 = child
+				local child = Instance.new("Part")
+				child.Name = "ChildPart_P1Parent"
+				child.Size = Vector3.new(1, 1, 1)
+				child.CFrame = CFrame.new(0, 6, 0)
+				child.Parent = weld_rig
+
+				local weld = Instance.new("Weld")
+				weld.Name = "ReversedWeld"
+				weld.Part0 = child -- CHILD is Part0
+				weld.Part1 = weld_rig.PrimaryPart -- PARENT is Part1
+				weld.C0 = CFrame.new(0, -1, 0)
+				weld.C1 = CFrame.new()
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				expect(encoded).to.be.ok()
+				expect(encoded.jname).to.equal("HumanoidRootPart")
+				expect(#encoded.children).to.equal(1)
+				-- Should still recognize ChildPart as the child in hierarchy
+				expect(encoded.children[1].jname).to.equal("ChildPart_P1Parent")
+				expect(encoded.children[1].jointType).to.equal("Weld")
+			end)
+
+			it("should handle deeply nested welds with mixed directionality", function()
+				local p1 = Instance.new("Part")
+				p1.Name = "Level1"
+				p1.CFrame = CFrame.new(0, 6, 0)
+				p1.Parent = weld_rig
+
+				local p2 = Instance.new("Part")
+				p2.Name = "Level2"
+				p2.CFrame = CFrame.new(0, 7, 0)
+				p2.Parent = weld_rig
+
+				local p3 = Instance.new("Part")
+				p3.Name = "Level3"
+				p3.CFrame = CFrame.new(0, 8, 0)
+				p3.Parent = weld_rig
+
+				-- HRP -> Level1 (standard)
+				local w1 = Instance.new("Weld")
+				w1.Part0 = weld_rig.PrimaryPart
+				w1.Part1 = p1
+				w1.Parent = weld_rig.PrimaryPart
+
+				-- Level1 -> Level2 (reversed: Part0=child, Part1=parent)
+				local w2 = Instance.new("Weld")
+				w2.Part0 = p2 -- child
+				w2.Part1 = p1 -- parent
+				w2.Parent = p1
+
+				-- Level2 -> Level3 (standard again)
+				local w3 = Instance.new("Weld")
+				w3.Part0 = p2
+				w3.Part1 = p3
+				w3.Parent = p2
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				expect(encoded).to.be.ok()
+				local l1 = encoded.children[1]
+				expect(l1).to.be.ok()
+				expect(l1.jname).to.equal("Level1")
+
+				local l2 = l1.children[1]
+				expect(l2).to.be.ok()
+				expect(l2.jname).to.equal("Level2")
+
+				local l3 = l2.children[1]
+				expect(l3).to.be.ok()
+				expect(l3.jname).to.equal("Level3")
+			end)
+		end)
+
+		describe("Weld vs WeldConstraint", function()
+			it("should handle Weld joint type correctly", function()
+				local child = Instance.new("Part")
+				child.Name = "WeldChild"
+				child.CFrame = CFrame.new(2, 5, 0)
+				child.Parent = weld_rig
+
+				local weld = Instance.new("Weld")
+				weld.Part0 = weld_rig.PrimaryPart
+				weld.Part1 = child
+				weld.C0 = CFrame.new(2, 0, 0)
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local childNode = encoded.children[1]
+				expect(childNode).to.be.ok()
+				expect(childNode.jointType).to.equal("Weld")
+				expect(childNode.jointtransform0).to.be.ok()
+				expect(childNode.jointtransform1).to.be.ok()
+			end)
+
+			it("should handle WeldConstraint joint type correctly", function()
+				local child = Instance.new("Part")
+				child.Name = "WeldConstraintChild"
+				child.CFrame = CFrame.new(2, 5, 0)
+				child.Parent = weld_rig
+
+				local wc = Instance.new("WeldConstraint")
+				wc.Part0 = weld_rig.PrimaryPart
+				wc.Part1 = child
+				wc.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local childNode = encoded.children[1]
+				expect(childNode).to.be.ok()
+				expect(childNode.jointType).to.equal("WeldConstraint")
+				-- WeldConstraint has no C0/C1, so transform is computed from relative CFrames
+				expect(childNode.jointtransform0).to.be.ok()
+			end)
+
+			it("should correctly compute WeldConstraint transform from relative CFrames", function()
+				local child = Instance.new("Part")
+				child.Name = "WCTransformTest"
+				child.CFrame = CFrame.new(3, 7, 2) * CFrame.Angles(0, math.pi/4, 0)
+				child.Parent = weld_rig
+
+				local wc = Instance.new("WeldConstraint")
+				wc.Part0 = weld_rig.PrimaryPart
+				wc.Part1 = child
+				wc.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local childNode = encoded.children[1]
+				expect(childNode).to.be.ok()
+
+				-- Verify the transform components encode the relative offset
+				local t0 = childNode.jointtransform0
+				expect(#t0).to.equal(12)
+
+				-- Reconstruct CFrame and verify it represents parent->child transform
+				local expectedRelative = weld_rig.PrimaryPart.CFrame:ToObjectSpace(child.CFrame)
+				local reconstructed = CFrame.new(t0[1], t0[2], t0[3], t0[4], t0[5], t0[6], t0[7], t0[8], t0[9], t0[10], t0[11], t0[12])
+
+				-- Position should match
+				expect((reconstructed.Position - expectedRelative.Position).Magnitude).to.be.near(0, 0.001)
+			end)
+		end)
+
+		describe("Weld Naming Consistency", function()
+			it("should use Part name not Weld name for jname", function()
+				local child = Instance.new("Part")
+				child.Name = "ActualPartName"
+				child.Parent = weld_rig
+
+				local weld = Instance.new("Weld")
+				weld.Name = "SomeWeldName"
+				weld.Part0 = weld_rig.PrimaryPart
+				weld.Part1 = child
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				expect(encoded.children[1].jname).to.equal("ActualPartName")
+			end)
+
+			it("should handle parts with same name connected by different welds", function()
+				local child1 = Instance.new("Part")
+				child1.Name = "Accessory"
+				child1.CFrame = CFrame.new(1, 5, 0)
+				child1.Parent = weld_rig
+
+				local child2 = Instance.new("Part")
+				child2.Name = "Accessory"
+				child2.CFrame = CFrame.new(-1, 5, 0)
+				child2.Parent = weld_rig
+
+				local w1 = Instance.new("Weld")
+				w1.Name = "AccessoryWeld1"
+				w1.Part0 = weld_rig.PrimaryPart
+				w1.Part1 = child1
+				w1.Parent = weld_rig.PrimaryPart
+
+				local w2 = Instance.new("Weld")
+				w2.Name = "AccessoryWeld2"
+				w2.Part0 = weld_rig.PrimaryPart
+				w2.Part1 = child2
+				w2.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				-- Both children should be present
+				expect(#encoded.children).to.equal(2)
+				-- Both should have the part name
+				local names = {}
+				for _, c in ipairs(encoded.children) do
+					names[c.jname] = (names[c.jname] or 0) + 1
+				end
+				expect(names["Accessory"]).to.equal(2)
+			end)
+
+			it("should preserve weld child naming when Part0/Part1 are reversed", function()
+				-- Setup where we force reversed traversal
+				local parent = Instance.new("Part")
+				parent.Name = "ParentPart"
+				parent.CFrame = CFrame.new(0, 6, 0)
+				parent.Parent = weld_rig
+
+				local child = Instance.new("Part")
+				child.Name = "ChildPart"
+				child.CFrame = CFrame.new(0, 7, 0)
+				child.Parent = weld_rig
+
+				-- Connect HRP to parent normally
+				local m1 = Instance.new("Motor6D")
+				m1.Part0 = weld_rig.PrimaryPart
+				m1.Part1 = parent
+				m1.Parent = weld_rig.PrimaryPart
+
+				-- Connect child to parent with REVERSED weld (Part0=child, Part1=parent)
+				local w = Instance.new("Weld")
+				w.Part0 = child -- Child is Part0!
+				w.Part1 = parent
+				w.Parent = parent
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local parentNode = encoded.children[1]
+				expect(parentNode.jname).to.equal("ParentPart")
+				expect(#parentNode.children).to.equal(1)
+				expect(parentNode.children[1].jname).to.equal("ChildPart")
+			end)
+		end)
+
+		describe("Transform Encoding Accuracy", function()
+			it("should encode Weld C0/C1 transforms correctly", function()
+				local child = Instance.new("Part")
+				child.Name = "TransformTestPart"
+				child.CFrame = CFrame.new(5, 10, 3)
+				child.Parent = weld_rig
+
+				local expectedC0 = CFrame.new(1, 2, 3) * CFrame.Angles(0, math.pi/2, 0)
+				local expectedC1 = CFrame.new(0.5, 0.5, 0.5)
+
+				local weld = Instance.new("Weld")
+				weld.Part0 = weld_rig.PrimaryPart
+				weld.Part1 = child
+				weld.C0 = expectedC0
+				weld.C1 = expectedC1
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local childNode = encoded.children[1]
+				expect(childNode.jointtransform0).to.be.ok()
+				expect(childNode.jointtransform1).to.be.ok()
+
+				-- Reconstruct and verify
+				local t0 = childNode.jointtransform0
+				local t1 = childNode.jointtransform1
+				local reconstructedC0 = CFrame.new(t0[1], t0[2], t0[3], t0[4], t0[5], t0[6], t0[7], t0[8], t0[9], t0[10], t0[11], t0[12])
+				local reconstructedC1 = CFrame.new(t1[1], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9], t1[10], t1[11], t1[12])
+
+				-- Verify positions match
+				expect((reconstructedC0.Position - expectedC0.Position).Magnitude).to.be.near(0, 0.001)
+				expect((reconstructedC1.Position - expectedC1.Position).Magnitude).to.be.near(0, 0.001)
+			end)
+
+			it("should handle identity transforms", function()
+				local child = Instance.new("Part")
+				child.Name = "IdentityTest"
+				child.CFrame = weld_rig.PrimaryPart.CFrame -- Same position
+				child.Parent = weld_rig
+
+				local weld = Instance.new("Weld")
+				weld.Part0 = weld_rig.PrimaryPart
+				weld.Part1 = child
+				weld.C0 = CFrame.new()
+				weld.C1 = CFrame.new()
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local childNode = encoded.children[1]
+				local t0 = childNode.jointtransform0
+
+				-- Identity should have position (0,0,0) and rotation matrix = identity
+				expect(math.abs(t0[1])).to.be.near(0, 0.001) -- X
+				expect(math.abs(t0[2])).to.be.near(0, 0.001) -- Y
+				expect(math.abs(t0[3])).to.be.near(0, 0.001) -- Z
+			end)
+
+			it("should correctly track jointParentIsPart0 flag", function()
+				-- Test standard direction
+				local child1 = Instance.new("Part")
+				child1.Name = "StandardDir"
+				child1.Parent = weld_rig
+
+				local w1 = Instance.new("Weld")
+				w1.Part0 = weld_rig.PrimaryPart
+				w1.Part1 = child1
+				w1.Parent = weld_rig.PrimaryPart
+
+				-- Test reversed direction
+				local child2 = Instance.new("Part")
+				child2.Name = "ReversedDir"
+				child2.Parent = weld_rig
+
+				local w2 = Instance.new("Weld")
+				w2.Part0 = child2 -- Child is Part0
+				w2.Part1 = weld_rig.PrimaryPart
+				w2.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+
+				-- Check the internal flag
+				local standardPart = rig:FindRigPart("StandardDir")
+				local reversedPart = rig:FindRigPart("ReversedDir")
+
+				expect(standardPart).to.be.ok()
+				expect(reversedPart).to.be.ok()
+				expect(standardPart.jointParentIsPart0).to.equal(true)
+				expect(reversedPart.jointParentIsPart0).to.equal(false)
+			end)
+
+			it("should normalize C0/C1 when joint direction is reversed", function()
+				-- Create a reversed weld (Part0=child, Part1=parent)
+				local child = Instance.new("Part")
+				child.Name = "ReversedC0C1Test"
+				child.CFrame = CFrame.new(0, 7, 0)
+				child.Parent = weld_rig
+
+				local parentOffset = CFrame.new(0, 2, 0) * CFrame.Angles(0, math.pi/4, 0)
+				local childOffset = CFrame.new(0, 0.5, 0)
+
+				local weld = Instance.new("Weld")
+				weld.Part0 = child -- CHILD is Part0
+				weld.Part1 = weld_rig.PrimaryPart -- PARENT is Part1
+				-- When reversed: C0 is child-relative, C1 is parent-relative
+				weld.C0 = childOffset
+				weld.C1 = parentOffset
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				local childNode = encoded.children[1]
+				expect(childNode).to.be.ok()
+
+				-- After normalization:
+				-- jointtransform0 should be the PARENT-relative offset (was C1)
+				-- jointtransform1 should be the CHILD-relative offset (was C0)
+				local t0 = childNode.jointtransform0
+				local t1 = childNode.jointtransform1
+
+				local reconstructedT0 = CFrame.new(t0[1], t0[2], t0[3], t0[4], t0[5], t0[6], t0[7], t0[8], t0[9], t0[10], t0[11], t0[12])
+				local reconstructedT1 = CFrame.new(t1[1], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9], t1[10], t1[11], t1[12])
+
+				-- t0 should match parentOffset (C1)
+				expect((reconstructedT0.Position - parentOffset.Position).Magnitude).to.be.near(0, 0.001)
+				-- t1 should match childOffset (C0)
+				expect((reconstructedT1.Position - childOffset.Position).Magnitude).to.be.near(0, 0.001)
+			end)
+
+			it("should produce same semantic result for standard and reversed welds with same geometry", function()
+				-- Two identical geometric setups, one standard, one reversed
+				local child1 = Instance.new("Part")
+				child1.Name = "StandardGeom"
+				child1.CFrame = CFrame.new(3, 5, 0)
+				child1.Parent = weld_rig
+
+				local child2 = Instance.new("Part")
+				child2.Name = "ReversedGeom"
+				child2.CFrame = CFrame.new(-3, 5, 0)
+				child2.Parent = weld_rig
+
+				-- Standard: Part0=HRP (parent), Part1=child
+				local w1 = Instance.new("Weld")
+				w1.Part0 = weld_rig.PrimaryPart
+				w1.Part1 = child1
+				w1.C0 = CFrame.new(3, 0, 0)
+				w1.C1 = CFrame.new()
+				w1.Parent = weld_rig.PrimaryPart
+
+				-- Reversed but geometrically equivalent offset
+				local w2 = Instance.new("Weld")
+				w2.Part0 = child2 -- CHILD is Part0
+				w2.Part1 = weld_rig.PrimaryPart -- PARENT is Part1
+				w2.C0 = CFrame.new() -- child-relative
+				w2.C1 = CFrame.new(-3, 0, 0) -- parent-relative
+				w2.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+				local encoded = rig:EncodeRig(true)
+
+				-- Find both children
+				local standard, reversed = nil, nil
+				for _, c in ipairs(encoded.children) do
+					if c.jname == "StandardGeom" then standard = c end
+					if c.jname == "ReversedGeom" then reversed = c end
+				end
+
+				expect(standard).to.be.ok()
+				expect(reversed).to.be.ok()
+
+				-- Both should have jointtransform0 representing parent->joint offset
+				-- The X offset magnitude should be 3 in both cases
+				local s0 = standard.jointtransform0
+				local r0 = reversed.jointtransform0
+
+				expect(math.abs(s0[1])).to.be.near(3, 0.001)
+				expect(math.abs(r0[1])).to.be.near(3, 0.001)
+			end)
+		end)
+
+		describe("exportWelds Flag", function()
+			it("should exclude welds when exportWelds is false", function()
+				local child = Instance.new("Part")
+				child.Name = "WeldedPart"
+				child.Parent = weld_rig
+
+				local weld = Instance.new("Weld")
+				weld.Part0 = weld_rig.PrimaryPart
+				weld.Part1 = child
+				weld.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+
+				-- Without exportWelds
+				local encodedNoWelds = rig:EncodeRig(false)
+				expect(#encodedNoWelds.children).to.equal(0)
+
+				-- With exportWelds
+				local encodedWithWelds = rig:EncodeRig(true)
+				expect(#encodedWithWelds.children).to.equal(1)
+			end)
+
+			it("should include Motor6Ds regardless of exportWelds flag", function()
+				local child = Instance.new("Part")
+				child.Name = "Motor6DPart"
+				child.Parent = weld_rig
+
+				local motor = Instance.new("Motor6D")
+				motor.Part0 = weld_rig.PrimaryPart
+				motor.Part1 = child
+				motor.Parent = weld_rig.PrimaryPart
+
+				local rig = rig_module.new(weld_rig)
+
+				local encodedNoWelds = rig:EncodeRig(false)
+				local encodedWithWelds = rig:EncodeRig(true)
+
+				-- Motor6D should be included in both cases
+				expect(#encodedNoWelds.children).to.equal(1)
+				expect(#encodedWithWelds.children).to.equal(1)
+			end)
+
+			it("should handle mixed Motor6D and Weld hierarchies with exportWelds=false", function()
+				local motorChild = Instance.new("Part")
+				motorChild.Name = "MotorPart"
+				motorChild.Parent = weld_rig
+
+				local weldChild = Instance.new("Part")
+				weldChild.Name = "WeldPart"
+				weldChild.Parent = weld_rig
+
+				local motor = Instance.new("Motor6D")
+				motor.Part0 = weld_rig.PrimaryPart
+				motor.Part1 = motorChild
+				motor.Parent = weld_rig.PrimaryPart
+
+				local weld = Instance.new("Weld")
+				weld.Part0 = motorChild
+				weld.Part1 = weldChild
+				weld.Parent = motorChild
+
+				local rig = rig_module.new(weld_rig)
+
+				-- exportWelds=false should skip the weld subtree
+				local encoded = rig:EncodeRig(false)
+				expect(#encoded.children).to.equal(1)
+				expect(encoded.children[1].jname).to.equal("MotorPart")
+				expect(#encoded.children[1].children).to.equal(0)
+			end)
 		end)
 	end)
 end 

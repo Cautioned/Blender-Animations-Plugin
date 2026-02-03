@@ -454,8 +454,19 @@ function RigPart:Encode(handledParts, opts)
 		local joint = self.joint
 		if parent and joint then
 			if joint:IsA("Motor6D") or joint:IsA("Weld") then
-				elem.jointtransform0 = { (joint :: any).C0:GetComponents() }
-				elem.jointtransform1 = { (joint :: any).C1:GetComponents() }
+				-- IMPORTANT: Normalize C0/C1 based on joint direction.
+				-- jointtransform0 should always be relative to the PARENT part.
+				-- jointtransform1 should always be relative to the CHILD part.
+				-- When jointParentIsPart0=true: Part0=parent, Part1=child -> C0 is parent-relative, C1 is child-relative (standard)
+				-- When jointParentIsPart0=false: Part0=child, Part1=parent -> C0 is child-relative, C1 is parent-relative (swapped)
+				if self.jointParentIsPart0 then
+					elem.jointtransform0 = { (joint :: any).C0:GetComponents() }
+					elem.jointtransform1 = { (joint :: any).C1:GetComponents() }
+				else
+					-- Swap: C1 becomes jointtransform0 (parent-relative), C0 becomes jointtransform1 (child-relative)
+					elem.jointtransform0 = { (joint :: any).C1:GetComponents() }
+					elem.jointtransform1 = { (joint :: any).C0:GetComponents() }
+				end
 			elseif joint:IsA("AnimationConstraint") then
 				-- For AnimationConstraint, the Transform property acts like C0, C1 is identity
 				elem.jointtransform0 = { (joint :: any).Transform:GetComponents() }

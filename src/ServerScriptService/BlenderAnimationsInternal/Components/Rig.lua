@@ -373,7 +373,21 @@ function Rig:LoadAnimation(data)
 	
 	local isDeformRig = self.isDeformRig
 
-	self.animTime = data.t
+	local exportInfo = data.export_info
+	local timeScale = 1
+	if type(exportInfo) == "table" then
+		local timeUnit = exportInfo.time_unit
+		if timeUnit == "frames" then
+			local fps = tonumber(exportInfo.fps)
+			if fps and fps > 0 then
+				timeScale = 1 / fps
+			else
+				warn("Animation export_info.time_unit is 'frames' but export_info.fps is missing/invalid.")
+			end
+		end
+	end
+
+	self.animTime = data.t * timeScale
 
 	-- Check if this is a deform rig animation
 	if data.is_deform_rig then
@@ -421,8 +435,10 @@ function Rig:LoadAnimation(data)
 			continue
 		end
 
+		local kfTime = kfdef.t * timeScale
+
 		if not kfdef.kf or type(kfdef.kf) ~= "table" then
-			warn("Skipping keyframe with invalid pose data at time " .. kfdef.t)
+			warn("Skipping keyframe with invalid pose data at time " .. kfTime)
 			continue
 		end
 
@@ -461,14 +477,14 @@ function Rig:LoadAnimation(data)
 
 				-- Validate CFrame data
 				if type(cfc) ~= "table" or #cfc < 12 then
-					warn("Invalid CFrame data for part " .. partName .. " at time " .. kfdef.t)
+					warn("Invalid CFrame data for part " .. partName .. " at time " .. kfTime)
 					continue
 				end
 
 				-- Ensure all CFrame values are numbers
 				for i = 1, 12 do
 					if type(cfc[i]) ~= "number" then
-						warn("Non-numeric value in CFrame for part " .. partName .. " at time " .. kfdef.t)
+						warn("Non-numeric value in CFrame for part " .. partName .. " at time " .. kfTime)
 						cfc[i] = tonumber(cfc[i]) or 0
 					end
 				end
@@ -503,7 +519,7 @@ function Rig:LoadAnimation(data)
 					cfc[4 + axis], cfc[7 + axis], cfc[10 + axis] = x, y, z
 				end
 
-				rigPart:AddPose(kfdef.t, CFrame.new(unpack(cfc)), isDeformBone, easingStyle, easingDirection)
+				rigPart:AddPose(kfTime, CFrame.new(unpack(cfc)), isDeformBone, easingStyle, easingDirection)
 			end
 		end
 	end

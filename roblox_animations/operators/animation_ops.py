@@ -16,7 +16,7 @@ from ..animation.import_export import (
     copy_anim_state,
     apply_ao_transform,
 )
-from ..core.utils import get_scene_fps, set_scene_fps
+from ..core.utils import get_scene_fps, set_scene_fps, get_object_by_name, object_exists
 
 
 class OBJECT_OT_ApplyTransform(bpy.types.Operator):
@@ -28,7 +28,7 @@ class OBJECT_OT_ApplyTransform(bpy.types.Operator):
     def poll(cls, context):
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         armature_name = settings.rbx_anim_armature if settings else None
-        grig = bpy.data.objects.get(armature_name)
+        grig = get_object_by_name(armature_name)
         return (
             grig
             and bpy.context.active_object
@@ -54,7 +54,7 @@ class OBJECT_OT_MapKeyframes(bpy.types.Operator):
     def poll(cls, context):
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         armature_name = settings.rbx_anim_armature if settings else None
-        grig = bpy.data.objects.get(armature_name)
+        grig = get_object_by_name(armature_name)
         return grig and bpy.context.active_object and bpy.context.active_object != grig
 
     def execute(self, context):
@@ -66,7 +66,8 @@ class OBJECT_OT_MapKeyframes(bpy.types.Operator):
 
         ao_imp = bpy.context.view_layer.objects.active
 
-        err_mappings = get_mapping_error_bones(bpy.data.objects[armature_name], ao_imp)
+        src_armature = get_object_by_name(armature_name)
+        err_mappings = get_mapping_error_bones(src_armature, ao_imp)
         if len(err_mappings) > 0:
             self.report(
                 {"ERROR"},
@@ -78,7 +79,7 @@ class OBJECT_OT_MapKeyframes(bpy.types.Operator):
 
         prepare_for_kf_map()
 
-        copy_anim_state(bpy.data.objects[armature_name], ao_imp)
+        copy_anim_state(src_armature, ao_imp)
 
         return {"FINISHED"}
 
@@ -94,8 +95,8 @@ class OBJECT_OT_Bake(bpy.types.Operator):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
         return (
-            arm_name in bpy.data.objects
-            and bpy.data.objects[arm_name].type == "ARMATURE"
+            object_exists(arm_name, context.scene)
+            and get_object_by_name(arm_name, context.scene).type == "ARMATURE"
         )
 
     def execute(self, context):
@@ -105,7 +106,7 @@ class OBJECT_OT_Bake(bpy.types.Operator):
 
             settings = getattr(context.scene, "rbx_anim_settings", None)
             armature_name = settings.rbx_anim_armature if settings else None
-            ao = bpy.data.objects[armature_name]
+            ao = get_object_by_name(armature_name)
 
             if ao.type != "ARMATURE":
                 self.report(
@@ -165,8 +166,8 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
         return (
-            arm_name in bpy.data.objects
-            and bpy.data.objects[arm_name].type == "ARMATURE"
+            object_exists(arm_name, context.scene)
+            and get_object_by_name(arm_name, context.scene).type == "ARMATURE"
         )
 
     def execute(self, context):
@@ -177,8 +178,8 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
             # Try to use the selected armature first
             settings = getattr(context.scene, "rbx_anim_settings", None)
             arm_name = settings.rbx_anim_armature if settings else None
-            if arm_name and arm_name in bpy.data.objects:
-                armature = bpy.data.objects[arm_name]
+            if arm_name and object_exists(arm_name, context.scene):
+                armature = get_object_by_name(arm_name, context.scene)
                 # Set as active object to ensure serialize() uses it
                 bpy.context.view_layer.objects.active = armature
             else:

@@ -285,7 +285,7 @@ def get_timeline_hash():
 
 def get_armature_timeline_hash(armature_name):
     """Get combined hash of action and timeline for an armature"""
-    obj = bpy.data.objects.get(armature_name)
+    obj = get_object_by_name(armature_name)
     if not obj or obj.type != "ARMATURE":
         return ""
 
@@ -400,19 +400,19 @@ def to_matrix(value):
             # Assume list of lists (4x4)
             try:
                 return Matrix(tuple(tuple(row) for row in value))
-            except:
+            except Exception:
                 pass
         elif len(value) == 16:
             # Assume flat list
             try:
                 return Matrix([value[i:i+4] for i in range(0, 16, 4)])
-            except:
+            except Exception:
                 pass
         elif len(value) == 12:
              # Assume CFrame list
             try:
                 return cf_to_mat(value)
-            except:
+            except Exception:
                 pass
                 
     return Matrix.Identity(4)
@@ -497,6 +497,28 @@ def get_unique_name(base_name):
         counter += 1
         new_name = f"{base_name}.{counter:03d}"
     return new_name
+
+
+def get_object_by_name(name, scene=None):
+    if not name:
+        return None
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene and hasattr(scene, "objects"):
+        return scene.objects.get(name)
+    return None
+
+
+def object_exists(name, scene=None):
+    return get_object_by_name(name, scene) is not None
+
+
+def iter_scene_objects(scene=None):
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene and hasattr(scene, "objects"):
+        return scene.objects
+    return []
 
 
 def find_master_collection_for_object(obj):

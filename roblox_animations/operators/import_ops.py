@@ -7,7 +7,7 @@ import base64
 import re
 import bpy
 from bpy_extras.io_utils import ImportHelper
-from ..core.utils import get_unique_name
+from ..core.utils import get_unique_name, get_object_by_name, iter_scene_objects
 from ..core.utils import cf_to_mat
 from ..core.constants import get_transform_to_blender
 from ..rig.creation import autoname_parts, get_unique_collection_name
@@ -15,6 +15,135 @@ from ..rig.creation import autoname_parts, get_unique_collection_name
 
 def _strip_suffix(name: str) -> str:
     return re.sub(r"\.\d+$", "", name or "")
+
+
+def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
+    """Rename parts by matching size fingerprints. O(n) via bucket hashing."""
+    import bmesh
+    from collections import defaultdict
+    
+    part_aux_list = meta_loaded.get("partAux")
+    if not part_aux_list:
+        return 0
+
+    rig_name = meta_loaded.get("rigName", "Rig")
+    num_targets = len(part_aux_list)
+    print(f"[RigImport] Fingerprint matching {num_targets} targets...")
+    
+    # Pre-process targets
+    fp_targets = []
+    for item in part_aux_list:
+        if not item or "idx" not in item:
+            continue
+        
+        idx = item["idx"]
+        target_name = item.get("name", f"{rig_name}{idx}")
+        
+        dims = item.get("dims_fp")
+        if dims and len(dims) == 3:
+            sorted_dims = tuple(sorted([float(x) for x in dims]))
+            fp_targets.append({
+                "target": target_name,
+                "dims": sorted_dims,
+                "sig": sum(sorted_dims),
+            })
+        elif "vol_fp" in item:
+            vol = float(item["vol_fp"])
+            fp_targets.append({
+                "target": target_name,
+                "dims": (vol,),
+                "sig": vol,
+            })
+
+    if not fp_targets:
+        return 0
+
+    BUCKET_QUANTUM = 0.1
+    mesh_objects = [o for o in parts_collection.objects if o.type == "MESH"]
+    
+    candidate_buckets = defaultdict(list)
+    all_candidates = []
+    
+    for obj in mesh_objects:
+        d = obj.dimensions
+        sorted_dims = tuple(sorted([d.x, d.y, d.z]))
+        sig = sum(sorted_dims)
+        bucket_key = round(sig / BUCKET_QUANTUM)
+        
+        cand = {
+            "obj": obj,
+            "dims": sorted_dims,
+            "sig": sig,
+            "bucket": bucket_key,
+            "used": False,
+        }
+        all_candidates.append(cand)
+        candidate_buckets[bucket_key].append(cand)
+    
+    def get_nearby_candidates(sig):
+        bucket = round(sig / BUCKET_QUANTUM)
+        for b in [bucket - 1, bucket, bucket + 1]:
+            for c in candidate_buckets.get(b, []):
+                if not c["used"]:
+                    yield c
+    
+    fingerprint_object_map = {}
+    renamed_count = 0
+    rejected_count = 0
+    MAX_ACCEPTABLE_DIFF = 0.15
+    
+    for target in fp_targets:
+        target_dims = target["dims"]
+        target_sig = target["sig"]
+        is_vol_mode = len(target_dims) == 1
+        
+        best_cand = None
+        best_diff = float('inf')
+        
+        for cand in get_nearby_candidates(target_sig):
+            if is_vol_mode:
+                # Volume mode - need to calc mesh volume lazily
+                if "vol" not in cand:
+                    bm = bmesh.new()
+                    try:
+                        bm.from_mesh(cand["obj"].data)
+                        cand["vol"] = abs(bm.calc_volume())
+                    except Exception:
+                        d = cand["dims"]
+                        cand["vol"] = d[0] * d[1] * d[2]
+                    finally:
+                        bm.free()
+                diff = abs(target_dims[0] - cand["vol"])
+            else:
+                # Dims mode - direct comparison
+                diff = sum(abs(a - b) for a, b in zip(target_dims, cand["dims"]))
+            
+            if diff < best_diff:
+                best_diff = diff
+                best_cand = cand
+        
+        if best_cand and best_diff <= MAX_ACCEPTABLE_DIFF:
+            obj = best_cand["obj"]
+            obj.name = target["target"]
+            best_cand["used"] = True
+            renamed_count += 1
+            fingerprint_object_map[target["target"]] = obj
+        elif best_cand:
+            rejected_count += 1
+    
+    print(f"[RigImport] Fingerprinting: {renamed_count} matched, {rejected_count} rejected")
+    
+    meta_loaded["_fingerprint_object_map"] = fingerprint_object_map
+    return renamed_count
+            
+    print(f"[RigImport] Size fingerprinting resolved {renamed_count} parts.")
+    print(f"[RigImport] Fingerprint map has {len(fingerprint_object_map)} entries")
+    
+    # Store the map on the metadata so create_rig can use it
+    meta_loaded["_fingerprint_object_map"] = fingerprint_object_map
+    
+    return renamed_count
+
 
 
 def _get_mesh_world_center(obj):
@@ -46,7 +175,7 @@ def _fingerprint_position(loc, precision=2) -> str:
     return f"{round(loc.x, precision)},{round(loc.y, precision)},{round(loc.z, precision)}"
 
 
-def _rename_parts_by_fingerprint(rig_def, parts_collection):
+def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerprint=0, fingerprint_object_map=None):
     """Rename meshes using transform position matching from rig metadata.
     
     Uses name matching first, then fingerprint matching, then falls back to nearest-neighbor.
@@ -111,7 +240,9 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
     # Log fingerprint index stats
     print(f"[RigImport] Position index sizes: p2={len(position_index_p2)}, p1={len(position_index_p1)}, p0={len(position_index_p0)}")
     
-    def is_reserved_name(obj, target_name):
+    fingerprinted_objects = set(fingerprint_object_map.values()) if fingerprint_object_map else set()
+
+    def is_reserved_name(obj, target_name, allow_override=False):
         """Check if obj's current name matches a rig bone name (other than target_name).
         
         This prevents position matching from stealing meshes that are already correctly
@@ -121,6 +252,8 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
         # If the mesh is already named for a rig bone, and it's not the bone we're looking for,
         # don't allow position matching to steal it
         if base_name in all_rig_names and base_name != target_name.lower():
+            if allow_override and obj not in fingerprinted_objects:
+                return False
             return True
         return False
     
@@ -149,7 +282,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
             return available[0]
         return None
     
-    def match_by_position(cf, target_name):
+    def match_by_position(cf, target_name, allow_reserved_override=False):
         """Try to match by position fingerprint only - no fuzzy fallback.
         
         Only matches if the mesh is at the EXACT expected position (within 0.01 units).
@@ -170,11 +303,17 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
         fp = _fingerprint_position(expected_loc, 2)
         candidates = position_index_p2.get(fp, [])
         # Filter out used meshes AND meshes reserved for other bone names
-        available = [o for o in candidates if o not in used and not is_reserved_name(o, target_name)]
+        available = [o for o in candidates if o not in used and not is_reserved_name(o, target_name, allow_reserved_override)]
         if available:
             print(f"[RigImport]   '{target_name}' MATCHED at position fp='{fp}' -> '{available[0].name}'")
             return available[0]
         
+        # Fallback: nearest unused with tight tolerance
+        nearest, dist = find_nearest_unused(expected_loc, target_name, max_distance=0.02)
+        if nearest:
+            print(f"[RigImport]   '{target_name}' MATCHED by proximity ({dist:.4f}) -> '{nearest.name}'")
+            return nearest
+
         print(f"[RigImport]   '{target_name}' NO POSITION MATCH at ({expected_loc.x:.4f}, {expected_loc.y:.4f}, {expected_loc.z:.4f})")
         return None
 
@@ -213,13 +352,23 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
     # Check if meshes already have names matching the rig bones
     # If so, use name-based matching. If not, use position-based matching.
     meshes_with_rig_names = 0
-    for obj in mesh_objects:
-        base_name = _strip_suffix(obj.name).lower()
-        if base_name in all_rig_names:
-            meshes_with_rig_names += 1
+    # for obj in mesh_objects:
+    #     base_name = _strip_suffix(obj.name).lower()
+    #     if base_name in all_rig_names:
+    #         meshes_with_rig_names += 1
     
-    use_name_matching = meshes_with_rig_names > 0
-    print(f"[RigImport] Found {meshes_with_rig_names} meshes with rig bone names - using {'NAME' if use_name_matching else 'POSITION'} matching")
+    # Force use of rename map if fingerprints were used
+    # If we successfully renamed parts via fingerprints, we should trust those names
+    if renamed_via_fingerprint > 0:
+        use_name_matching = True
+        print("[RigImport] Fingerprinting successful - running NAME matching on corrected parts")
+    else:
+        for obj in mesh_objects:
+            base_name = _strip_suffix(obj.name).lower()
+            if base_name in all_rig_names:
+                meshes_with_rig_names += 1
+        use_name_matching = meshes_with_rig_names > 0
+        print(f"[RigImport] Found {meshes_with_rig_names} meshes with rig bone names - using {'NAME' if use_name_matching else 'POSITION'} matching")
     
     for target_name, transform, is_aux in nodes_to_match:
         obj = None
@@ -230,6 +379,10 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
             obj = match_by_name(target_name)
             if obj:
                 print(f"[RigImport] {prefix}'{target_name}' matched by NAME -> '{obj.name}'")
+            elif transform:
+                obj = match_by_position(transform, target_name, allow_reserved_override=True)
+                if obj:
+                    print(f"[RigImport] {prefix}'{target_name}' matched by POSITION -> '{obj.name}'")
         else:
             # Use position matching
             if transform:
@@ -260,11 +413,11 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection):
         print(f"[RigImport]   RENAME: '{temp_names[i][1]}' -> '{target_name}'")
         obj.name = target_name
     
-    print(f"[RigImport] " + "="*50)
+    print("[RigImport] " + "="*50)
     print(f"[RigImport] SUMMARY: {matched_count} parts renamed, {len(unmatched_names)} unmatched")
     if unmatched_names:
         print(f"[RigImport] Unmatched parts: {unmatched_names}")
-    print(f"[RigImport] " + "="*50)
+    print("[RigImport] " + "="*50)
     
     return matched_count > 0
 
@@ -306,7 +459,7 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         # Do not clear objects
-        objnames_before_import = {obj.name for obj in bpy.data.objects}
+        objnames_before_import = {obj.name for obj in iter_scene_objects(context.scene)}
         if bpy.app.version >= (5, 0, 0):
             bpy.ops.wm.obj_import(
                 filepath=self.properties.filepath,
@@ -326,7 +479,7 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
 
         # Get the actual newly imported OBJECTS
         imported_objs = [
-            obj for obj in bpy.data.objects if obj.name not in objnames_before_import
+            obj for obj in iter_scene_objects(context.scene) if obj.name not in objnames_before_import
         ]
 
         # Extract meta...
@@ -334,7 +487,8 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
         partial = {}
         meta_objs_to_delete = []
         for obj in imported_objs:
-            match = re.search(r"^Meta(\d+)q1(.*?)q1\d*(\.\d+)?$", obj.name)
+            # Case-insensitive match for Meta part names (Roblox/OBJ idiosyncrasies)
+            match = re.search(r"^meta(\d+)q1(.*?)q1\d*(\.\d+)?$", obj.name, re.IGNORECASE)
             if match:
                 partial[int(match.group(1))] = match.group(2)
                 meta_objs_to_delete.append(obj)
@@ -424,8 +578,15 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                         coll.objects.unlink(obj)
                     parts_collection.objects.link(obj)
 
-            # Try to restore correct names using transform fingerprints.
-            _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection)
+            renamed_via_fp = _rename_parts_by_size_fingerprint(meta_loaded, parts_collection)
+            
+            fp_map = meta_loaded.get("_fingerprint_object_map", {})
+            if fp_map:
+                fp_map_names = {k: v.name for k, v in fp_map.items()}
+                ob["_FingerprintMap"] = json.dumps(fp_map_names)
+                print(f"[RigImport] Stored {len(fp_map_names)} authoritative part mappings")
+            
+            _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection, renamed_via_fp, fp_map)
 
             # Optional legacy fallback: if fingerprinting didn't rename, try autoname using provided parts list.
             parts_payload = meta_loaded.get("parts")
@@ -474,7 +635,7 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
     def poll(cls, context):
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         armature_name = settings.rbx_anim_armature if settings else None
-        return bpy.data.objects.get(armature_name)
+        return get_object_by_name(armature_name)
 
     def execute(self, context):
         from ..animation.import_export import (
@@ -490,7 +651,7 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
         armature_name = settings.rbx_anim_armature if settings else None
         
         # Get target armature early to fail fast
-        armature = bpy.data.objects.get(armature_name)
+        armature = get_object_by_name(armature_name)
         if not armature:
             self.report(
                 {"ERROR"},
@@ -504,22 +665,22 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
             self.report({"INFO"}, "Created new keying set for animation import.")
 
         # Import and keep track of what is imported (use set for faster lookup)
-        objnames_before_import = {obj.name for obj in bpy.data.objects}
+        objnames_before_import = {obj.name for obj in iter_scene_objects(context.scene)}
         bpy.ops.import_scene.fbx(filepath=self.properties.filepath)
         objnames_imported = [
-            obj.name for obj in bpy.data.objects if obj.name not in objnames_before_import
+            obj.name for obj in iter_scene_objects(context.scene) if obj.name not in objnames_before_import
         ]
 
         def clear_imported():
             """Clean up all objects imported from the FBX file."""
             for obj_name in objnames_imported:
-                obj = bpy.data.objects.get(obj_name)
+                obj = get_object_by_name(obj_name)
                 if obj:
                     bpy.data.objects.remove(obj)
 
         # Check that there's exactly 1 armature in the imported file
         armatures_imported = [
-            obj for obj in bpy.data.objects
+            obj for obj in iter_scene_objects(context.scene)
             if obj.type == "ARMATURE" and obj.name in objnames_imported
         ]
         if len(armatures_imported) == 0:

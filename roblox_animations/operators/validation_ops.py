@@ -15,7 +15,7 @@ from mathutils import Vector
 from typing import Dict, List, Tuple, Set
 
 from ..animation.serialization import is_deform_bone_rig
-from ..core.utils import get_scene_fps
+from ..core.utils import get_scene_fps, get_object_by_name
 import math
 
 
@@ -91,7 +91,7 @@ def _draw_motionpath_violations():
     global _armature_name_for_cache
     if arm_name != _armature_name_for_cache or not _bone_color_cache:
         _bone_color_cache.clear()
-        arm = bpy.data.objects.get(arm_name)
+        arm = get_object_by_name(arm_name)
         if arm and arm.type == "ARMATURE":
             for pb in arm.pose.bones:
                 _bone_color_cache[pb.name] = _get_bone_display_color(pb)
@@ -150,7 +150,7 @@ def _draw_motionpath_keyframes():
     for bone_name, pts in points_by_bone.items():
         settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
-        arm = bpy.data.objects.get(arm_name)
+        arm = get_object_by_name(arm_name)
         pbone = arm.pose.bones.get(bone_name) if arm else None
         color = (1.0, 1.0, 1.0, 1.0)
         if pbone is not None:
@@ -378,7 +378,7 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
     def poll(cls, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
-        obj = bpy.data.objects.get(arm_name)
+        obj = get_object_by_name(arm_name)
         return bool(obj and obj.type == "ARMATURE")
 
     def execute(self, context):
@@ -392,7 +392,7 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         scene = context.scene
         settings = getattr(scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
-        armature = bpy.data.objects.get(arm_name)
+        armature = get_object_by_name(arm_name)
         if not armature or armature.type != "ARMATURE":
             self.report({"ERROR"}, "no valid armature selected")
             return {"CANCELLED"}

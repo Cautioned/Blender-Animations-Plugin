@@ -10,6 +10,7 @@ from ..core.constants import get_transform_to_blender
 from ..core.utils import (
     cf_to_mat,
     get_unique_name,
+    get_object_by_name,
     find_master_collection_for_object,
     find_parts_collection_in_master,
 )
@@ -25,6 +26,38 @@ def _matrix_to_idprop(value):
 def _strip_suffix(name: str) -> str:
     """Strip .001/.002 style suffixes for stable matching."""
     return re.sub(r"\.\d+$", "", name or "")
+
+
+def _safe_mode_set(mode, obj=None):
+    ctx = bpy.context
+    if obj:
+        try:
+            ctx.view_layer.objects.active = obj
+            obj.select_set(True)
+        except Exception:
+            pass
+
+    try:
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode=mode)
+            return True
+    except Exception:
+        pass
+
+    if hasattr(ctx, "temp_override") and obj:
+        try:
+            with ctx.temp_override(active_object=obj, object=obj, selected_objects=[obj], selected_editable_objects=[obj]):
+                if bpy.ops.object.mode_set.poll():
+                    bpy.ops.object.mode_set(mode=mode)
+                    return True
+        except Exception:
+            pass
+
+    try:
+        bpy.ops.object.mode_set(mode=mode)
+        return True
+    except Exception:
+        return False
 
 
 def _fingerprint_position(matrix: Matrix, precision: int = 2) -> str:
@@ -62,12 +95,31 @@ def _build_match_context(parts_collection):
 
 
 def _find_matching_part(aux_name, aux_cf, match_ctx):
-    """Resolve an aux entry to a mesh by name first, then conservative position fingerprint."""
-    name_index = match_ctx["name_index"]
+    """Resolve an aux entry to a mesh.
+    
+    Priority order:
+    1. Fingerprint object map (authoritative, from size fingerprinting)
+    2. Name-based lookup (fallback)
+    3. Position fingerprint (last resort)
+    """
     used = match_ctx["used"]
     t2b = match_ctx["t2b"]
-
-    # Name-based candidates (base name match, ignoring suffixes)
+    
+    
+    # This is the definitive mapping established during import fingerprinting
+    fp_map = match_ctx.get("fingerprint_object_map", {})
+    if aux_name and aux_name in fp_map:
+        obj = fp_map[aux_name]
+        if obj not in used:
+            print(f"[_find_matching_part] FINGERPRINT HIT: '{aux_name}' -> mesh '{obj.name}'")
+            return obj
+        else:
+            print(f"[_find_matching_part] FINGERPRINT found but already used: '{aux_name}'")
+    elif aux_name:
+        print(f"[_find_matching_part] FINGERPRINT MISS: '{aux_name}' not in map (map has {len(fp_map)} entries)")
+    
+    # Fallback: Name-based candidates (base name match, ignoring suffixes)
+    name_index = match_ctx["name_index"]
     candidates = []
     base_name = _strip_suffix(aux_name or "").lower()
     if base_name and base_name in name_index:
@@ -84,7 +136,6 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
         try:
             expected_mat = t2b @ cf_to_mat(aux_cf)
             expected_pos = expected_mat.to_translation()
-            parts_collection = match_ctx.get("parts_collection")
             max_dist = 0.05
 
             for prec in [2, 1, 0]:
@@ -162,7 +213,6 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     amt = ao.data
     bone = amt.edit_bones.new(rigsubdef["jname"])
     joint_type = rigsubdef.get("jointType") or "Motor6D"
-    is_weld = joint_type in ("Weld", "WeldConstraint")
 
     mat = cf_to_mat(rigsubdef["transform"])
     bone["transform"] = _matrix_to_idprop(mat)
@@ -257,6 +307,7 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     bone["nicetransform"] = _matrix_to_idprop(o_trans.inverted() @ post_mat)
 
     # link objects to bone by matching name, then fingerprint
+    # Handle AUX parts (parts welded to this bone but not the primary part)
     aux_transform_list = rigsubdef.get("auxTransform") or []
     for idx, aux_name in enumerate(rigsubdef["aux"]):
         if not aux_name:
@@ -270,6 +321,24 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
             # Queue constraint for later - can't apply in edit mode
             pending = match_ctx.setdefault("pending_constraints", [])
             pending.append((found_obj, bone.name))
+            
+    # Handle PRIMARY part (pname)
+    # This was previously left to auto_constraint_parts, which guessed based on bone name.
+    # Now we explicitly link 'pname' to this bone, ensuring correct constraints for duplicates.
+    p_name = rigsubdef.get("pname")
+    if p_name:
+        # We don't have a specific transform for pname relative to bone here (it's implicit in bone head),
+        # so pass None for cf. strict name matching takes priority anyway.
+        found_primary = _find_matching_part(p_name, None, match_ctx)
+        
+        # Fallback: simple lookup in collection if _find_matching_part fails (it strips suffixes)
+        if not found_primary and parts_collection:
+             found_primary = parts_collection.objects.get(p_name)
+
+        if found_primary:
+            match_ctx["used"].add(found_primary)
+            pending = match_ctx.setdefault("pending_constraints", [])
+            pending.append((found_primary, bone.name))
 
     # handle child bones
     for child in rigsubdef["children"]:
@@ -305,40 +374,58 @@ def _get_or_create_weld_bone_shape():
 
 
 def _configure_weld_bones(armature_obj):
-    """Configure weld bones with custom display (wire/line) and lock them from animation."""
+    """Configure weld bones: custom shape, lock transforms, gray color."""
     amt = armature_obj.data
     
-    # Get or create the custom bone shape for welds
+    settings = bpy.context.scene.rbx_anim_settings
+    hide_welds = getattr(settings, "rbx_hide_weld_bones", False)
     weld_shape = _get_or_create_weld_bone_shape()
     
-    # Switch to pose mode to access pose bones
-    bpy.context.view_layer.objects.active = armature_obj
-    bpy.ops.object.mode_set(mode="POSE")
+    _safe_mode_set("POSE", armature_obj)
+    
+    # Blender 4.0+ uses bone collections, 3.x uses bone.hide
+    try:
+        collections = amt.collections
+        use_collections = True
+    except Exception:
+        collections = None
+        use_collections = False
+
+    weld_coll = None
+    if use_collections:
+        weld_coll_name = "_WeldBones"
+        weld_coll = collections.get(weld_coll_name)
+        if weld_coll is None:
+            weld_coll = collections.new(weld_coll_name)
     
     for bone in amt.bones:
         joint_type = bone.get("rbx_joint_type", "Motor6D")
         if joint_type in ("Weld", "WeldConstraint"):
             pose_bone = armature_obj.pose.bones.get(bone.name)
             if pose_bone:
-                # Assign custom shape (line)
                 pose_bone.custom_shape = weld_shape
                 pose_bone.use_custom_shape_bone_size = True
                 
-                # Lock all transforms to prevent accidental animation
                 pose_bone.lock_location = (True, True, True)
                 pose_bone.lock_rotation = (True, True, True)
                 pose_bone.lock_rotation_w = True
                 pose_bone.lock_scale = (True, True, True)
                 
-                # Use custom bone color group to visually distinguish weld bones
                 if hasattr(pose_bone, "color"):
-                    # Blender 4.0+ bone colors
                     pose_bone.color.palette = 'CUSTOM'
                     pose_bone.color.custom.normal = (0.3, 0.3, 0.3)
                     pose_bone.color.custom.select = (0.5, 0.5, 0.5)
                     pose_bone.color.custom.active = (0.6, 0.6, 0.6)
+            
+            if use_collections:
+                weld_coll.assign(bone)
+            else:
+                bone.hide = hide_welds
     
-    bpy.ops.object.mode_set(mode="OBJECT")
+    if use_collections:
+        weld_coll.is_visible = not hide_welds
+    
+    _safe_mode_set("OBJECT", armature_obj)
 
 
 def create_rig(rigging_type, rig_meta_obj_name):
@@ -349,9 +436,9 @@ def create_rig(rigging_type, rig_meta_obj_name):
 
     # Ensure we are in object mode
     if bpy.context.active_object and bpy.context.mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
+        _safe_mode_set("OBJECT", bpy.context.active_object)
 
-    rig_meta_obj = bpy.data.objects.get(rig_meta_obj_name)
+    rig_meta_obj = get_object_by_name(rig_meta_obj_name)
     if not rig_meta_obj:
         raise ValueError(f"Rig meta object '{rig_meta_obj_name}' not found.")
         return
@@ -389,6 +476,31 @@ def create_rig(rigging_type, rig_meta_obj_name):
     bpy.context.view_layer.objects.active = rig_meta_obj
 
     meta_loaded = json.loads(rig_meta_obj["RigMeta"])
+    
+    # Load the authoritative fingerprint->object map
+    # This was populated during import by _rename_parts_by_size_fingerprint
+    fp_map = {}
+    fp_map_json = rig_meta_obj.get("_FingerprintMap")
+    if fp_map_json:
+        try:
+            fp_map_names = json.loads(fp_map_json)
+            print(f"[RigCreate] Loading fingerprint map with {len(fp_map_names)} entries...")
+            # Convert names back to object references
+            for part_name, obj_name in fp_map_names.items():
+                obj = parts_collection.objects.get(obj_name)
+                if obj:
+                    fp_map[part_name] = obj
+                    print(f"[RigCreate]   '{part_name}' -> mesh '{obj.name}'")
+                else:
+                    print(f"[RigCreate]   WARNING: mesh '{obj_name}' not found for part '{part_name}'")
+            print(f"[RigCreate] Loaded {len(fp_map)} authoritative fingerprint mappings")
+        except Exception as e:
+            print(f"[RigCreate] Failed to load fingerprint map: {e}")
+    else:
+        print("[RigCreate] WARNING: No _FingerprintMap found on meta object!")
+    
+    match_ctx["fingerprint_object_map"] = fp_map
+    
     # Try to restore correct part names using fingerprinting before building constraints.
     _apply_fingerprint_renames(meta_loaded["rig"], match_ctx)
 
@@ -409,29 +521,46 @@ def create_rig(rigging_type, rig_meta_obj_name):
     amt.show_axes = True
     amt.show_names = True
 
-    bpy.ops.object.mode_set(mode="EDIT")
+    if bpy.context.mode != "EDIT":
+        _safe_mode_set("EDIT", ao)
     # Pass the specific parts_collection to be used for constraining
     load_rigbone(ao, rigging_type, meta_loaded["rig"], None, parts_collection, match_ctx)
 
-    bpy.ops.object.mode_set(mode="OBJECT")
+    if bpy.context.mode != "OBJECT":
+        _safe_mode_set("OBJECT", ao)
     
     # Apply pending constraints now that we're in object mode
     from .constraints import link_object_to_bone_rigid, auto_constraint_parts
-    for obj, bone_name in match_ctx.get("pending_constraints", []):
+    
+    # Track objects that were constrained via authoritative fingerprint mapping
+    # These should NOT be touched by auto_constraint_parts
+    authoritatively_constrained = set()
+    
+    pending = match_ctx.get("pending_constraints", [])
+    print(f"[RigCreate] Applying {len(pending)} pending constraints...")
+    
+    for obj, bone_name in pending:
         bone = ao.data.bones.get(bone_name)
         if bone:
             link_object_to_bone_rigid(obj, ao, bone)
+            authoritatively_constrained.add(obj)
+            print(f"[RigCreate] AUTHORITATIVE: mesh '{obj.name}' -> bone '{bone_name}'")
+        else:
+            print(f"[RigCreate] WARNING: bone '{bone_name}' not found for mesh '{obj.name}'")
     
-    # Auto-constraint parts by matching bone names to mesh names
-    # This handles parts that were renamed by fingerprint matching during import
+    # Auto-constraint ONLY parts that were NOT authoritatively constrained
+    # This handles any parts that weren't in the fingerprint map (legacy/fallback)
     bpy.context.view_layer.update()
-    ok, msg = auto_constraint_parts(ao.name)
+    ok, msg = auto_constraint_parts(ao.name, skip_objects=authoritatively_constrained)
 
-    # If no parts matched, retry once on the next tick to allow depsgraph updates
+    # If no parts matched via fallback, retry once (but STILL skip authoritative ones)
     if ok and msg and "No matching parts found" in msg:
+        # Capture the set in closure
+        _skip_set = authoritatively_constrained
+        _ao_name = ao.name
         def _retry_auto_constraint():
             try:
-                auto_constraint_parts(ao.name)
+                auto_constraint_parts(_ao_name, skip_objects=_skip_set)
             except Exception:
                 pass
             return None
