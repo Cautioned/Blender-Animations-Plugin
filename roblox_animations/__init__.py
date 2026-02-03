@@ -14,7 +14,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 3, 2),
+    "version": (2, 3, 5),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -43,6 +43,8 @@ CLASSES = (
     operators.OBJECT_OT_AnalyzePhysics,
     operators.OBJECT_OT_TogglePhysicsGhost,
     operators.OBJECT_OT_ToggleRotationMomentum,
+    # Weld bone visibility
+    operators.OBJECT_OT_ToggleWeldBones,
     # Animation operators
     operators.OBJECT_OT_ApplyTransform,
     operators.OBJECT_OT_MapKeyframes,

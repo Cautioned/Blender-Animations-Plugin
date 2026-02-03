@@ -5,7 +5,12 @@ Rig generation and management operators.
 import bpy
 from ..rig.creation import create_rig
 from ..rig.ik import create_ik_config, remove_ik_config, has_ik_constraint, update_pole_axis
-from ..core.utils import pose_bone_selected, pose_bone_set_selected
+from ..core.utils import (
+    pose_bone_selected,
+    pose_bone_set_selected,
+    iter_scene_objects,
+    get_object_by_name,
+)
 
 
 class OBJECT_OT_GenRig(bpy.types.Operator):
@@ -42,7 +47,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
         # Check for rig meta objects (existing method)
         has_rig_meta = any(
             "RigMeta" in obj and obj.name.startswith("__") and "Meta" in obj.name
-            for obj in bpy.data.objects
+            for obj in iter_scene_objects()
         )
 
         # Check for armatures with Motor6D properties (transform, transform1, nicetransform)
@@ -52,7 +57,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
                 "transform" in bone and "transform1" in bone and "nicetransform" in bone
                 for bone in obj.data.bones
             )
-            for obj in bpy.data.objects
+            for obj in iter_scene_objects()
         )
 
         return has_rig_meta or has_motor6d_rig
@@ -62,14 +67,14 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
         # Check if scene has either rig meta objects or armatures with Motor6D properties
         return any(
             "RigMeta" in obj and obj.name.startswith("__") and "Meta" in obj.name
-            for obj in bpy.data.objects
+            for obj in iter_scene_objects(context.scene)
         ) or any(
             obj.type == "ARMATURE"
             and any(
                 "transform" in bone and "transform1" in bone and "nicetransform" in bone
                 for bone in obj.data.bones
             )
-            for obj in bpy.data.objects
+            for obj in iter_scene_objects(context.scene)
         )
 
     def create_rig_meta_from_armature(self, armature_obj):
@@ -121,8 +126,9 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
 
         # Create temporary meta object
         meta_obj_name = f"__{rig_structure['rigName']}Meta_Detected"
-        if meta_obj_name in bpy.data.objects:
-            bpy.data.objects.remove(bpy.data.objects[meta_obj_name], do_unlink=True)
+        meta_obj = get_object_by_name(meta_obj_name, bpy.context.scene)
+        if meta_obj:
+            bpy.data.objects.remove(meta_obj, do_unlink=True)
 
         bpy.ops.object.add(type="EMPTY", location=(0, 0, 0))
         temp_meta = bpy.context.object
@@ -136,7 +142,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
     def execute(self, context):
         try:
             # Check if the selected item is a rig meta object or an armature
-            selected_obj = bpy.data.objects.get(self.pr_rig_meta_name)
+            selected_obj = get_object_by_name(self.pr_rig_meta_name, context.scene)
             if selected_obj and "RigMeta" in selected_obj:
                 # Existing case: rig meta object
                 create_rig(self.pr_rigging_type, self.pr_rig_meta_name)
@@ -153,10 +159,9 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
                 meta_obj_name = self.create_rig_meta_from_armature(selected_obj)
                 create_rig(self.pr_rigging_type, meta_obj_name)
                 # Clean up temporary meta object
-                if meta_obj_name in bpy.data.objects:
-                    bpy.data.objects.remove(
-                        bpy.data.objects[meta_obj_name], do_unlink=True
-                    )
+                meta_obj = get_object_by_name(meta_obj_name, bpy.context.scene)
+                if meta_obj:
+                    bpy.data.objects.remove(meta_obj, do_unlink=True)
                 self.report(
                     {"INFO"},
                     f"Rig rebuilt from detected armature {self.pr_rig_meta_name}.",
@@ -179,13 +184,13 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
         OBJECT_OT_GenRig.rig_meta_items_cache.clear()
 
         # Add rig meta objects (existing method)
-        for obj in bpy.data.objects:
+        for obj in iter_scene_objects(context.scene):
             if "RigMeta" in obj and obj.name.startswith("__") and "Meta" in obj.name:
                 item = (obj.name, obj.name, "")
                 OBJECT_OT_GenRig.rig_meta_items_cache.append(item)
 
         # Add armatures with Motor6D properties (new detection method)
-        for obj in bpy.data.objects:
+        for obj in iter_scene_objects(context.scene):
             if obj.type == "ARMATURE" and any(
                 "transform" in bone and "transform1" in bone and "nicetransform" in bone
                 for bone in obj.data.bones
@@ -463,7 +468,6 @@ class OBJECT_OT_ToggleCOM(bpy.types.Operator):
 
     def execute(self, context):
         from ..rig.com import (
-            is_com_visualization_enabled,
             is_com_for_armature,
             enable_com_visualization,
             update_com_visualization,
@@ -834,6 +838,64 @@ class OBJECT_OT_ToggleRotationMomentum(bpy.types.Operator):
         toggle_angular_momentum()
         state = "enabled" if is_angular_momentum_enabled() else "disabled"
         self.report({"INFO"}, f"Rotation momentum {state}")
+        
+        return {"FINISHED"}
+
+
+class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
+    """Toggle visibility of weld bones in the armature"""
+    bl_label = "Toggle Weld Bones"
+    bl_idname = "object.rbxanims_toggle_weld_bones"
+    bl_description = "Show or hide weld/weldconstraint bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == "ARMATURE"
+
+    def execute(self, context):
+        settings = context.scene.rbx_anim_settings
+        settings.rbx_hide_weld_bones = not settings.rbx_hide_weld_bones
+        hide = settings.rbx_hide_weld_bones
+        
+        armature = context.active_object
+        if armature and armature.type == "ARMATURE":
+            amt = armature.data
+            count = 0
+            
+            try:
+                collections = amt.collections
+                use_collections = True
+            except Exception:
+                collections = None
+                use_collections = False
+            
+            if use_collections:
+                weld_coll_name = "_WeldBones"
+                weld_coll = collections.get(weld_coll_name)
+                
+                if weld_coll is None:
+                    weld_coll = collections.new(weld_coll_name)
+                    for bone in amt.bones:
+                        joint_type = bone.get("rbx_joint_type", "Motor6D")
+                        if joint_type in ("Weld", "WeldConstraint"):
+                            weld_coll.assign(bone)
+                            count += 1
+                else:
+                    count = len([b for b in amt.bones if b.get("rbx_joint_type") in ("Weld", "WeldConstraint")])
+                
+                weld_coll.is_visible = not hide
+            else:
+                # Blender 3.x fallback
+                for bone in amt.bones:
+                    joint_type = bone.get("rbx_joint_type", "Motor6D")
+                    if joint_type in ("Weld", "WeldConstraint"):
+                        bone.hide = hide
+                        count += 1
+            
+            state = "hidden" if hide else "visible"
+            self.report({"INFO"}, f"{count} weld bones now {state}")
         
         return {"FINISHED"}
 

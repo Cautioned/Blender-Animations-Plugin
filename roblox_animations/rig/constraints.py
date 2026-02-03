@@ -3,10 +3,10 @@ Constraint management utilities for linking objects to bones.
 """
 
 import re
-import bpy
 from ..core.utils import (
     find_master_collection_for_object,
     find_parts_collection_in_master,
+    get_object_by_name,
 )
 
 
@@ -28,9 +28,17 @@ def link_object_to_bone_rigid(obj, ao, bone):
     constraint.inverse_matrix = (ao.matrix_world @ bone_mat).inverted()
 
 
-def auto_constraint_parts(armature_name):
-    """Automatically constrain parts/meshes with matching bone names"""
-    armature = bpy.data.objects.get(armature_name)
+def auto_constraint_parts(armature_name, skip_objects=None):
+    """Automatically constrain parts/meshes with matching bone names.
+    
+    Args:
+        armature_name: Name of the armature to constrain parts to
+        skip_objects: Set of objects to skip (already constrained authoritatively)
+    """
+    if skip_objects is None:
+        skip_objects = set()
+        
+    armature = get_object_by_name(armature_name)
     if not armature:
         return False, f"Armature '{armature_name}' not found."
 
@@ -56,32 +64,43 @@ def auto_constraint_parts(armature_name):
     # Only process objects within this rig's parts collection
     for obj in parts_collection.objects:
         if obj.type == "MESH":
+            
+            if obj in skip_objects:
+                continue
+                
             # Strip .001, .002 etc from name for matching
             base_name = re.sub(r"\.\d+$", "", obj.name).lower()
             bone_name = bone_name_map.get(base_name)
             if not bone_name:
                 continue
 
-            # Check for existing constraints and clear if they belong to another armature
-            for constraint in list(obj.constraints):
-                if constraint.type == "CHILD_OF" and constraint.target != armature:
-                    obj.constraints.remove(constraint)
+            # Ensure exactly one correct Child Of constraint exists
+            # We want to preserve the existing correct one (to keep inverse_matrix if set)
+            # and remove ANY other Child Of constraints (duplicates, wrong bone, wrong target)
+            correct_constraint_found = False
+            
+            # Iterate over a copy to safely remove items
+            for c in list(obj.constraints):
+                if c.type == "CHILD_OF":
+                    is_correct_target = (c.target == armature)
+                    is_correct_bone = (c.subtarget == bone_name)
+                    
+                    if is_correct_target and is_correct_bone and not correct_constraint_found:
+                        # Found the first valid matching constraint - keep it
+                        correct_constraint_found = True
+                    else:
+                        # Remove if:
+                        # - Wrong target (different armature)
+                        # - Wrong bone (different subtarget on this armature)
+                        # - Duplicate (we already found one correct constraint)
+                        obj.constraints.remove(c)
 
-            # Add constraint if not already constrained to the correct bone
-            existing_constraint = next(
-                (
-                    c
-                    for c in obj.constraints
-                    if c.type == "CHILD_OF"
-                    and c.target == armature
-                    and c.subtarget == bone_name
-                ),
-                None,
-            )
-            if not existing_constraint:
+            # Create constraint only if we didn't find one to preserve
+            if not correct_constraint_found:
                 constraint = obj.constraints.new(type="CHILD_OF")
                 constraint.target = armature
                 constraint.subtarget = bone_name
+            
             matched_parts.append(obj.name)
 
     if not matched_parts:
@@ -95,7 +114,7 @@ def auto_constraint_parts(armature_name):
 
 def manual_constraint_parts(armature_name, bone_mesh_assignments):
     """Manually constrain parts based on provided assignments"""
-    armature = bpy.data.objects.get(armature_name)
+    armature = get_object_by_name(armature_name)
     if not armature:
         return False, f"Armature '{armature_name}' not found."
 
@@ -111,7 +130,8 @@ def manual_constraint_parts(armature_name, bone_mesh_assignments):
             continue
 
         # First, remove any existing CHILD_OF constraint that targets this armature
-        for c in obj.constraints:
+        # iterating over a copy of the list is crucial to safe removal
+        for c in list(obj.constraints):
             if c.type == "CHILD_OF" and c.target == armature:
                 obj.constraints.remove(c)
 

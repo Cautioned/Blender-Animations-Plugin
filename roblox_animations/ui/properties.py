@@ -10,7 +10,7 @@ from bpy.props import (
     IntProperty,
 )
 from bpy.types import PropertyGroup
-from ..core.utils import armature_items
+from ..core.utils import armature_items, get_object_by_name
 from ..core.constants import DEFAULT_SERVER_PORT
 
 
@@ -24,7 +24,7 @@ def _on_gravity_update(self, context):
             from ..rig.physics import _physics_data
             armature_name = _physics_data.get("armature_name")
             if armature_name:
-                armature = bpy.data.objects.get(armature_name)
+                armature = get_object_by_name(armature_name)
                 if armature:
                     analyze_animation(armature)
     except Exception:
@@ -39,7 +39,7 @@ def _on_physics_param_update(self, context):
             from ..rig.physics import _physics_data
             armature_name = _physics_data.get("armature_name")
             if armature_name:
-                armature = bpy.data.objects.get(armature_name)
+                armature = get_object_by_name(armature_name)
                 if armature:
                     analyze_animation(armature)
     except Exception:
@@ -133,6 +133,12 @@ class RobloxAnimationSettings(PropertyGroup):
             "when disabled, animations without cyclic extrapolation hold the final pose instead of baking every frame"
         ),
         default=True,
+    )
+
+    rbx_hide_weld_bones: BoolProperty(
+        name="Hide Weld Bones",
+        description="hide weld/weldconstraint bones in the viewport (they're still there, just invisible)",
+        default=False,
     )
 
 

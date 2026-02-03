@@ -13,8 +13,14 @@ from ..core.constants import (
     cf_round,
     cf_round_fac,
 )
-from ..core.utils import get_scene_fps, mat_to_cf, get_action_fcurves, to_matrix
-from .easing import get_easing_for_bone, map_blender_to_roblox_easing
+from ..core.utils import (
+    get_scene_fps,
+    mat_to_cf,
+    get_action_fcurves,
+    to_matrix,
+    iter_scene_objects,
+)
+from .easing import map_blender_to_roblox_easing
 
 
 def is_deform_bone_rig(armature: "bpy.types.Object") -> bool:
@@ -27,7 +33,7 @@ def is_deform_bone_rig(armature: "bpy.types.Object") -> bool:
         return False
 
     # Iterate through all mesh objects in the scene
-    for mesh_obj in bpy.data.objects:
+    for mesh_obj in iter_scene_objects():
         if mesh_obj.type == "MESH":
             # Check if the mesh has an Armature modifier targeting our armature
             for modifier in mesh_obj.modifiers:
@@ -1383,6 +1389,20 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     if is_skinned_rig:
         result["is_deform_bone_rig"] = True
         result["bone_hierarchy"] = extract_bone_hierarchy(ao_eval)
+
+    # Export FPS metadata for consumers (e.g., Roblox) that want to preserve timing
+    try:
+        scene = ctx.scene
+        result["export_info"] = {
+            "fps": float(desired_fps),
+            "fps_base": float(getattr(scene.render, "fps_base", 1.0) or 1.0),
+            "frame_start": int(getattr(scene, "frame_start", 0)),
+            "frame_end": int(getattr(scene, "frame_end", 0)),
+            "frame_step": int(getattr(scene, "frame_step", 1) or 1),
+            "time_unit": "seconds",
+        }
+    except Exception:
+        pass
 
     # Restore the original frame
     ctx.scene.frame_set(original_frame)

@@ -51,7 +51,11 @@ return function()
 		describe("ListArmatures", function()
 			it("should return armature data on success", function()
 				local armatures = { { name = "Armature1" }, { name = "Armature2" } }
-				mockHttpService._getAsyncResponse = '{"armatures": [{"name": "Armature1"}, {"name": "Armature2"}]}'
+				-- ListArmatures uses RequestAsync, not GetAsync
+				mockHttpService._requestAsyncResponse = {
+					Success = true,
+					Body = '{"armatures": [{"name": "Armature1"}, {"name": "Armature2"}]}'
+				}
 				mockHttpService._jsonDecodeResponse = { armatures = armatures }
 
 				local result = connection:ListArmatures(1337)
@@ -60,14 +64,17 @@ return function()
 				expect(result[1].name).to.equal("Armature1")
 			end)
 
-			it("should return nil if GetAsync fails", function()
-				mockHttpService._getAsyncShouldSucceed = false
+			it("should return nil if RequestAsync fails", function()
+				mockHttpService._requestAsyncShouldSucceed = false
 				local result = connection:ListArmatures(1337)
 				expect(result).to.equal(nil)
 			end)
 
 			it("should return nil if JSONDecode fails", function()
-				mockHttpService._getAsyncResponse = "invalid json"
+				mockHttpService._requestAsyncResponse = {
+					Success = true,
+					Body = "invalid json"
+				}
 				mockHttpService._jsonDecodeShouldSucceed = false
 				local result = connection:ListArmatures(1337)
 				expect(result).to.equal(nil)

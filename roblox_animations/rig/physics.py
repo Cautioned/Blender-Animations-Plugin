@@ -9,11 +9,11 @@ ghost character visualization showing physics-corrected positions.
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector, Matrix
+from mathutils import Vector
 from typing import Optional, Dict, List, Tuple
-import math
 
 from .com import calculate_com
+from ..core.utils import get_object_by_name
 
 
 # Default gravity constant (Blender units per second squared)
@@ -44,7 +44,7 @@ def get_gravity() -> float:
     try:
         settings = bpy.context.scene.rbx_anim_settings
         return settings.rbx_physics_gravity
-    except:
+    except Exception:
         return DEFAULT_GRAVITY
 
 
@@ -587,7 +587,7 @@ def _draw_physics_callback():
     if not armature_name:
         return
     
-    armature = bpy.data.objects.get(armature_name)
+    armature = get_object_by_name(armature_name)
     if not armature or armature.type != "ARMATURE":
         _physics_data["enabled"] = False
         return
@@ -745,7 +745,7 @@ def _draw_trajectory(shader, current_frame: int):
             continue
             
         pos = _physics_data["predicted_positions"][frame]
-        state = _physics_data["frame_states"].get(frame, "grounded")
+        _physics_data["frame_states"].get(frame, "grounded")
         
         if i > 0 and frames[i-1] >= current_frame - view_behind:
             prev_pos = _physics_data["predicted_positions"].get(frames[i-1])

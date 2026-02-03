@@ -7,6 +7,7 @@ from mathutils import Matrix
 from ..core.utils import (
     get_action_fcurves,
     pose_bone_set_selected,
+    get_object_by_name,
 )
 
 
@@ -183,12 +184,15 @@ def prepare_for_kf_map():
     # clear anim data from target rig
     settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
     armature_name = settings.rbx_anim_armature if settings else None
-    bpy.data.objects[armature_name].animation_data_clear()
+    target_obj = get_object_by_name(armature_name)
+    if not target_obj:
+        return
+    target_obj.animation_data_clear()
 
     # select all pose bones in the target rig (simply generate kfs for everything)
-    bpy.context.view_layer.objects.active = bpy.data.objects[armature_name]
+    bpy.context.view_layer.objects.active = target_obj
     bpy.ops.object.mode_set(mode="POSE")
-    for bone in bpy.data.objects[armature_name].pose.bones:
+    for bone in target_obj.pose.bones:
         pose_bone_set_selected(bone, bool(bone.parent))
 
 

@@ -7,6 +7,8 @@ from ..rig.constraints import auto_constraint_parts
 from ..core.utils import (
     find_master_collection_for_object,
     find_parts_collection_in_master,
+    get_object_by_name,
+    object_exists,
 )
 
 
@@ -19,7 +21,7 @@ class OBJECT_OT_AutoConstraint(bpy.types.Operator):
     def poll(cls, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         arm_name = settings.rbx_anim_armature if settings else None
-        return arm_name in bpy.data.objects
+        return object_exists(arm_name, context.scene)
 
     def execute(self, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
@@ -48,7 +50,7 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
         """Get objects that are available for constraining (not in other _Parts collections)"""
         settings = getattr(context.scene, "rbx_anim_settings", None)
         armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature, context.scene) if settings else None
         )
         if not armature:
             return []
@@ -72,7 +74,7 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
     def poll(cls, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature, context.scene) if settings else None
         )
         return armature and armature.type == "ARMATURE"
 
@@ -80,7 +82,7 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
         """Safely get the parts collection for the currently selected armature."""
         settings = getattr(context.scene, "rbx_anim_settings", None)
         armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature, context.scene) if settings else None
         )
         if not armature:
             return None
@@ -94,7 +96,7 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
 
         settings = getattr(context.scene, "rbx_anim_settings", None)
         armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature, context.scene) if settings else None
         )
         parts_collection = self.get_parts_collection(context)
 
@@ -186,7 +188,8 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
                 continue
 
             # First, remove any existing CHILD_OF constraint that targets this armature
-            for c in obj.constraints:
+            # use list() to iterate over a copy, preventing skipped items during removal
+            for c in list(obj.constraints):
                 if c.type == "CHILD_OF" and c.target == armature:
                     obj.constraints.remove(c)
 

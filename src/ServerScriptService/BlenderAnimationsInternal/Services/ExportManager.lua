@@ -25,10 +25,14 @@ function ExportManager:clearMetaParts()
 	end
 end
 
-function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Instance]: string }, usedJointNames: { [string]: boolean }?)
+function ExportManager:reencodeJointMetadata(
+	rigNode: any,
+	partEncodeMap: { [Instance]: string },
+	usedJointNames: { [string]: boolean }?
+)
 	-- Initialize usedJointNames on first call (root node)
 	usedJointNames = usedJointNames or {}
-	
+
 	-- round transform matrices (compresses data)
 	for _, transform in pairs({ "transform", "jointtransform0", "jointtransform1" }) do
 		if rigNode[transform] then
@@ -37,7 +41,7 @@ function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Ins
 			end
 		end
 	end
-	
+
 	-- Also round auxTransform arrays (each is a 12-value CFrame)
 	if rigNode.auxTransform then
 		for auxIdx, auxCf in pairs(rigNode.auxTransform) do
@@ -48,12 +52,12 @@ function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Ins
 			end
 		end
 	end
-	
+
 	-- Uniquify jname only for Welds (not Motor6Ds) to avoid collisions like multiple "Handle" bones
 	local originalJname = rigNode.jname
 	local jointType = rigNode.jointType
 	local isWeld = jointType == "Weld" or jointType == "WeldConstraint"
-	
+
 	if originalJname and isWeld then
 		local uniqueJname = originalJname
 		local retryCount = 0
@@ -83,21 +87,28 @@ function ExportManager:reencodeJointMetadata(rigNode: any, partEncodeMap: { [Ins
 	end
 end
 
-function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
+function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, originalMap: { [Instance]: Instance })
 	assert(State.activeRig)
 
 	local partNames = {}
 	local partEncodeMap = {}
+	local partAuxData = {} -- New aux data for fingerprints
 
 	local usedModelNames = {}
 	local partCount = 0
 
-	local originalDescendants = State.activeRig.model:GetDescendants()
 	local primaryClone = rigModelToExport.PrimaryPart
+
+	-- Iterate the CLONE's descendants.
 	for descIdx, desc in ipairs(rigModelToExport:GetDescendants()) do
 		if desc:IsA("BasePart") then
 			partCount = partCount + 1
 			local isPrimary = desc == primaryClone
+
+			local originalInst = originalMap[desc]
+
+			-- Verify (Optional, but good for debugging if ever needed)
+			-- if originalInst and originalInst.Name ~= desc.Name then warn("Mismatch mapping?") end
 
 			-- uniqify the name
 			local baseName = desc.Name :: string
@@ -111,7 +122,29 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
 			if not isPrimary then
 				partNames[#partNames + 1] = desc.Name
 			end
-			partEncodeMap[originalDescendants[descIdx]] = desc.Name
+
+			-- Generate Robust Geometric Fingerprint (Uniform Scaling)
+			-- We use Uniform Scaling (modifying X, Y, Z equally) by a unique amount per ID.
+			-- This guards against axis-swapping or rotation, as (X+e, Y+e, Z+e) simply scales the shape.
+			-- Different IDs = Different 'e' = Distinct resulting dimensions.
+
+			local id = partCount
+			local quantum = 0.0001 -- 0.1mm steps
+
+			local perturbation = Vector3.one * (id * quantum)
+			desc.Size = desc.Size + perturbation
+
+			-- Store Expected Dimensions/Volume
+			partAuxData[partCount] = {
+				idx = partCount,
+				name = desc.Name,
+				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
+				vol_fp = desc.Size.X * desc.Size.Y * desc.Size.Z, -- Fallback for Mesh Volume calculation
+			}
+
+			if originalInst then
+				partEncodeMap[originalInst] = desc.Name
+			end
 			desc.Name = rigModelToExport.Name .. partCount
 		elseif desc:IsA("Humanoid") or desc:IsA("AnimationController") then
 			-- Get rid of all humanoids so that they do not affect naming...
@@ -128,24 +161,68 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType)
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 
-	return { rigName = State.activeRig.model.Name, parts = partNames, rig = encodedRig }
+	print("[ExportManager] Exporting with Robust Size Fingerprints (v1.4) - Uniform Scaling")
+
+	return {
+		rigName = State.activeRig.model.Name,
+		parts = partNames,
+		rig = encodedRig,
+		partAux = partAuxData, -- Send aux data
+		version = "1.1",
+	}
 end
 
-function ExportManager:generateMetadataLegacy(rigModelToExport: Types.RigModelType)
+function ExportManager:generateMetadataLegacy(
+	rigModelToExport: Types.RigModelType,
+	originalMap: { [Instance]: Instance }
+)
 	assert(State.activeRig)
 
 	local partRoles: { [string]: string } = {} -- Maps original part names to their roles/identifiers
 	local partEncodeMap: { [BasePart]: string } = {} -- Maps original parts to their roles for encoding
+	local partAuxData = {}
+	local usedModelNames = {}
+	local partCount = 0
+
 	local primaryClone = rigModelToExport.PrimaryPart
-	local originalDescendants = State.activeRig.model:GetDescendants()
 
 	for descIdx, desc in ipairs(rigModelToExport:GetDescendants()) do
 		if desc:IsA("BasePart") then
-			local partRole: string = desc.Name -- or any logic to determine the part's role/identifier
-			partEncodeMap[originalDescendants[descIdx] :: BasePart] = partRole
+			partCount = partCount + 1
+
+			local originalInst = originalMap[desc]
+
+			-- IMPORTANT: Uniquify names even for Legacy export to prevent collision ambiguities
+			-- The user can rename them back in Blender if they really want duplicates, but for matching we need unique keys.
+			local baseName = desc.Name
+			local retryCount = 0
+			while usedModelNames[desc.Name] do
+				retryCount = retryCount + 1
+				desc.Name = baseName .. retryCount
+			end
+			usedModelNames[desc.Name] = true
+
+			local partRole: string = desc.Name
+
+			if originalInst then
+				partEncodeMap[originalInst] = partRole
+			end
 			if desc ~= primaryClone then
 				partRoles[desc.Name] = partRole
 			end
+
+			-- Generate Robust Geometric Fingerprint (Legacy)
+			local id = partCount
+			local quantum = 0.0001
+
+			local perturbation = Vector3.one * (id * quantum)
+			desc.Size = desc.Size + perturbation
+
+			partAuxData[partCount] = {
+				idx = partCount,
+				name = desc.Name,
+				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
+			}
 		end
 		-- No need to destroy Humanoid or AnimationController
 	end
@@ -159,7 +236,15 @@ function ExportManager:generateMetadataLegacy(rigModelToExport: Types.RigModelTy
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 
-	return { rigName = State.activeRig.model.Name, parts = partRoles, rig = encodedRig }
+	print("[ExportManager] Exporting Legacy with Size/Volume Fingerprints (v1.3)")
+
+	return {
+		rigName = State.activeRig.model.Name,
+		parts = partRoles,
+		rig = encodedRig,
+		partAux = partAuxData,
+		version = "1.1",
+	}
 end
 
 function ExportManager:exportRig()
@@ -175,7 +260,48 @@ function ExportManager:exportRig()
 		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
 	end
 
+	local function buildArchivablePathMap(root: Instance)
+		local map = {}
+		local function recurse(p: Instance, path: string)
+			local archivableChildren = {}
+			for _, child in ipairs(p:GetChildren()) do
+				if child.Archivable then
+					table.insert(archivableChildren, child)
+				end
+			end
+			for i, child in ipairs(archivableChildren) do
+				local childPath = path == "" and tostring(i) or (path .. "/" .. tostring(i))
+				if child:IsA("BasePart") then
+					map[childPath] = child
+				end
+				recurse(child, childPath)
+			end
+		end
+		recurse(root, "")
+		return map
+	end
+
+	local originalPathMap = buildArchivablePathMap(State.activeRigModel)
+
+	local wasArchivable = State.activeRigModel.Archivable
+	State.activeRigModel.Archivable = true
 	local rigModelToExport = State.activeRigModel:Clone()
+	State.activeRigModel.Archivable = wasArchivable
+
+	local clonePathMap = rigModelToExport and buildArchivablePathMap(rigModelToExport) or {}
+	local originalMap = {}
+	for path, clonePart in pairs(clonePathMap) do
+		local originalPart = originalPathMap[path]
+		if originalPart then
+			originalMap[clonePart] = originalPart
+		end
+	end
+
+	if not rigModelToExport then
+		warn("[ExportManager] Failed to clone ActiveRig (Clone returned nil).")
+		return
+	end
+
 	rigModelToExport.Parent = State.activeRigModel.Parent
 	rigModelToExport.Archivable = false
 
@@ -183,7 +309,7 @@ function ExportManager:exportRig()
 
 	State.metaParts = { rigModelToExport }
 
-	local meta = self:generateMetadata(rigModelToExport)
+	local meta = self:generateMetadata(rigModelToExport, originalMap)
 	if not meta then
 		return
 	end
@@ -202,7 +328,7 @@ function ExportManager:exportRig()
 		idx = idx + 1
 	end
 	game.Selection:Set(State.metaParts)
-	PluginManager():ExportSelection(); -- deprecated
+	PluginManager():ExportSelection() -- deprecated
 end
 
 function ExportManager:exportRigLegacy()
@@ -218,7 +344,48 @@ function ExportManager:exportRigLegacy()
 		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
 	end
 
+	local function buildArchivablePathMap(root: Instance)
+		local map = {}
+		local function recurse(p: Instance, path: string)
+			local archivableChildren = {}
+			for _, child in ipairs(p:GetChildren()) do
+				if child.Archivable then
+					table.insert(archivableChildren, child)
+				end
+			end
+			for i, child in ipairs(archivableChildren) do
+				local childPath = path == "" and tostring(i) or (path .. "/" .. tostring(i))
+				if child:IsA("BasePart") then
+					map[childPath] = child
+				end
+				recurse(child, childPath)
+			end
+		end
+		recurse(root, "")
+		return map
+	end
+
+	local originalPathMap = buildArchivablePathMap(State.activeRigModel)
+
+	local wasArchivable = State.activeRigModel.Archivable
+	State.activeRigModel.Archivable = true
 	local rigModelToExport = State.activeRigModel:Clone()
+	State.activeRigModel.Archivable = wasArchivable
+
+	local clonePathMap = rigModelToExport and buildArchivablePathMap(rigModelToExport) or {}
+	local originalMap = {}
+	for path, clonePart in pairs(clonePathMap) do
+		local originalPart = originalPathMap[path]
+		if originalPart then
+			originalMap[clonePart] = originalPart
+		end
+	end
+
+	if not rigModelToExport then
+		warn("[ExportManager] Failed to clone ActiveRig (Clone returned nil).")
+		return
+	end
+
 	rigModelToExport.Parent = State.activeRigModel.Parent
 	rigModelToExport.Archivable = false
 
@@ -226,7 +393,7 @@ function ExportManager:exportRigLegacy()
 
 	State.metaParts = { rigModelToExport }
 
-	local meta = self:generateMetadataLegacy(rigModelToExport)
+	local meta = self:generateMetadataLegacy(rigModelToExport, originalMap)
 	if not meta then
 		return
 	end
@@ -245,7 +412,7 @@ function ExportManager:exportRigLegacy()
 		idx = idx + 1
 	end
 	game.Selection:Set(State.metaParts)
-	PluginManager():ExportSelection(); -- deprecated
+	PluginManager():ExportSelection() -- deprecated
 end
 
 return ExportManager

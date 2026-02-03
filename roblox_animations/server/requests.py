@@ -7,8 +7,15 @@ import traceback
 import zlib
 import bpy
 import bpy_extras
-from mathutils import Vector, Matrix
-from ..core.utils import get_action_hash, get_scene_fps, set_scene_fps, cf_to_mat
+from mathutils import Matrix
+from ..core.utils import (
+    get_action_hash,
+    get_scene_fps,
+    set_scene_fps,
+    cf_to_mat,
+    get_object_by_name,
+    iter_scene_objects,
+)
 from ..core import utils
 from ..animation.serialization import serialize, is_deform_bone_rig
 from ..animation.import_export import import_animation_preserve_ik
@@ -76,21 +83,12 @@ def execute_list_armatures(task_id):
         utils.invalidate_armature_cache()
 
         fresh_armatures = [
-            obj.name for obj in bpy.data.objects if obj.type == "ARMATURE"
+            obj.name for obj in iter_scene_objects() if obj.type == "ARMATURE"
         ]
 
         armatures = []
         for armature_name in fresh_armatures:
-            obj = bpy.data.objects.get(armature_name)
-            if not obj:
-                # Try to find the object even if it's hidden/disabled
-                for obj_candidate in bpy.data.objects:
-                    if (
-                        obj_candidate.name == armature_name
-                        and obj_candidate.type == "ARMATURE"
-                    ):
-                        obj = obj_candidate
-                        break
+            obj = get_object_by_name(armature_name)
 
             if obj:  # Double-check object still exists
                 # build bone hierarchy map: { bone_name: parent_bone_name or None }
@@ -156,20 +154,13 @@ def execute_in_main_thread(task_id, armature_name):
             pending_responses[task_id] = (False, "No armature selected")
             return
 
-        ao = bpy.data.objects.get(armature_name)
+        ao = get_object_by_name(armature_name)
         if not ao:
-            # Try to find the object even if it's hidden/disabled
-            for obj in bpy.data.objects:
-                if obj.name == armature_name and obj.type == "ARMATURE":
-                    ao = obj
-                    break
-
-            if not ao:
-                pending_responses[task_id] = (
-                    False,
-                    f"Armature '{armature_name}' not found.",
-                )
-                return
+            pending_responses[task_id] = (
+                False,
+                f"Armature '{armature_name}' not found.",
+            )
+            return
 
         if ao.type != "ARMATURE":
             pending_responses[task_id] = (
@@ -238,18 +229,11 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 "No armature specified for import. Please provide target armature or select one in the scene."
             )
 
-        ao = bpy.data.objects.get(armature_name)
+        ao = get_object_by_name(armature_name)
         if not ao:
-            # Try to find the object even if it's hidden/disabled
-            for obj in bpy.data.objects:
-                if obj.name == armature_name and obj.type == "ARMATURE":
-                    ao = obj
-                    break
-
-            if not ao:
-                raise ValueError(
-                    f"Selected object '{armature_name}' is not a valid armature."
-                )
+            raise ValueError(
+                f"Selected object '{armature_name}' is not a valid armature."
+            )
 
         if ao.type != "ARMATURE":
             raise ValueError(
@@ -605,20 +589,13 @@ def execute_get_bone_rest(task_id, armature_name):
             pending_responses[task_id] = (False, "No armature selected")
             return
 
-        ao = bpy.data.objects.get(armature_name)
+        ao = get_object_by_name(armature_name)
         if not ao:
-            # Try to find the object even if it's hidden/disabled
-            for obj in bpy.data.objects:
-                if obj.name == armature_name and obj.type == "ARMATURE":
-                    ao = obj
-                    break
-
-            if not ao:
-                pending_responses[task_id] = (
-                    False,
-                    f"Object '{armature_name}' is not a valid armature.",
-                )
-                return
+            pending_responses[task_id] = (
+                False,
+                f"Object '{armature_name}' is not a valid armature.",
+            )
+            return
 
         if ao.type != "ARMATURE":
             pending_responses[task_id] = (

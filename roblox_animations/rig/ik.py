@@ -3,7 +3,7 @@ ik (inverse kinematics) setup and management utilities.
 """
 
 import math
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 import bpy
 from mathutils import Vector, Matrix
@@ -120,7 +120,6 @@ def update_pole_axis(
     
     # Switch to edit mode to move the pole bone
     bpy.context.view_layer.objects.active = ao
-    current_mode = ao.mode
     bpy.ops.object.mode_set(mode="EDIT")
     
     amt = ao.data
@@ -206,13 +205,13 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                 # Remove Y scale driver
                 try:
                     pose_bone.driver_remove("scale", 1)
-                except:
+                except Exception:
                     pass
         
         # Remove IK constraint influence driver (from IK-FK switch)
         try:
             constraint.driver_remove("influence")
-        except:
+        except Exception:
             pass
         
         # Remove Copy Rotation/Location constraints and their drivers from child bones (foot/hand)
@@ -228,7 +227,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                 # Remove driver before removing constraint
                 try:
                     c.driver_remove("influence")
-                except:
+                except Exception:
                     pass
                 child_bone.constraints.remove(c)
             
@@ -266,7 +265,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
         if bone:
             try:
                 bone.driver_remove("hide")
-            except:
+            except Exception:
                 pass
 
     # ensure we're operating on the right object
@@ -328,7 +327,7 @@ def setup_ik_stretch(
         # Add driver to scale Y (bone length axis)
         try:
             pose_bone.driver_remove("scale", 1)
-        except:
+        except Exception:
             pass
         
         driver = pose_bone.driver_add("scale", 1)
@@ -444,7 +443,7 @@ def _add_ikfk_driver(
     """Add a driver to a constraint property that reads the IK_FK custom property."""
     try:
         constraint.driver_remove(prop_name)
-    except:
+    except Exception:
         pass
     
     driver = constraint.driver_add(prop_name)
@@ -458,7 +457,8 @@ def _add_ikfk_driver(
     var.name = "ikfk"
     var.type = 'SINGLE_PROP'
     var.targets[0].id = ao
-    var.targets[0].data_path = f'pose.bones["{ik_target_name}"]["IK_FK"]'
+    safe_name = bpy.utils.escape_identifier(ik_target_name)
+    var.targets[0].data_path = f'pose.bones["{safe_name}"]["IK_FK"]'
 
 
 def _add_ikfk_hide_driver(
@@ -469,7 +469,7 @@ def _add_ikfk_hide_driver(
     """Add a driver to hide a bone when IK_FK < 0.5."""
     try:
         bone.driver_remove("hide")
-    except:
+    except Exception:
         pass
     
     driver = bone.driver_add("hide")
@@ -483,7 +483,8 @@ def _add_ikfk_hide_driver(
     var.name = "ikfk"
     var.type = 'SINGLE_PROP'
     var.targets[0].id = ao
-    var.targets[0].data_path = f'pose.bones["{ik_target_name}"]["IK_FK"]'
+    safe_name = bpy.utils.escape_identifier(ik_target_name)
+    var.targets[0].data_path = f'pose.bones["{safe_name}"]["IK_FK"]'
     
     # Hide when IK_FK < 0.5 (FK mode)
     drv.expression = "ikfk < 0.5"
@@ -597,7 +598,6 @@ def create_ik_config(
             edit_bone = amt.edit_bones.get(bone.name)
             if edit_bone and edit_bone.parent:
                 # offset the head slightly in the local Y direction (forward bend)
-                local_y = (edit_bone.tail - edit_bone.head).normalized()
                 # use the bone's local Z axis for the bend direction (flipped)
                 local_z = edit_bone.z_axis.normalized()
                 edit_bone.head = edit_bone.head - local_z * prebend_offset

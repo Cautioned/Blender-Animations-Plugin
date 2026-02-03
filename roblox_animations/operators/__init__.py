@@ -25,6 +25,7 @@ from .rig_ops import (
     OBJECT_OT_AnalyzePhysics,
     OBJECT_OT_TogglePhysicsGhost,
     OBJECT_OT_ToggleRotationMomentum,
+    OBJECT_OT_ToggleWeldBones,
 )
 from .animation_ops import (
     OBJECT_OT_ApplyTransform,
@@ -69,6 +70,7 @@ __all__ = [
     "OBJECT_OT_AnalyzePhysics",
     "OBJECT_OT_TogglePhysicsGhost",
     "OBJECT_OT_ToggleRotationMomentum",
+    "OBJECT_OT_ToggleWeldBones",
     # Animation operators
     "OBJECT_OT_ApplyTransform",
     "OBJECT_OT_MapKeyframes",

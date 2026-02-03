@@ -556,8 +556,61 @@ do -- Creates the plugin
 		})
 	end
 
+	-- Build tab content once to avoid re-parent churn on tab switches
+	local tabContent = {
+		Player = PlayerTab.create(services),
+		Rigging = RiggingTab.create(services),
+		["Blender Sync"] = BlenderSyncTab.create(services),
+		Tools = ToolsTab.create(services),
+		More = MoreTab.create(services),
+	}
+
+	local function makeTabFrame(tabName: string, children)
+		local tabChildren = {
+			_UIListLayout = New("UIListLayout")({
+				SortOrder = Enum.SortOrder.LayoutOrder,
+				Padding = UDim.new(0, 7),
+			}),
+			_UIPadding = New("UIPadding")({
+				PaddingLeft = UDim.new(0, 5),
+				PaddingRight = UDim.new(0, 5),
+				PaddingBottom = UDim.new(0, 10),
+				PaddingTop = UDim.new(0, 10),
+			}),
+		}
+		for i, child in ipairs(children) do
+			tabChildren["child" .. i] = child
+		end
+		return New("Frame")({
+			Name = tabName .. "Tab",
+			BackgroundTransparency = 1,
+			Size = Computed(function()
+				return if State.activeTab:get() == tabName
+					then UDim2.new(1, 0, 0, 0)
+					else UDim2.new(1, 0, 0, 0)
+			end),
+			AutomaticSize = Computed(function()
+				return if State.activeTab:get() == tabName
+					then Enum.AutomaticSize.Y
+					else Enum.AutomaticSize.None
+			end),
+			Visible = Computed(function()
+				return State.activeTab:get() == tabName
+			end),
+			[Children] = tabChildren,
+		})
+	end
+
+	local tabFrames = {
+		_PlayerTab = makeTabFrame("Player", tabContent.Player),
+		_RiggingTab = makeTabFrame("Rigging", tabContent.Rigging),
+		_BlenderSyncTab = makeTabFrame("Blender Sync", tabContent["Blender Sync"]),
+		_ToolsTab = makeTabFrame("Tools", tabContent.Tools),
+		_MoreTab = makeTabFrame("More", tabContent.More),
+	}
+
 	-- Create the main widget
-	local function pluginWidget(tabChildren)
+	local function pluginWidget()
 		return Widget({
 			Plugin = Plugin,
 			Id = game:GetService("HttpService"):GenerateGUID(),
@@ -587,25 +640,13 @@ do -- Creates the plugin
 						end),
 						BackgroundTransparency = 1,
 						AutomaticCanvasSize = Enum.AutomaticSize.Y,
-						[Children] = Computed(function()
-							local dynamicChildren = tabChildren:get()
-							local allChildren = {
-								_UIListLayout = New("UIListLayout")({
-									SortOrder = Enum.SortOrder.LayoutOrder,
-									Padding = UDim.new(0, 7),
-								}),
-								_UIPadding = New("UIPadding")({
-									PaddingLeft = UDim.new(0, 5),
-									PaddingRight = UDim.new(0, 5),
-									PaddingBottom = UDim.new(0, 10),
-									PaddingTop = UDim.new(0, 10),
-								}),
-							}
-							for i, child in ipairs(dynamicChildren) do
-								allChildren["child" .. i] = child
-							end
-							return allChildren
-						end),
+						[Children] = {
+							_PlayerTab = tabFrames._PlayerTab,
+							_RiggingTab = tabFrames._RiggingTab,
+							_BlenderSyncTab = tabFrames._BlenderSyncTab,
+							_ToolsTab = tabFrames._ToolsTab,
+							_MoreTab = tabFrames._MoreTab,
+						},
 				}),
 			},
 			}),
@@ -613,21 +654,7 @@ do -- Creates the plugin
 	end
 
 	-- Create the main widget with tab content
-	pluginWidget(Computed(function()
-		local tab = State.activeTab:get()
-		if tab == "Player" then
-			return PlayerTab.create(services) :: any
-		elseif tab == "Rigging" then
-			return RiggingTab.create(services) :: any
-		elseif tab == "Blender Sync" then
-			return BlenderSyncTab.create(services) :: any
-		elseif tab == "Tools" then
-			return ToolsTab.create(services) :: any
-		elseif tab == "More" then
-			return MoreTab.create(services) :: any
-		end
-		return {}
-	end))
+		pluginWidget()
 	
 	-- Create the help widget
 	local _helpWidget = Widget({

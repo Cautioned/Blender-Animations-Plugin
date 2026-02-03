@@ -8,7 +8,7 @@ import urllib.parse
 import http.server
 import traceback
 import bpy
-from ..core.utils import get_cached_armatures, get_cached_armature_hash
+from ..core.utils import get_cached_armatures, get_cached_armature_hash, get_object_by_name
 from .requests import (
     pending_requests,
     pending_responses,
@@ -24,7 +24,7 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
         cached_armatures = get_cached_armatures()
         armatures = []
         for armature_name in cached_armatures:
-            obj = bpy.data.objects.get(armature_name)
+            obj = get_object_by_name(armature_name)
             if obj:  # Double-check object still exists
                 armature_info = {
                     "name": obj.name,
@@ -61,7 +61,7 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
-            obj = bpy.data.objects.get(armature_name)
+            obj = get_object_by_name(armature_name)
             if not (obj and obj.type == "ARMATURE"):
                 self.send_detailed_error(404, "Not Found", "Armature not found")
                 return
