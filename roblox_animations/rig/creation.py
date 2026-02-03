@@ -98,7 +98,7 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
     """Resolve an aux entry to a mesh.
     
     Priority order:
-    1. Fingerprint object map (authoritative, from size fingerprinting)
+    1. Fingerprint object map (authoritative, from index-based matching)
     2. Name-based lookup (fallback)
     3. Position fingerprint (last resort)
     """
@@ -107,16 +107,20 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
     
     
     # This is the definitive mapping established during import fingerprinting
+    # Map is keyed by FINAL object name (with .001 suffix), so search by stripped name match
     fp_map = match_ctx.get("fingerprint_object_map", {})
-    if aux_name and aux_name in fp_map:
-        obj = fp_map[aux_name]
-        if obj not in used:
-            print(f"[_find_matching_part] FINGERPRINT HIT: '{aux_name}' -> mesh '{obj.name}'")
-            return obj
+    if aux_name and fp_map:
+        # find all objects in fp_map whose stripped name matches aux_name
+        for obj_name, obj in fp_map.items():
+            if _strip_suffix(obj_name) == aux_name and obj not in used:
+                print(f"[_find_matching_part] FINGERPRINT HIT: '{aux_name}' -> mesh '{obj.name}'")
+                return obj
+        # if we get here, either no match or all matches were used
+        has_any = any(_strip_suffix(k) == aux_name for k in fp_map.keys())
+        if has_any:
+            print(f"[_find_matching_part] FINGERPRINT found but all used: '{aux_name}'")
         else:
-            print(f"[_find_matching_part] FINGERPRINT found but already used: '{aux_name}'")
-    elif aux_name:
-        print(f"[_find_matching_part] FINGERPRINT MISS: '{aux_name}' not in map (map has {len(fp_map)} entries)")
+            print(f"[_find_matching_part] FINGERPRINT MISS: '{aux_name}' not in map (map has {len(fp_map)} entries)")
     
     # Fallback: Name-based candidates (base name match, ignoring suffixes)
     name_index = match_ctx["name_index"]
