@@ -22,9 +22,16 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     import bmesh
     from collections import defaultdict
     
-    part_aux_list = meta_loaded.get("partAux")
-    if not part_aux_list:
+    part_aux_raw = meta_loaded.get("partAux")
+    if not part_aux_raw:
         return 0
+
+    # lua arrays with numeric keys come through as dicts {"1": ..., "2": ...}
+    # normalize to list of values
+    if isinstance(part_aux_raw, dict):
+        part_aux_list = list(part_aux_raw.values())
+    else:
+        part_aux_list = part_aux_raw
 
     rig_name = meta_loaded.get("rigName", "Rig")
     num_targets = len(part_aux_list)
@@ -33,7 +40,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     # Pre-process targets
     fp_targets = []
     for item in part_aux_list:
-        if not item or "idx" not in item:
+        if not item or not isinstance(item, dict) or "idx" not in item:
             continue
         
         idx = item["idx"]
@@ -61,14 +68,22 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     BUCKET_QUANTUM = 0.1
     mesh_objects = [o for o in parts_collection.objects if o.type == "MESH"]
     
+    print(f"[RigImport] Target fingerprints from metadata:")
+    for t in fp_targets[:5]:  # show first 5
+        print(f"[RigImport]   '{t['target']}': dims={t['dims']}, sig={t['sig']:.6f}")
+    
+    # build candidates from ALL mesh objects - don't trust existing names
     candidate_buckets = defaultdict(list)
     all_candidates = []
     
+    print(f"[RigImport] Mesh object dimensions:")
     for obj in mesh_objects:
         d = obj.dimensions
         sorted_dims = tuple(sorted([d.x, d.y, d.z]))
         sig = sum(sorted_dims)
         bucket_key = round(sig / BUCKET_QUANTUM)
+        
+        print(f"[RigImport]   '{obj.name}': dims={tuple(round(x, 6) for x in sorted_dims)}, sig={sig:.6f}")
         
         cand = {
             "obj": obj,
@@ -90,17 +105,27 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     fingerprint_object_map = {}
     renamed_count = 0
     rejected_count = 0
-    MAX_ACCEPTABLE_DIFF = 0.15
+    skipped_count = 0
+    no_candidate_count = 0
+    ambiguous_count = 0
+    # perturbation is 0.0001 * id per axis, so 0.0003 * id for sum of 3 dims
+    # but OBJ export loses precision, so only trust matches that are clearly unique
+    MAX_ACCEPTABLE_DIFF = 0.01
+    AMBIGUITY_THRESHOLD = 0.001  # if 2nd best is within this of best, it's ambiguous
     
     for target in fp_targets:
+        target_name = target["target"]
         target_dims = target["dims"]
         target_sig = target["sig"]
         is_vol_mode = len(target_dims) == 1
         
         best_cand = None
         best_diff = float('inf')
+        second_best_diff = float('inf')
+        candidates_checked = 0
         
         for cand in get_nearby_candidates(target_sig):
+            candidates_checked += 1
             if is_vol_mode:
                 # Volume mode - need to calc mesh volume lazily
                 if "vol" not in cand:
@@ -119,30 +144,41 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
                 diff = sum(abs(a - b) for a, b in zip(target_dims, cand["dims"]))
             
             if diff < best_diff:
+                second_best_diff = best_diff
                 best_diff = diff
                 best_cand = cand
+            elif diff < second_best_diff:
+                second_best_diff = diff
         
-        if best_cand and best_diff <= MAX_ACCEPTABLE_DIFF:
+        # Check for ambiguity - if 2nd best is nearly as good, don't trust the match
+        is_ambiguous = (second_best_diff - best_diff) < AMBIGUITY_THRESHOLD
+        
+        if best_cand and best_diff <= MAX_ACCEPTABLE_DIFF and not is_ambiguous:
             obj = best_cand["obj"]
-            obj.name = target["target"]
+            current_name = _strip_suffix(obj.name)
             best_cand["used"] = True
-            renamed_count += 1
-            fingerprint_object_map[target["target"]] = obj
-        elif best_cand:
-            rejected_count += 1
-    
-    print(f"[RigImport] Fingerprinting: {renamed_count} matched, {rejected_count} rejected")
-    
-    meta_loaded["_fingerprint_object_map"] = fingerprint_object_map
-    return renamed_count
+            fingerprint_object_map[target_name] = obj
             
-    print(f"[RigImport] Size fingerprinting resolved {renamed_count} parts.")
-    print(f"[RigImport] Fingerprint map has {len(fingerprint_object_map)} entries")
+            if current_name == target_name:
+                # already has correct name, don't rename
+                skipped_count += 1
+            else:
+                obj.name = target_name
+                renamed_count += 1
+        elif is_ambiguous and best_cand:
+            # Multiple parts have same dimensions - let position matching handle it
+            ambiguous_count += 1
+        elif best_cand:
+            print(f"[RigImport]   '{target_name}' rejected: best_diff={best_diff:.6f} > {MAX_ACCEPTABLE_DIFF} (checked {candidates_checked} candidates)")
+            rejected_count += 1
+        else:
+            print(f"[RigImport]   '{target_name}' no candidates found (target_sig={target_sig:.4f}, checked {candidates_checked})")
+            no_candidate_count += 1
     
-    # Store the map on the metadata so create_rig can use it
+    print(f"[RigImport] Fingerprinting: {renamed_count} renamed, {skipped_count} already correct, {ambiguous_count} ambiguous, {rejected_count} rejected, {no_candidate_count} no candidates")
+    
     meta_loaded["_fingerprint_object_map"] = fingerprint_object_map
-    
-    return renamed_count
+    return renamed_count + skipped_count
 
 
 

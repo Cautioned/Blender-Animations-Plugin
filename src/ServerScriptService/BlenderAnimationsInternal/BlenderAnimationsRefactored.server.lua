@@ -36,6 +36,7 @@ local Widget = require(PluginComponents.Widget)
 local Toolbar = require(PluginComponents.Toolbar)
 local ToolbarButton = require(PluginComponents.ToolbarButton)
 local Selection = game:GetService("Selection")
+local UserInputService = game:GetService("UserInputService")
 local StudioComponents = Components:FindFirstChild("StudioComponents")
 
 local ScrollFrame = require(StudioComponents.ScrollFrame)
@@ -78,6 +79,50 @@ local services = {
 	blenderSyncManager = blenderSyncManager,
 	plugin = Plugin,
 }
+
+local function importAnimationFromClipboard()
+	if not State.enableClipboardExport:get() then
+		warn("Clipboard import is disabled in Settings.")
+		return
+	end
+	if not State.activeRigExists:get() then
+		warn("No active rig selected.")
+		return
+	end
+
+	services.playbackService:stopAnimationAndDisconnect()
+	local importScriptText = "Paste the animation data below this line"
+
+	services.exportManager:clearMetaParts()
+	if State.importScript then
+		State.importScript:Destroy()
+	end
+	State.importScript = Instance.new("Script", game.Workspace)
+	assert(State.importScript)
+	State.importScript.Archivable = false
+	State.importScript.Source = "-- " .. importScriptText .. "\n"
+	Plugin:OpenScript(State.importScript, 2)
+	local tempConnection: RBXScriptConnection
+	tempConnection = State.importScript.Changed:Connect(function(prop)
+		if prop == "Source" then
+			tempConnection:Disconnect()
+			if State.importScript then
+				local animData = select(
+					3,
+					string.find(
+						State.importScript.Source,
+						"^%-%- " .. importScriptText .. "\n(.*)$"
+					)
+				)
+				State.importScript:Destroy()
+				State.importScript = nil
+				if animData then
+					services.animationManager:loadAnimDataFromText(animData, false)
+				end
+			end
+		end
+	end)
+end
 
 local function cleanupAll()
 	-- 1. Stop running processes (synchronously so it finishes before unload)
@@ -213,6 +258,21 @@ do -- Creates the plugin
 		Plugin = Plugin,
 		Name = "Blender Animations",
 	})
+
+	local importClipboardAction = Plugin:CreatePluginAction(
+		"BlenderAnimations_ImportClipboard",
+		"Import Animation (Clipboard)",
+		"Import animation data from clipboard",
+		""
+	)
+
+	table.insert(
+		State.connections,
+		importClipboardAction.Triggered:Connect(function()
+			State.activeTab:set("Player")
+			importAnimationFromClipboard()
+		end)
+	)
 
 	State.widgetsEnabled = Value(false)
 	State.helpWidgetEnabled = Value(false)
@@ -725,6 +785,48 @@ end
 
 -- Always listen for selection changes
 table.insert(State.connections, Selection.SelectionChanged:Connect(updateActiveRigFromSelection))
+
+-- Tab hotkey (Tab / Shift+Tab) to cycle tabs
+table.insert(
+	State.connections,
+	UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+		if not State.widgetsEnabled:get() then
+			return
+		end
+		if UserInputService:GetFocusedTextBox() then
+			return
+		end
+		if input.KeyCode ~= Enum.KeyCode.Tab then
+			return
+		end
+
+		local tabs = State.tabs:get()
+		if #tabs == 0 then
+			return
+		end
+		local current = State.activeTab:get()
+		local currentIndex = 1
+		for i, t in ipairs(tabs) do
+			if t == current then
+				currentIndex = i
+				break
+			end
+		end
+		local isShift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+		local step = isShift and -1 or 1
+		local nextIndex = currentIndex + step
+		if nextIndex > #tabs then
+			nextIndex = 1
+		elseif nextIndex < 1 then
+			nextIndex = #tabs
+		end
+		State.activeTab:set(tabs[nextIndex])
+	end)
+)
 
 
 

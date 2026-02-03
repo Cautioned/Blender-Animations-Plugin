@@ -129,18 +129,18 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 			-- Different IDs = Different 'e' = Distinct resulting dimensions.
 
 			local id = partCount
-			local quantum = 0.0001 -- 0.1mm steps
+			local quantum = 0.0001 -- 1cm steps - must survive FBX precision loss
 
 			local perturbation = Vector3.one * (id * quantum)
 			desc.Size = desc.Size + perturbation
 
-			-- Store Expected Dimensions/Volume
-			partAuxData[partCount] = {
+			-- Store Expected Dimensions/Volume (use table.insert for proper JSON array serialization)
+			table.insert(partAuxData, {
 				idx = partCount,
 				name = desc.Name,
 				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
 				vol_fp = desc.Size.X * desc.Size.Y * desc.Size.Z, -- Fallback for Mesh Volume calculation
-			}
+			})
 
 			if originalInst then
 				partEncodeMap[originalInst] = desc.Name
@@ -161,7 +161,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 
-	print("[ExportManager] Exporting with Robust Size Fingerprints (v1.4) - Uniform Scaling")
+	-- print("[ExportManager] Exporting with Robust Size Fingerprints (v1.4) - Uniform Scaling")
 
 	return {
 		rigName = State.activeRig.model.Name,
@@ -213,16 +213,17 @@ function ExportManager:generateMetadataLegacy(
 
 			-- Generate Robust Geometric Fingerprint (Legacy)
 			local id = partCount
-			local quantum = 0.0001
+			local quantum = 0.0001 -- 1cm steps - must survive FBX precision loss
 
 			local perturbation = Vector3.one * (id * quantum)
 			desc.Size = desc.Size + perturbation
 
-			partAuxData[partCount] = {
+			-- use table.insert for proper JSON array serialization
+			table.insert(partAuxData, {
 				idx = partCount,
 				name = desc.Name,
 				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
-			}
+			})
 		end
 		-- No need to destroy Humanoid or AnimationController
 	end
@@ -236,7 +237,7 @@ function ExportManager:generateMetadataLegacy(
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 
-	print("[ExportManager] Exporting Legacy with Size/Volume Fingerprints (v1.3)")
+	-- print("[ExportManager] Exporting Legacy with Size/Volume Fingerprints (v1.3)")
 
 	return {
 		rigName = State.activeRig.model.Name,
@@ -327,6 +328,10 @@ function ExportManager:exportRig()
 		metaPart.Archivable = false
 		idx = idx + 1
 	end
+	
+	-- Wait a frame for size changes to propagate before export
+	task.wait()
+	
 	game.Selection:Set(State.metaParts)
 	PluginManager():ExportSelection() -- deprecated
 end
@@ -411,6 +416,10 @@ function ExportManager:exportRigLegacy()
 		metaPart.Archivable = false
 		idx = idx + 1
 	end
+	
+	-- Wait a frame for size changes to propagate before export
+	task.wait()
+	
 	game.Selection:Set(State.metaParts)
 	PluginManager():ExportSelection() -- deprecated
 end
