@@ -99,12 +99,19 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
     
     Priority order:
     1. Fingerprint object map (authoritative, from index-based matching)
-    2. Name-based lookup (fallback)
+    2. Name-based lookup with position tiebreaking (for duplicates)
     3. Position fingerprint (last resort)
     """
     used = match_ctx["used"]
     t2b = match_ctx["t2b"]
     
+    # Pre-compute expected position if we have transform data
+    expected_pos = None
+    if aux_cf:
+        try:
+            expected_pos = (t2b @ cf_to_mat(aux_cf)).to_translation()
+        except Exception:
+            pass
     
     # This is the definitive mapping established during import fingerprinting
     # Map is keyed by FINAL object name (with .001 suffix), so search by stripped name match
@@ -123,6 +130,7 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
             print(f"[_find_matching_part] FINGERPRINT MISS: '{aux_name}' not in map (map has {len(fp_map)} entries)")
     
     # Fallback: Name-based candidates (base name match, ignoring suffixes)
+    # WITH POSITION TIEBREAKING for multiple candidates
     name_index = match_ctx["name_index"]
     candidates = []
     base_name = _strip_suffix(aux_name or "").lower()
@@ -132,7 +140,30 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
                 candidates.append(obj)
 
     if candidates:
-        return candidates[0]
+        if len(candidates) == 1:
+            return candidates[0]
+        # Multiple candidates - use position to pick closest, but ONLY if within reasonable distance
+        MAX_NAME_POS_DIST = 1.0  # 1 unit max - if nothing is this close, don't guess
+        if expected_pos is not None:
+            best_obj = None
+            best_dist = float('inf')
+            for obj in candidates:
+                obj_pos = obj.matrix_world.to_translation()
+                dist = (obj_pos - expected_pos).length
+                if dist < best_dist:
+                    best_dist = dist
+                    best_obj = obj
+            if best_obj and best_dist <= MAX_NAME_POS_DIST:
+                print(f"[_find_matching_part] NAME+POS: '{aux_name}' -> '{best_obj.name}' (dist={best_dist:.4f}, {len(candidates)} candidates)")
+                return best_obj
+            elif best_obj:
+                print(f"[_find_matching_part] NAME+POS REJECTED: '{aux_name}' best candidate '{best_obj.name}' too far (dist={best_dist:.4f} > {MAX_NAME_POS_DIST})")
+                return None  # Don't return a bad match
+        # No position data, just take first (legacy behavior) - but this is risky with many candidates
+        if len(candidates) <= 3:
+            return candidates[0]
+        print(f"[_find_matching_part] NAME AMBIGUOUS: '{aux_name}' has {len(candidates)} candidates, no position data to disambiguate")
+        return None
 
     # Position fingerprint fallback at multiple precision levels
     # Only accept unambiguous matches within a small distance threshold.
