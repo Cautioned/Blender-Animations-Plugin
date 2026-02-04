@@ -67,8 +67,46 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
 
     BUCKET_QUANTUM = 0.1
     mesh_objects = [o for o in parts_collection.objects if o.type == "MESH"]
+    mesh_centers = {obj: _get_mesh_world_center(obj) for obj in mesh_objects}
+
+    # Build expected position map from rig definition (for left/right disambiguation)
+    expected_loc_by_name = {}
+    rig_def = meta_loaded.get("rig")
+    if rig_def:
+        t2b = get_transform_to_blender()
+
+        def collect_expected_positions(node, depth=0):
+            if not node:
+                return
+            jname = node.get("jname") or node.get("pname") or ""
+            node_transform = node.get("transform")
+            if jname and node_transform:
+                try:
+                    expected_loc = (t2b @ cf_to_mat(node_transform)).to_translation()
+                    expected_loc_by_name[jname.lower()] = expected_loc
+                except Exception:
+                    pass
+
+            aux_names = node.get("aux") or []
+            aux_transforms = node.get("auxTransform") or []
+            for idx, aux_name in enumerate(aux_names):
+                if not aux_name:
+                    continue
+                cf = aux_transforms[idx] if idx < len(aux_transforms) else None
+                if not cf:
+                    continue
+                try:
+                    expected_loc = (t2b @ cf_to_mat(cf)).to_translation()
+                    expected_loc_by_name[aux_name.lower()] = expected_loc
+                except Exception:
+                    pass
+
+            for child in (node.get("children") or []):
+                collect_expected_positions(child, depth + 1)
+
+        collect_expected_positions(rig_def)
     
-    print(f"[RigImport] Target fingerprints from metadata:")
+    print("[RigImport] Target fingerprints from metadata:")
     for t in fp_targets[:5]:  # show first 5
         print(f"[RigImport]   '{t['target']}': dims={t['dims']}, sig={t['sig']:.6f}")
     
@@ -76,7 +114,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     candidate_buckets = defaultdict(list)
     all_candidates = []
     
-    print(f"[RigImport] Mesh object dimensions:")
+    print("[RigImport] Mesh object dimensions:")
     for obj in mesh_objects:
         d = obj.dimensions
         sorted_dims = tuple(sorted([d.x, d.y, d.z]))
@@ -101,81 +139,167 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
             for c in candidate_buckets.get(b, []):
                 if not c["used"]:
                     yield c
+
+    def get_scaled_candidates(sig):
+        if sig <= 0:
+            return iter(())
+        min_sig = sig * MIN_SCALE
+        max_sig = sig * MAX_SCALE
+        min_bucket = round(min_sig / BUCKET_QUANTUM)
+        max_bucket = round(max_sig / BUCKET_QUANTUM)
+        for b in range(min_bucket, max_bucket + 1):
+            for c in candidate_buckets.get(b, []):
+                if not c["used"]:
+                    yield c
     
     fingerprint_object_map = {}
     renamed_count = 0
     rejected_count = 0
     skipped_count = 0
-    no_candidate_count = 0
-    ambiguous_count = 0
-    # perturbation is 0.0001 * id per axis, so 0.0003 * id for sum of 3 dims
-    # but OBJ export loses precision, so only trust matches that are clearly unique
-    MAX_ACCEPTABLE_DIFF = 0.01
-    AMBIGUITY_THRESHOLD = 0.001  # if 2nd best is within this of best, it's ambiguous
+    scale_samples = []
+    MAX_ACCEPTABLE_REL_DIFF = 0.03
+    MAX_ACCEPTABLE_DIFF_VOL = 0.01
+    MIN_SCALE = 0.1
+    MAX_SCALE = 10.0
+    MAX_POS_DIST = 0.15
+    LOOSE_POS_DIST = MAX_POS_DIST * 3
     
-    for target in fp_targets:
-        target_name = target["target"]
+    mesh_x_positive = {obj: mesh_centers[obj].x > 0 for obj in mesh_objects}
+    
+    def compute_size_match(target, cand):
         target_dims = target["dims"]
         target_sig = target["sig"]
         is_vol_mode = len(target_dims) == 1
         
-        best_cand = None
-        best_diff = float('inf')
-        second_best_diff = float('inf')
-        candidates_checked = 0
-        
-        for cand in get_nearby_candidates(target_sig):
-            candidates_checked += 1
-            if is_vol_mode:
-                # Volume mode - need to calc mesh volume lazily
-                if "vol" not in cand:
-                    bm = bmesh.new()
-                    try:
-                        bm.from_mesh(cand["obj"].data)
-                        cand["vol"] = abs(bm.calc_volume())
-                    except Exception:
-                        d = cand["dims"]
-                        cand["vol"] = d[0] * d[1] * d[2]
-                    finally:
-                        bm.free()
-                diff = abs(target_dims[0] - cand["vol"])
-            else:
-                # Dims mode - direct comparison
-                diff = sum(abs(a - b) for a, b in zip(target_dims, cand["dims"]))
-            
-            if diff < best_diff:
-                second_best_diff = best_diff
-                best_diff = diff
-                best_cand = cand
-            elif diff < second_best_diff:
-                second_best_diff = diff
-        
-        # Check for ambiguity - if 2nd best is nearly as good, don't trust the match
-        is_ambiguous = (second_best_diff - best_diff) < AMBIGUITY_THRESHOLD
-        
-        if best_cand and best_diff <= MAX_ACCEPTABLE_DIFF and not is_ambiguous:
-            obj = best_cand["obj"]
-            current_name = _strip_suffix(obj.name)
-            best_cand["used"] = True
-            fingerprint_object_map[target_name] = obj
-            
-            if current_name == target_name:
-                # already has correct name, don't rename
-                skipped_count += 1
-            else:
-                obj.name = target_name
-                renamed_count += 1
-        elif is_ambiguous and best_cand:
-            # Multiple parts have same dimensions - let position matching handle it
-            ambiguous_count += 1
-        elif best_cand:
-            print(f"[RigImport]   '{target_name}' rejected: best_diff={best_diff:.6f} > {MAX_ACCEPTABLE_DIFF} (checked {candidates_checked} candidates)")
-            rejected_count += 1
+        if is_vol_mode:
+            if "vol" not in cand:
+                bm = bmesh.new()
+                try:
+                    bm.from_mesh(cand["obj"].data)
+                    cand["vol"] = abs(bm.calc_volume())
+                except Exception:
+                    d = cand["dims"]
+                    cand["vol"] = d[0] * d[1] * d[2]
+                finally:
+                    bm.free()
+            diff = abs(target_dims[0] - cand["vol"])
+            return (diff, 1.0) if diff <= MAX_ACCEPTABLE_DIFF_VOL else (None, None)
         else:
-            print(f"[RigImport]   '{target_name}' no candidates found (target_sig={target_sig:.4f}, checked {candidates_checked})")
-            no_candidate_count += 1
+            if target_sig <= 0:
+                return (None, None)
+            scale = cand["sig"] / target_sig
+            if scale < MIN_SCALE or scale > MAX_SCALE:
+                return (None, None)
+            scaled_target = [d * scale for d in target_dims]
+            diff = sum(abs(a - b) for a, b in zip(scaled_target, cand["dims"]))
+            diff = diff / max(cand["sig"], 1e-6)
+            return (diff, scale) if diff <= MAX_ACCEPTABLE_REL_DIFF else (None, None)
     
-    print(f"[RigImport] Fingerprinting: {renamed_count} renamed, {skipped_count} already correct, {ambiguous_count} ambiguous, {rejected_count} rejected, {no_candidate_count} no candidates")
+    def check_candidate(target_name, target_lower, cand, scale, expected_loc):
+        obj = cand["obj"]
+        mesh_center = mesh_centers[obj]
+        
+        is_left = 'left' in target_lower
+        is_right = 'right' in target_lower
+        if is_left or is_right:
+            if expected_loc is not None:
+                expected_x = expected_loc.x * scale
+                tolerance = 0.1 * scale
+                if abs(expected_x) >= tolerance:
+                    expected_positive = expected_x > 0
+                    if mesh_x_positive[obj] != expected_positive:
+                        return (float('inf'), False)
+        
+        if expected_loc is None:
+            return (float('inf'), True)
+        expected_scaled = expected_loc * scale
+        pos_dist = (mesh_center - expected_scaled).length
+        return (pos_dist, True)
+    
+    from statistics import median
+    
+    matched = {}
+    unmatched = []
+    
+    for target in fp_targets:
+        target_name = target["target"]
+        target_lower = target_name.lower()
+        expected_loc = expected_loc_by_name.get(target_lower)
+        is_vol_mode = len(target["dims"]) == 1
+        
+        best_cand = None
+        best_pos_dist = float('inf')
+        best_scale = 1.0
+        best_diff = float('inf')
+        pass_num = 0
+        
+        cand_iter = get_nearby_candidates(target["sig"]) if is_vol_mode else get_scaled_candidates(target["sig"])
+        for cand in cand_iter:
+            diff, scale = compute_size_match(target, cand)
+            if diff is None:
+                continue
+            
+            pos_dist, valid = check_candidate(target_name, target_lower, cand, scale, expected_loc)
+            if not valid:
+                continue
+            
+            # Determine which pass this match qualifies for
+            if expected_loc is not None:
+                scaled_threshold = MAX_POS_DIST * scale
+                loose_threshold = LOOSE_POS_DIST * scale
+                
+                if pos_dist < scaled_threshold:
+                    # Pass 1 quality - tight position match
+                    if pos_dist < best_pos_dist or (pos_dist == best_pos_dist and diff < best_diff):
+                        best_cand, best_pos_dist, best_scale, best_diff, pass_num = cand, pos_dist, scale, diff, 1
+                elif pos_dist < loose_threshold:
+                    # Pass 1.5 quality - loose position match (only if no pass 1 match)
+                    if pass_num < 1 and (pos_dist < best_pos_dist or (pos_dist == best_pos_dist and diff < best_diff)):
+                        best_cand, best_pos_dist, best_scale, best_diff, pass_num = cand, pos_dist, scale, diff, 15
+                else:
+                    # Pass 2 quality - size only (only if no better match)
+                    if pass_num < 1 and diff < best_diff:
+                        best_cand, best_pos_dist, best_scale, best_diff, pass_num = cand, float('inf'), scale, diff, 2
+            else:
+                # No position data - size only match
+                if diff < best_diff:
+                    best_cand, best_pos_dist, best_scale, best_diff, pass_num = cand, float('inf'), scale, diff, 2
+        
+        if best_cand is not None:
+            matched[target_name] = (target, best_cand, best_scale, best_pos_dist, pass_num)
+        else:
+            unmatched.append(target)
+    
+    # Commit all matches
+    pass_counts = {1: 0, 15: 0, 2: 0}
+    for target_name, (target, cand, scale, pos_dist, pass_num) in matched.items():
+        obj = cand["obj"]
+        current_name = _strip_suffix(obj.name)
+        cand["used"] = True
+        fingerprint_object_map[target_name] = obj
+        if len(target["dims"]) > 1 and scale > 0:
+            scale_samples.append(scale)
+        if current_name == target_name:
+            skipped_count += 1
+        else:
+            obj.name = target_name
+            renamed_count += 1
+        pass_counts[pass_num] = pass_counts.get(pass_num, 0) + 1
+    
+    # Report unmatched
+    for target in unmatched:
+        print(f"[RigImport]   '{target['target']}' rejected: no valid match")
+        rejected_count += 1
+    
+    print(f"[RigImport] Pass 1 (tight): {pass_counts.get(1, 0)} | Pass 1.5 (loose): {pass_counts.get(15, 0)} | Pass 2 (size-only): {pass_counts.get(2, 0)}")
+    
+    if scale_samples:
+        from statistics import median
+        rig_scale = median(scale_samples)
+        meta_loaded["_rig_scale"] = rig_scale
+        print(f"[RigImport] Estimated rig scale: {rig_scale:.4f}")
+
+    print(f"[RigImport] Fingerprinting: {renamed_count} renamed, {skipped_count} already correct, {rejected_count} rejected")
     
     meta_loaded["_fingerprint_object_map"] = fingerprint_object_map
     return renamed_count + skipped_count
@@ -211,7 +335,7 @@ def _fingerprint_position(loc, precision=2) -> str:
     return f"{round(loc.x, precision)},{round(loc.y, precision)},{round(loc.z, precision)}"
 
 
-def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerprint=0, fingerprint_object_map=None):
+def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerprint=0, fingerprint_object_map=None, scale_factor=1.0):
     """Rename meshes using transform position matching from rig metadata.
     
     Uses name matching first, then fingerprint matching, then falls back to nearest-neighbor.
@@ -331,6 +455,8 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
             raw_mat = cf_to_mat(cf)
             expected_mat = t2b @ raw_mat
             expected_loc = expected_mat.to_translation()
+            if scale_factor and scale_factor != 1.0:
+                expected_loc = expected_loc * scale_factor
         except Exception as e:
             print(f"[RigImport]   '{target_name}' Failed to convert CFrame: {e}")
             return None
@@ -622,7 +748,8 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 ob["_FingerprintMap"] = json.dumps(fp_map_names)
                 print(f"[RigImport] Stored {len(fp_map_names)} authoritative part mappings")
             
-            _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection, renamed_via_fp, fp_map)
+            rig_scale = meta_loaded.get("_rig_scale", 1.0)
+            _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection, renamed_via_fp, fp_map, rig_scale)
 
             # Optional legacy fallback: if fingerprinting didn't rename, try autoname using provided parts list.
             parts_payload = meta_loaded.get("parts")

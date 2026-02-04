@@ -23,16 +23,20 @@ import math
 _violation_draw_handler = None  # lines
 _violation_label_draw_handler = None  # labels
 _keyframe_points_draw_handler = None  # keyframe markers
+_floor_limit_draw_handler = None  # floor limit plane
 _violation_segments: List[
     Tuple[Vector, Vector, int, str, bool, bool]
 ] = []  # (start, end, frame, bone_name, key_prev, key_curr)
 _bone_color_cache: Dict[str, Tuple[float, float, float, float]] = {}
 _armature_name_for_cache: str = ""
 _keyframe_points: List[Tuple[Vector, str, int]] = []  # (location, bone_name, frame)
+_below_root_violations: List[Tuple[Vector, Vector, str]] = []  # (bone_pos, floor_pos, bone_name)
+_floor_limit_z: float = 0.0  # world Z of floor limit
 
 # Roblox animation validation constants (matching Lua script)
 ANIM_MAX_DURATION = 10.0  # seconds
 ANIM_MAX_BOUNDS = 5.0  # studs from root
+ANIM_MAX_BELOW_ROOT = 3.1  # max studs below root Y
 ANIM_MAX_DELTA = 1.0  # studs per frame
 ANIM_FPS = 30.0  # target fps
 
@@ -111,6 +115,80 @@ def _draw_motionpath_violations():
         batch = batch_for_shader(shader, "LINES", {"pos": coords})
         shader.bind()
         shader.uniform_float("color", color)
+        batch.draw(shader)
+
+    gpu.state.blend_set("NONE")
+
+
+def _draw_floor_limit():
+    """Draw floor limit plane and vertical drop lines for below-root violations."""
+    if not _below_root_violations and _floor_limit_z == 0.0:
+        return
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader
+    except Exception:
+        return
+
+    shader = None
+    for name in ("UNIFORM_COLOR", "3D_UNIFORM_COLOR", "FLAT_COLOR"):
+        try:
+            shader = gpu.shader.from_builtin(name)
+            break
+        except Exception:
+            continue
+    if shader is None:
+        return
+
+    gpu.state.blend_set("ALPHA")
+    try:
+        gpu.state.line_width_set(2.0)
+    except Exception:
+        pass
+
+    # Draw floor limit as dashed grid lines (orange/red)
+    if _floor_limit_z != 0.0:
+        floor_color = (1.0, 0.3, 0.1, 0.5)
+        grid_size = 3.0
+        grid_lines = []
+        for i in range(-5, 6):
+            offset = i * grid_size / 5
+            grid_lines.append(Vector((-grid_size, offset, _floor_limit_z)))
+            grid_lines.append(Vector((grid_size, offset, _floor_limit_z)))
+            grid_lines.append(Vector((offset, -grid_size, _floor_limit_z)))
+            grid_lines.append(Vector((offset, grid_size, _floor_limit_z)))
+        
+        batch = batch_for_shader(shader, "LINES", {"pos": grid_lines})
+        shader.bind()
+        shader.uniform_float("color", floor_color)
+        batch.draw(shader)
+
+    # Draw vertical drop lines from violating bones to floor (red)
+    if _below_root_violations:
+        drop_color = (1.0, 0.0, 0.0, 0.8)
+        drop_lines = []
+        for bone_pos, floor_pos, _bone_name in _below_root_violations:
+            drop_lines.append(bone_pos)
+            drop_lines.append(floor_pos)
+        
+        batch = batch_for_shader(shader, "LINES", {"pos": drop_lines})
+        shader.bind()
+        shader.uniform_float("color", drop_color)
+        batch.draw(shader)
+
+        # Draw X markers at violation points
+        x_color = (1.0, 0.0, 0.0, 1.0)
+        x_size = 0.1
+        x_lines = []
+        for bone_pos, _floor_pos, _bone_name in _below_root_violations:
+            x_lines.append(Vector((bone_pos.x - x_size, bone_pos.y - x_size, bone_pos.z)))
+            x_lines.append(Vector((bone_pos.x + x_size, bone_pos.y + x_size, bone_pos.z)))
+            x_lines.append(Vector((bone_pos.x - x_size, bone_pos.y + x_size, bone_pos.z)))
+            x_lines.append(Vector((bone_pos.x + x_size, bone_pos.y - x_size, bone_pos.z)))
+        
+        batch = batch_for_shader(shader, "LINES", {"pos": x_lines})
+        shader.bind()
+        shader.uniform_float("color", x_color)
         batch.draw(shader)
 
     gpu.state.blend_set("NONE")
@@ -295,6 +373,24 @@ def _validate_bounds(
     return violations
 
 
+def _validate_below_root(
+    positions: Dict[str, Vector], root_pos: Vector, scale: float
+) -> List[Tuple[str, str]]:
+    """Validate bones aren't too far below root Y position."""
+    violations = []
+    root_y = root_pos.z  # blender Z = roblox Y
+
+    for bone_name, pos in positions.items():
+        depth = (root_y - pos.z) / scale
+        if depth > ANIM_MAX_BELOW_ROOT:
+            violations.append((
+                bone_name,
+                f"Bone '{bone_name}' is {depth:.2f} studs below root (max: {ANIM_MAX_BELOW_ROOT})",
+            ))
+
+    return violations
+
+
 def _validate_rotation_constraints(
     armature_obj: "bpy.types.Object", evaluated_obj: "bpy.types.Object"
 ) -> List[str]:
@@ -387,7 +483,10 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
             _violation_draw_handler, \
             _violation_label_draw_handler, \
             _keyframe_points, \
-            _keyframe_points_draw_handler
+            _keyframe_points_draw_handler, \
+            _floor_limit_draw_handler, \
+            _below_root_violations, \
+            _floor_limit_z
 
         scene = context.scene
         settings = getattr(scene, "rbx_anim_settings", None)
@@ -418,6 +517,8 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         # Comprehensive validation checks
         all_warnings = []
         all_violations = []
+        _below_root_violations = []
+        _floor_limit_z = 0.0
 
         # 1. Duration validation
         duration_warnings = _validate_animation_duration(scene, fps)
@@ -454,6 +555,10 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
             root_pos = _get_root_world_pos(armature, arm_eval)
             positions = _collect_bone_world_head(armature, arm_eval)
 
+            # Set floor limit Z once (first frame with valid root)
+            if root_pos is not None and _floor_limit_z == 0.0:
+                _floor_limit_z = root_pos.z - (ANIM_MAX_BELOW_ROOT * scale)
+
             # 3. Bounds validation (check every frame)
             if root_pos is not None:
                 bounds_violations = _validate_bounds(positions, root_pos, scale)
@@ -461,7 +566,20 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
                     all_violations.append((f, bone_name, violation_msg))
                     self.report({"WARNING"}, f"[frame {f}] {violation_msg}")
 
-            # 4. Rotation validation (check every frame)
+            # 4. Below-root validation (check every frame)
+            if root_pos is not None:
+                floor_z = root_pos.z - (ANIM_MAX_BELOW_ROOT * scale)
+                below_violations = _validate_below_root(positions, root_pos, scale)
+                for bone_name, violation_msg in below_violations:
+                    all_violations.append((f, bone_name, violation_msg))
+                    self.report({"WARNING"}, f"[frame {f}] {violation_msg}")
+                    # Add to visual list
+                    bone_pos = positions.get(bone_name)
+                    if bone_pos:
+                        floor_pos = Vector((bone_pos.x, bone_pos.y, floor_z))
+                        _below_root_violations.append((bone_pos.copy(), floor_pos, bone_name))
+
+            # 5. Rotation validation (check every frame)
             rotation_warnings = _validate_rotation_constraints(armature, arm_eval)
             for warning in rotation_warnings:
                 all_warnings.append(f"[frame {f}] {warning}")
@@ -504,6 +622,10 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
             _keyframe_points_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
                 _draw_motionpath_keyframes, (), "WINDOW", "POST_VIEW"
             )
+        if _floor_limit_draw_handler is None:
+            _floor_limit_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                _draw_floor_limit, (), "WINDOW", "POST_VIEW"
+            )
 
         settings = getattr(scene, "rbx_anim_settings", None)
         if settings:
@@ -542,10 +664,15 @@ class OBJECT_OT_ClearMotionPathValidation(Operator):
             _violation_draw_handler, \
             _violation_label_draw_handler, \
             _keyframe_points, \
-            _keyframe_points_draw_handler
+            _keyframe_points_draw_handler, \
+            _floor_limit_draw_handler, \
+            _below_root_violations, \
+            _floor_limit_z
 
         _violation_segments = []
         _keyframe_points = []
+        _below_root_violations = []
+        _floor_limit_z = 0.0
         if _violation_draw_handler is not None:
             try:
                 bpy.types.SpaceView3D.draw_handler_remove(
@@ -570,6 +697,14 @@ class OBJECT_OT_ClearMotionPathValidation(Operator):
             except Exception:
                 pass
             _keyframe_points_draw_handler = None
+        if _floor_limit_draw_handler is not None:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    _floor_limit_draw_handler, "WINDOW"
+                )
+            except Exception:
+                pass
+            _floor_limit_draw_handler = None
 
         settings = getattr(context.scene, "rbx_anim_settings", None)
         if settings:
@@ -591,9 +726,14 @@ def cleanup_validation_draw_handlers():
         _violation_draw_handler, \
         _violation_label_draw_handler, \
         _keyframe_points, \
-        _keyframe_points_draw_handler
+        _keyframe_points_draw_handler, \
+        _floor_limit_draw_handler, \
+        _below_root_violations, \
+        _floor_limit_z
     _violation_segments = []
     _keyframe_points = []
+    _below_root_violations = []
+    _floor_limit_z = 0.0
     if _violation_draw_handler is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_violation_draw_handler, "WINDOW")
@@ -616,3 +756,11 @@ def cleanup_validation_draw_handlers():
         except Exception:
             pass
         _keyframe_points_draw_handler = None
+    if _floor_limit_draw_handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                _floor_limit_draw_handler, "WINDOW"
+            )
+        except Exception:
+            pass
+        _floor_limit_draw_handler = None

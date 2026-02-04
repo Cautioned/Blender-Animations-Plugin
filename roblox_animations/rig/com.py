@@ -11,7 +11,7 @@ on individual bones, allowing per-rig customization without cluttering the UI.
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector, Matrix
+from mathutils import Vector
 from typing import Optional, Dict, Tuple
 
 # Default bone weights for R15 rigs
