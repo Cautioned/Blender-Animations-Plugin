@@ -152,8 +152,8 @@ function ExportBoneToggles.create(services: any, layoutOrder: number?)
 		lastPaintedIndex:set(index)
 	end
 
-	return VerticalCollapsibleSection({
-		Text = "Export Bone Toggles",
+	local section = VerticalCollapsibleSection({
+		Text = "Export Rig Bone Toggles",
 		Collapsed = false,
 		LayoutOrder = layoutOrder or 2,
 		Visible = State.activeRigExists,
@@ -313,8 +313,17 @@ function ExportBoneToggles.create(services: any, layoutOrder: number?)
 			end
 
 			return items
-		end),
+		end, Fusion.cleanup),
 	})
+
+	section.Destroying:Connect(function()
+		if releaseConn then
+			releaseConn:Disconnect()
+			releaseConn = nil
+		end
+	end)
+
+	return section
 end
 
 return ExportBoneToggles

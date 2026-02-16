@@ -90,6 +90,9 @@ def update_pole_axis(
     if not constrained_bone:
         return
     
+    # Ensure depsgraph is up-to-date before reading bone properties
+    bpy.context.view_layer.update()
+    
     # Gather chain bones
     chain_count = ik_constraint.chain_count
     chain_bones = [constrained_bone]
@@ -101,15 +104,17 @@ def update_pole_axis(
     if len(chain_bones) < 2:
         return
     
-    # Calculate chain geometry
-    chain_end = chain_bones[0].tail  # End of chain (e.g., ankle)
-    chain_start = chain_bones[-1].head  # Start of chain (e.g., hip)
+    # Calculate chain geometry using rest-space coordinates (bone.head_local/tail_local)
+    # NOT pose-space PoseBone.head/.tail, which include current pose transforms
+    # and would produce wrong results when the rig isn't in rest pose.
+    chain_end = chain_bones[0].bone.tail_local.copy()    # End of chain (e.g., ankle)
+    chain_start = chain_bones[-1].bone.head_local.copy()  # Start of chain (e.g., hip)
     chain_vector = chain_end - chain_start
     chain_length = chain_vector.length
     
     # Find the middle joint (elbow/knee) - this is where the bend happens
     if len(chain_bones) >= 2:
-        middle_joint = chain_bones[-1].tail  # The joint between upper and lower bones
+        middle_joint = chain_bones[-1].bone.tail_local.copy()  # Joint between upper and lower
     else:
         middle_joint = (chain_start + chain_end) / 2
     
@@ -576,8 +581,10 @@ def create_ik_config(
             current = current.parent
 
         effective_depth = len(chain_bones)
-        pos_low = chain_bones[0].tail
-        pos_high = chain_bones[-1].head if effective_depth > 0 else chain_bones[0].head
+        # Use rest-space coordinates (bone.tail_local/head_local) instead of
+        # pose-space PoseBone.tail/.head which include current pose transforms.
+        pos_low = chain_bones[0].bone.tail_local
+        pos_high = chain_bones[-1].bone.head_local if effective_depth > 0 else chain_bones[0].bone.head_local
         dist = (pos_low - pos_high).length
 
         basal = chain_bones[-1] if effective_depth > 0 else tail_bone

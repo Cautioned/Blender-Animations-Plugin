@@ -31,6 +31,10 @@ def link_object_to_bone_rigid(obj, ao, bone):
 def auto_constraint_parts(armature_name, skip_objects=None):
     """Automatically constrain parts/meshes with matching bone names.
     
+    Uses position-based disambiguation when multiple bones share the same
+    base name (e.g. "left hand", "left hand.001"). This prevents meshes
+    from being constrained to the wrong bone on the opposite side of the rig.
+    
     Args:
         armature_name: Name of the armature to constrain parts to
         skip_objects: Set of objects to skip (already constrained authoritatively)
@@ -57,9 +61,21 @@ def auto_constraint_parts(armature_name, skip_objects=None):
             f"Could not find a 'Parts' collection inside '{master_collection.name}'.",
         )
 
-    # Create a mapping of lowercase to actual bone names
-    bone_name_map = {bone.name.lower(): bone.name for bone in armature.data.bones}
+    # Build a mapping of base name -> list of bone names
+    # This handles duplicates correctly (e.g. "left hand", "left hand.001")
+    from collections import defaultdict
+    bone_groups = defaultdict(list)  # base_name_lower -> [bone_name, ...]
+    for bone in armature.data.bones:
+        base = re.sub(r"\.\d+$", "", bone.name).lower()
+        bone_groups[base].append(bone.name)
+    
+    # Precompute bone head positions in world space for disambiguation
+    bone_positions = {}
+    for bone in armature.data.bones:
+        bone_positions[bone.name] = armature.matrix_world @ bone.head_local
+    
     matched_parts = []
+    used_bones = set()  # track which specific bones have been claimed
 
     # Only process objects within this rig's parts collection
     for obj in parts_collection.objects:
@@ -70,32 +86,54 @@ def auto_constraint_parts(armature_name, skip_objects=None):
                 
             # Strip .001, .002 etc from name for matching
             base_name = re.sub(r"\.\d+$", "", obj.name).lower()
-            bone_name = bone_name_map.get(base_name)
-            if not bone_name:
+            bone_candidates = bone_groups.get(base_name)
+            if not bone_candidates:
                 continue
+            
+            # Filter out already-claimed bones
+            available = [b for b in bone_candidates if b not in used_bones]
+            if not available:
+                continue
+            
+            # Pick the best bone: closest to the mesh's world center
+            if len(available) == 1:
+                bone_name = available[0]
+            else:
+                # Compute mesh center
+                mesh_center = obj.matrix_world.to_translation()  # rough center
+                if obj.data.vertices:
+                    from mathutils import Vector
+                    verts = obj.data.vertices
+                    min_co = [float('inf')] * 3
+                    max_co = [float('-inf')] * 3
+                    for v in verts:
+                        for i in range(3):
+                            min_co[i] = min(min_co[i], v.co[i])
+                            max_co[i] = max(max_co[i], v.co[i])
+                    local_center = Vector([(min_co[i] + max_co[i]) / 2.0 for i in range(3)])
+                    mesh_center = obj.matrix_world @ local_center
+                
+                # Sort by distance to mesh center
+                def _bone_dist(bn):
+                    return (bone_positions[bn] - mesh_center).length
+                available.sort(key=_bone_dist)
+                bone_name = available[0]
+
+            used_bones.add(bone_name)
 
             # Ensure exactly one correct Child Of constraint exists
-            # We want to preserve the existing correct one (to keep inverse_matrix if set)
-            # and remove ANY other Child Of constraints (duplicates, wrong bone, wrong target)
             correct_constraint_found = False
             
-            # Iterate over a copy to safely remove items
             for c in list(obj.constraints):
                 if c.type == "CHILD_OF":
                     is_correct_target = (c.target == armature)
                     is_correct_bone = (c.subtarget == bone_name)
                     
                     if is_correct_target and is_correct_bone and not correct_constraint_found:
-                        # Found the first valid matching constraint - keep it
                         correct_constraint_found = True
                     else:
-                        # Remove if:
-                        # - Wrong target (different armature)
-                        # - Wrong bone (different subtarget on this armature)
-                        # - Duplicate (we already found one correct constraint)
                         obj.constraints.remove(c)
 
-            # Create constraint only if we didn't find one to preserve
             if not correct_constraint_found:
                 constraint = obj.constraints.new(type="CHILD_OF")
                 constraint.target = armature

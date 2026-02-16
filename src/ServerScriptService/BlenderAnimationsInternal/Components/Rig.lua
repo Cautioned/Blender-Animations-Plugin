@@ -120,11 +120,10 @@ function Rig:checkCyclicMotor6D(model: Model)
 	
 	-- Collect all motor6d and animation constraint joints and build the graph
 	for _, descendant in ipairs(model:GetDescendants()) do
-		if descendant:IsA("Motor6D") or descendant:IsA("AnimationConstraint") then
-			local joint = descendant :: Motor6D | AnimationConstraint
+		if descendant:IsA("Motor6D") then
+			local joint = descendant :: Motor6D
 			local part0 = joint.Part0
 			local part1 = joint.Part1
-			
 			if part0 and part1 then
 				if not motor6dGraph[part0] then
 					motor6dGraph[part0] = {}
@@ -137,6 +136,27 @@ function Rig:checkCyclicMotor6D(model: Model)
 				
 				-- Add directed edge from part0 to part1
 				table.insert(motor6dGraph[part0], part1)
+			end
+		elseif descendant:IsA("AnimationConstraint") then
+			local joint = descendant :: AnimationConstraint
+			local attachment0 = joint.Attachment0
+			local attachment1 = joint.Attachment1
+			local part0 = attachment0 and attachment0.Parent
+			local part1 = attachment1 and attachment1.Parent
+			if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
+				local p0 = part0 :: BasePart
+				local p1 = part1 :: BasePart
+				if not motor6dGraph[p0] then
+					motor6dGraph[p0] = {}
+					table.insert(allParts, p0)
+				end
+				if not motor6dGraph[p1] then
+					motor6dGraph[p1] = {}
+					table.insert(allParts, p1)
+				end
+				
+				-- Add directed edge from part0 to part1
+				table.insert(motor6dGraph[p0], p1)
 			end
 		end
 	end

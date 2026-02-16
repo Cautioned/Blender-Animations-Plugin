@@ -7,6 +7,7 @@ This module contains all Blender operators (actions) for the addon.
 from .import_ops import (
     OBJECT_OT_ImportModel,
     OBJECT_OT_ImportFbxAnimation,
+    OBJECT_OT_ConfirmWeaponTarget,
 )
 from .rig_ops import (
     OBJECT_OT_GenRig,
@@ -26,6 +27,8 @@ from .rig_ops import (
     OBJECT_OT_TogglePhysicsGhost,
     OBJECT_OT_ToggleRotationMomentum,
     OBJECT_OT_ToggleWeldBones,
+    OBJECT_OT_WorldSpaceUnparent,
+    OBJECT_OT_WorldSpaceReparent,
 )
 from .animation_ops import (
     OBJECT_OT_ApplyTransform,
@@ -36,6 +39,10 @@ from .animation_ops import (
 from .constraint_ops import (
     OBJECT_OT_AutoConstraint,
     OBJECT_OT_ManualConstraint,
+)
+from .weapon_ops import (
+    OBJECT_OT_AttachMeshToBone,
+    OBJECT_OT_ImportAndAttach,
 )
 from .server_ops import (
     StartServerOperator,
@@ -53,6 +60,7 @@ __all__ = [
     # Import operators
     "OBJECT_OT_ImportModel",
     "OBJECT_OT_ImportFbxAnimation",
+    "OBJECT_OT_ConfirmWeaponTarget",
     # Rig operators
     "OBJECT_OT_GenRig",
     "OBJECT_OT_GenIK",
@@ -71,6 +79,8 @@ __all__ = [
     "OBJECT_OT_TogglePhysicsGhost",
     "OBJECT_OT_ToggleRotationMomentum",
     "OBJECT_OT_ToggleWeldBones",
+    "OBJECT_OT_WorldSpaceUnparent",
+    "OBJECT_OT_WorldSpaceReparent",
     # Animation operators
     "OBJECT_OT_ApplyTransform",
     "OBJECT_OT_MapKeyframes",
@@ -81,6 +91,9 @@ __all__ = [
     # Constraint operators
     "OBJECT_OT_AutoConstraint",
     "OBJECT_OT_ManualConstraint",
+    # Weapon/accessory operators
+    "OBJECT_OT_AttachMeshToBone",
+    "OBJECT_OT_ImportAndAttach",
     # Server operators
     "StartServerOperator",
     "StopServerOperator",

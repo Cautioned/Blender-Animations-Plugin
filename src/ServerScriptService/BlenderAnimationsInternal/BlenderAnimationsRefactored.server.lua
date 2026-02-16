@@ -219,6 +219,9 @@ local function updateActiveRigFromSelection()
 			end
 		elseif #selection == 0 then
 			State.lastSelectionWasKeyframeSequence = false
+			if State.activeRigModel then
+				cleanupRigSelection()
+			end
 		end
 	end
 end
@@ -479,7 +482,7 @@ do -- Creates the plugin
 						}),
 						New("UIPadding")({
 							PaddingTop = UDim.new(0, 10),
-							PaddingBottom = UDim.new(0, 10),
+							PaddingBottom = UDim.new(0, 5),
 						}),
 
 						[Children :: any] = Computed(function()
@@ -503,20 +506,17 @@ do -- Creates the plugin
 									tabButtons,
 									New("Frame")({
 										LayoutOrder = i,
-										Size = UDim2.new(1, 0, 0, 120),
+										Size = UDim2.new(1, 0, 0, 128),
 										BackgroundTransparency = 1,
 										[Children] = {
 											Button({
 												Text = tabName,
-												Size = UDim2.new(0, 120, 0, 18),
+											Size = UDim2.new(0, 128, 0, 22),
 												Position = UDim2.fromScale(0.5, 0.5),
 												AnchorPoint = Vector2.new(0.5, 0.5),
 												Rotation = Computed(function()
 													return if State.dockSide:get() == Enum.InitialDockState.Left then 90 else -90
 												end),
-												Activated = function()
-													State.activeTab:set(tabName)
-												end,
 												BackgroundColorStyle = Computed(function()
 													if State.activeTab:get() == tabName then
 														return Enum.StudioStyleGuideColor.DiffFilePathBackground
@@ -526,6 +526,7 @@ do -- Creates the plugin
 												end),
 												[OnEvent("InputBegan")] = function(input)
 													if input and input.UserInputType == Enum.UserInputType.MouseButton1 then
+														State.activeTab:set(tabName)
 														State.draggedTab:set(tabName)
 													end
 												end,
@@ -587,7 +588,7 @@ do -- Creates the plugin
 									[Children] = {
 										Button({
 											Text = "⇩",
-											Size = UDim2.new(0, 40, 0, 18),
+											Size = UDim2.new(0, 40, 0, 22),
 											Position = UDim2.fromScale(0.5, 0.5),
 											AnchorPoint = Vector2.new(0.5, 0.5),
 											Rotation = Computed(function()
@@ -609,7 +610,7 @@ do -- Creates the plugin
 								})
 							)
 							return tabButtons
-						end) :: any,
+						end, Fusion.cleanup) :: any,
 					},
 				}),
 			},
@@ -633,7 +634,7 @@ do -- Creates the plugin
 			}),
 			_UIPadding = New("UIPadding")({
 				PaddingLeft = UDim.new(0, 5),
-				PaddingRight = UDim.new(0, 5),
+				PaddingRight = UDim.new(0, 14),
 				PaddingBottom = UDim.new(0, 10),
 				PaddingTop = UDim.new(0, 10),
 			}),
@@ -673,7 +674,7 @@ do -- Creates the plugin
 	local function pluginWidget()
 		return Widget({
 			Plugin = Plugin,
-			Id = game:GetService("HttpService"):GenerateGUID(),
+			Id = "BlenderAnimationsMain",
 			Name = "Blender Animations",
 			InitialDockTo = State.dockSide:get(),
 			InitialEnabled = false,
@@ -719,7 +720,7 @@ do -- Creates the plugin
 	-- Create the help widget
 	local _helpWidget = Widget({
 		Plugin = Plugin,
-		Id = game:GetService("HttpService"):GenerateGUID(),
+		Id = "BlenderAnimationsHelp",
 		Name = "IMPORTANT READ ME!!!",
 		InitialDockTo = Enum.InitialDockState.Float,
 		InitialEnabled = false,
@@ -732,8 +733,8 @@ do -- Creates the plugin
 		end,
 		[Children] = {
 			New("UIPadding")({
-				PaddingLeft = UDim.new(0, 4),
-				PaddingRight = UDim.new(0, 16),
+				PaddingLeft = UDim.new(0, 10),
+				PaddingRight = UDim.new(0, 10),
 				PaddingTop = UDim.new(0, 16),
 				PaddingBottom = UDim.new(0, 16),
 			}),

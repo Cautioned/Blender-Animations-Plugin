@@ -666,6 +666,20 @@ def _frame_change_handler(scene):
         update_com_visualization(obj)
 
 
+def _depsgraph_update_handler(scene, depsgraph):
+    """Update COM visualization on depsgraph changes (e.g., weight edits)."""
+    if not _com_data["enabled"]:
+        return
+
+    armature_name = _com_data.get("armature_name")
+    obj = bpy.data.objects.get(armature_name) if armature_name else None
+    if obj is None:
+        obj = bpy.context.active_object
+
+    if obj and obj.type == "ARMATURE":
+        update_com_visualization(obj)
+
+
 def register_frame_handler():
     """Register the frame change handler for real-time COM updates."""
     if _frame_change_handler not in bpy.app.handlers.frame_change_post:
@@ -676,3 +690,15 @@ def unregister_frame_handler():
     """Unregister the frame change handler."""
     if _frame_change_handler in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(_frame_change_handler)
+
+
+def register_depsgraph_handler():
+    """Register the depsgraph update handler for real-time COM updates."""
+    if _depsgraph_update_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_depsgraph_update_handler)
+
+
+def unregister_depsgraph_handler():
+    """Unregister the depsgraph update handler."""
+    if _depsgraph_update_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_depsgraph_update_handler)

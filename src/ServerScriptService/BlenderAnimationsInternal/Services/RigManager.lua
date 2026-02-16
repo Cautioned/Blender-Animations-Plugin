@@ -342,6 +342,8 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 		return
 	end
 
+	State.lastKnownRigModel = rigModel
+
 	if not rigModel.PrimaryPart then
 		self:addWarning("Rig has no PrimaryPart set.")
 		if rigModel:FindFirstChild("HumanoidRootPart") then

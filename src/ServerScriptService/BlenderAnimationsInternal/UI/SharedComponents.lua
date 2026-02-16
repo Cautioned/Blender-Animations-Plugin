@@ -30,6 +30,7 @@ function SharedComponents.AnimatedHintLabel(props: {
 	ClipsDescendants: boolean,
 	Visible: boolean,
 	TextTransparency: any,
+	RichText: boolean?,
 })
 	local activeHint = props.Text
 	local displayedText = Value(activeHint:get())
@@ -55,6 +56,7 @@ function SharedComponents.AnimatedHintLabel(props: {
 	return Label({
 		Text = displayedText,
 		TextWrapped = true,
+		RichText = props.RichText,
 		Size = Computed(function()
 			return UDim2.new(1, 0, 0, height:get())
 		end),
@@ -78,6 +80,7 @@ function SharedComponents.createHeaderUI()
 			New("UIPadding")({
 				PaddingLeft = UDim.new(0, 5),
 				PaddingRight = UDim.new(0, 5),
+				PaddingBottom = UDim.new(0, 5),
 			}),
 			Label({
 				LayoutOrder = 1,
@@ -109,9 +112,6 @@ function SharedComponents.createHeaderUI()
 				TextWrapped = true,
 				Size = UDim2.new(1, 0, 0, 0),
 				AutomaticSize = Enum.AutomaticSize.Y,
-			}),
-			New("UIPadding")({
-				PaddingBottom = UDim.new(0, 5),
 			}),
 		},
 	})

@@ -137,6 +137,8 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col.operator(
             "object.rbxanims_manualconstraint", text="Manual Constraint Editor"
         )
+        col.separator()
+        col.label(text="Weapon / Accessory", icon="OBJECT_DATA")
         # Toggle weld bone visibility
         weld_row = col.row(align=True)
         weld_row.operator(
@@ -165,6 +167,24 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         else:
             ik_row.operator("object.rbxanims_genik", text="Generate IK")
         ik_row.operator("object.rbxanims_removeik", text="Remove IK")
+        
+        # World-space unparent/reparent
+        ws_row = col.row(align=True)
+        ws_row.operator("object.rbxanims_worldspace_unparent", text="Unparent")
+        ws_row.operator("object.rbxanims_worldspace_reparent", text="Reparent")
+        
+        # Show indicator if any bones are world-space unparented
+        if selected_armature:
+            ws_bones = [
+                b.name for b in selected_armature.data.bones
+                if b.get("worldspace_bone")
+            ]
+            if ws_bones:
+                ws_info = col.box()
+                ws_info.label(
+                    text=f"{len(ws_bones)} bone(s) world-space",
+                    icon="UNLINKED",
+                )
         
         # Show IK-FK slider if an IK target with the property is selected
         if selected_ik_target:

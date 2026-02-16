@@ -663,6 +663,18 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         driven_bones = get_all_driven_bones(ao)
         if driven_bones:
             constrained_bones.update(driven_bones)
+
+        # Bones with inherit_rotation disabled must be baked every frame.
+        # Roblox Motor6D hierarchy always inherits parent rotation, so the
+        # serializer must emit a varying compensation CFrame each frame to
+        # keep the bone world-space-stable when its parent moves.
+        # These are tracked separately from constrained_bones because the
+        # constrained path has easing-thinning logic that would skip them.
+        non_inheriting_bones: Set[str] = set()
+        for bone in ao.pose.bones:
+            if not bone.bone.use_inherit_rotation:
+                non_inheriting_bones.add(bone.name)
+
         animated_bones = set()
         all_actions = set()
 
@@ -688,7 +700,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     all_actions.add(c.target.animation_data.action)
 
         # decide hybrid vs sparse after we know which bones are actually constrained
-        has_constraints_local = len(constrained_bones) > 0
+        has_constraints_local = len(constrained_bones) > 0 or len(non_inheriting_bones) > 0
         if has_constraints_local:
             pass
         else:
@@ -1085,6 +1097,48 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             extended_frames.add(frame_end)
             extended_frames.add(frame_start)
 
+            # Expand per_bone_keyframes for each cyclic bone so the sparse emission
+            # logic treats replicated frames as explicit keyframes.
+            # Also replicate per_bone_interpolation so easing data is available.
+            for cbone in cyclic_bones:
+                kf_set = per_bone_keyframes.setdefault(cbone, set())
+                interp_map = per_bone_interpolation.get(cbone, {})
+
+                # Collect the original base keyframes and their interpolation data
+                # for this bone from its cyclic fcurves
+                bone_base_keys: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+                for fc in fcurves_with_cycles:
+                    if not fc.data_path.startswith("pose.bones"):
+                        continue
+                    m = bone_name_pattern.search(fc.data_path)
+                    if not m or m.group(1) != cbone:
+                        continue
+                    for kp in fc.keyframe_points:
+                        kf = int(round(kp.co.x))
+                        if kf not in bone_base_keys:
+                            bone_base_keys[kf] = (kp.interpolation, kp.easing)
+
+                # For each extended frame, check if it maps to a base keyframe
+                # offset by a multiple of cycle_len.  Boundary frames are
+                # included so they receive correct interpolation/easing data
+                # (otherwise cyclic bones at frame_start/frame_end fall back
+                # to Linear default, causing identity glitches).
+                if cycle_len > 0 and bone_base_keys:
+                    for ef in extended_frames:
+                        for base_kf, base_interp in bone_base_keys.items():
+                            diff = ef - base_kf
+                            if diff != 0 and diff % cycle_len == 0:
+                                kf_set.add(ef)
+                                if ef not in interp_map:
+                                    interp_map_full = per_bone_interpolation.setdefault(cbone, {})
+                                    interp_map_full[ef] = base_interp
+                                break
+
+                # Also add the original base keyframes that fall within range
+                for base_kf in bone_base_keys:
+                    if frame_start <= base_kf <= frame_end:
+                        kf_set.add(base_kf)
+
             all_frames_to_bake = sorted(extended_frames)
             keyframe_times.update(extended_frames)
         elif full_range:
@@ -1174,10 +1228,13 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 # For cyclic bones, we only care about frames where THIS bone has keyframes
                 bone_kfs = per_bone_keyframes.get(bone_name, set())
                 is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and frame in bone_kfs
+                # Cyclic bones should also be emitted at boundary frames
+                is_cyclic_boundary = bool(cyclic_bones) and bone_name in cyclic_bones and is_boundary_frame
                 if (
                     (bone_keyframes and frame in bone_keyframes)
                     or (constraint_keyframes and frame in constraint_keyframes)
                     or is_cyclic_key
+                    or is_cyclic_boundary
                 ):
                     # If an animated bone is at its rest pose on an explicit keyframe,
                     # it won't be in current_full_pose. We need to add it back with an
@@ -1190,9 +1247,15 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if bone_name not in current_full_pose:
                     current_full_pose[bone_name] = identity_cf
 
+            # Also ensure non-inheriting bones are included
+            for bone_name in non_inheriting_bones:
+                if bone_name not in current_full_pose:
+                    current_full_pose[bone_name] = identity_cf
+
             roblox_style, roblox_direction = None, None
             for bone_name, cframe_data in current_full_pose.items():
                 is_constrained = bone_name in constrained_bones
+                is_non_inheriting = bone_name in non_inheriting_bones
                 is_animated = bone_name in animated_bones
                 bone_keyframes = per_bone_keyframes.get(bone_name)
                 constraint_keyframes = constraint_target_easing.get(bone_name)
@@ -1204,13 +1267,18 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     or is_cyclic_key
                 )
 
-                # When full_range is enabled, bake ALL animated bones at start and end frames
-                is_boundary_bake = full_range and is_animated and (frame == frame_start or frame == frame_end)
+                # When full_range is enabled, bake ALL animated bones at start and end frames.
+                # For cyclic bones, also bake boundary frames even when full_range is off,
+                # since the animation must cover the entire scene range.
+                is_cyclic_boundary = bool(cyclic_bones) and bone_name in cyclic_bones and is_boundary_frame
+                is_boundary_bake = (full_range or is_cyclic_boundary) and is_animated and (frame == frame_start or frame == frame_end)
 
                 # Determine whether this bone should be baked on this frame
                 should_bake = False
 
                 if is_constrained:
+                    should_bake = True
+                elif is_non_inheriting:
                     should_bake = True
                 elif is_boundary_bake:
                     should_bake = True
@@ -1285,6 +1353,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     and previous_state[1] == "Constant"
                     and interpolation is None
                     and not is_sparse_key
+                    and not is_non_inheriting
                 ):
                     cframe_data = previous_state[0]
                     roblox_style, roblox_direction = (
@@ -1297,6 +1366,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if (
                     nla_single_action is not None
                     and is_constrained
+                    and not is_non_inheriting
                     and has_explicit_easing
                     and not is_sparse_key
                     and not is_boundary_frame
@@ -1314,6 +1384,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if (
                     nla_single_action is not None
                     and is_constrained
+                    and not is_non_inheriting
                     and has_explicit_easing
                     and is_boundary_frame
                     and not is_sparse_key
@@ -1323,12 +1394,17 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 ):
                     continue
 
-                # For CONSTANT holds, clamp to previous pose to avoid blending
+                # For CONSTANT holds, clamp to previous pose to avoid blending.
+                # For cyclic boundary frames (e.g. frame_end) that aren't explicit
+                # keys, blender's cyclic modifier wraps the evaluation into the
+                # NEXT cycle, producing a value jump.  Clamp those too.
                 if (
                     previous_state is not None
                     and not is_sparse_key
-                    and not is_boundary_frame
+                    and not is_constrained
+                    and not is_non_inheriting
                     and (interpolation == "CONSTANT" or roblox_style == "Constant")
+                    and (not is_boundary_frame or is_cyclic_boundary)
                 ):
                     cframe_data = previous_state[0]
 
@@ -1340,6 +1416,8 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     interpolation == "CONSTANT"
                     and not is_sparse_key
                     and not is_boundary_frame
+                    and not is_constrained
+                    and not is_non_inheriting
                 )
 
                 if is_constant_hold:
@@ -1348,13 +1426,31 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                 # Skip unchanged states for non-constrained bones only
                 # Constrained bones must be included on every frame for accurate IK playback
-                if not is_sparse_key and not is_boundary_frame and not is_constrained:
+                # Cyclic boundary frames must always be emitted to anchor the end of the animation
+                if not is_sparse_key and not is_boundary_frame and not is_constrained and not is_non_inheriting and not is_cyclic_boundary:
                     if previous_state and _bone_state_equivalent(
                         previous_state, candidate_state
                     ):
                         continue
 
                 final_kf_state[bone_name] = candidate_state
+
+            # Roblox treats a Pose absent from a Keyframe as CFrame.identity,
+            # not as "hold previous."  When siblings have staggered keys a
+            # constant-hold bone would be missing from keyframes created by
+            # its siblings, snapping to identity.  Ensure every bone that is
+            # mid-constant-hold appears in every emitted keyframe.
+            if final_kf_state:
+                for held_bone, held_state in last_baked_states.items():
+                    if held_bone in final_kf_state:
+                        continue
+                    if held_state[1] != "Constant":
+                        continue
+                    final_kf_state[held_bone] = [
+                        list(held_state[0]),
+                        held_state[1],
+                        held_state[2],
+                    ]
 
             if final_kf_state:
                 time_in_seconds = (frame - frame_start) / fps

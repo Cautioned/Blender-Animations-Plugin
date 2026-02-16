@@ -96,9 +96,10 @@ function BlenderSyncTab.create(services: any)
 					Size = UDim2.new(1, 0, 0, 150),
 					LayoutOrder = 5,
 					BackgroundTransparency = 1,
-					CanvasSize = UDim2.new(0.95, 0, 0, 0),
+					CanvasSize = UDim2.new(0, 0, 0, 0),
 					AutomaticCanvasSize = Enum.AutomaticSize.Y,
-					ScrollBarThickness = 0,
+					ScrollBarThickness = 4,
+					ScrollBarImageTransparency = 0.5,
 					Visible = Computed(function()
 						return State.isServerConnected:get()
 					end),
@@ -234,7 +235,7 @@ function BlenderSyncTab.create(services: any)
 							)
 						end
 						return elements
-					end),
+					end, Fusion.cleanup),
 				}) :: any,
 				Button({
 					Text = "Import Animation from Blender",

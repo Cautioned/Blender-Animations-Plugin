@@ -183,6 +183,7 @@ return function(props: VerticalExpandingListProperties): Frame
 						},
 						Label {
 							TextXAlignment = Enum.TextXAlignment.Left,
+							TextYAlignment = Enum.TextYAlignment.Center,
 							Size = UDim2.fromScale(1, 1),
 
 							Font = themeProvider:GetFont("Bold"),

@@ -137,6 +137,7 @@ function KeyframeNaming.createKeyframeNamingUI(services: any, layoutOrder: numbe
 									return isHovering:get() and 0.7 or 0.85
 								end),
 								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground) :: any,
+								ClipsDescendants = true,
 								[OnEvent("MouseEnter")] = function()
 									isHovering:set(true)
 								end,
@@ -174,7 +175,7 @@ function KeyframeNaming.createKeyframeNamingUI(services: any, layoutOrder: numbe
 						)
 					end
 					return keyframesUI
-				end),
+				end, Fusion.cleanup),
 			}) :: any,
 		},
 	})

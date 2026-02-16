@@ -3457,6 +3457,111 @@ class TestAnimationSerialization(unittest.TestCase):
             )
 
 
+    def test_non_inheriting_bone_baked_with_staggered_keys(self):
+        """Bones with inherit_rotation=False must be emitted on every keyframe.
+
+        Roblox Motor6D hierarchy always inherits parent rotation, so when
+        a bone has inherit_rotation disabled in Blender the serializer must
+        emit a varying compensation CFrame each frame.  If the bone uses
+        CONSTANT interpolation and its keys are staggered relative to its
+        parent, older code would clamp/suppress/thin the bone — snapping it
+        to identity or a stale pose.
+        """
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "InheritRotRig"
+        armature = armature_obj.data
+        armature.name = "InheritRotArmature"
+
+        # Parent bone (Neck) — will rotate across the timeline
+        neck = armature.edit_bones.new("Neck")
+        neck.head = (0, 0, 2)
+        neck.tail = (0, 0, 1.5)
+
+        # Child bone (Head) — inherit_rotation OFF, constant hold
+        head = armature.edit_bones.new("Head")
+        head.head = (0, 0, 1.5)
+        head.tail = (0, 0, 1)
+        head.parent = neck
+        head.use_inherit_rotation = False
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for bone in armature_obj.pose.bones:
+            bone.bone["is_transformable"] = True
+            bone.bone["transform"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform0"] = mathutils.Matrix.Identity(4)
+            bone.bone["transform1"] = mathutils.Matrix.Identity(4)
+            bone.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("InheritRotAction")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Neck: rotates from 0 to 45 deg over frames 1-10 (LINEAR)
+        neck_pb = armature_obj.pose.bones["Neck"]
+        neck_pb.rotation_euler = (0, 0, 0)
+        neck_pb.keyframe_insert(data_path="rotation_euler", frame=1)
+        neck_pb.rotation_euler = (math.radians(45), 0, 0)
+        neck_pb.keyframe_insert(data_path="rotation_euler", frame=10)
+        self.set_action_interpolation(action, "LINEAR")
+
+        # Head: constant hold at a fixed rotation, keys staggered from Neck
+        head_pb = armature_obj.pose.bones["Head"]
+        head_pb.rotation_euler = (0, 0, 0)
+        head_pb.keyframe_insert(data_path="rotation_euler", frame=3)
+        head_pb.rotation_euler = (0, 0, 0)
+        head_pb.keyframe_insert(data_path="rotation_euler", frame=8)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if "Head" in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        bpy.context.scene.frame_set(1)
+
+        result = serialize(armature_obj)
+        self.assertTrue(result, "Serialization returned no result.")
+        keyframes = result["kfs"]
+
+        # Collect every keyframe index where Head appears
+        head_times = []
+        head_cframes = []
+        for i, kf in enumerate(keyframes):
+            head_data = kf["kf"].get("Head")
+            if head_data:
+                head_times.append(kf["t"])
+                head_cframes.append(head_data[0])
+
+        # Head must appear on the majority of emitted keyframes, not just its own keys.
+        # With inherit_rotation off and a moving parent, it needs dense baking so that
+        # Roblox doesn't snap it to CFrame.identity on keyframes created by sibling bones.
+        self.assertGreaterEqual(
+            len(head_times),
+            len(keyframes) - 1,
+            f"Head (inherit_rotation=False) must be baked densely. "
+            f"Appeared in {len(head_times)}/{len(keyframes)} keyframes."
+        )
+
+        # The Head CFrame should NOT be identity — it must carry the correct
+        # rest offset from its parent so Roblox positions it correctly.
+        from ..core.constants import identity_cf
+
+        for i, cf in enumerate(head_cframes):
+            rounded = [round(v, 4) for v in cf]
+            self.assertNotEqual(
+                rounded,
+                [round(v, 4) for v in identity_cf],
+                f"Head CFrame at time {head_times[i]:.3f} should not be identity — "
+                f"it needs the rest offset from Neck to position correctly in Roblox."
+            )
+
+
 # This allows running the tests from the Blender text editor
 if __name__ == "__main__":
     suite = unittest.TestSuite()
