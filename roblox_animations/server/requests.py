@@ -450,20 +450,63 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                         legacy_fcurves, getattr(action, "groups", [])
                     )
 
+                group_collections = []
+                action_groups = getattr(action, "groups", None)
+                if action_groups is not None:
+                    group_collections.append(action_groups)
+                channelbag_groups = getattr(channelbag, "groups", None)
+                if channelbag_groups is not None and channelbag_groups is not action_groups:
+                    group_collections.append(channelbag_groups)
+
+                def ensure_group(group_name):
+                    if not group_collections:
+                        return None
+                    for group_collection in group_collections:
+                        if group_collection is None:
+                            continue
+                        existing = None
+                        try:
+                            existing = group_collection.get(group_name)
+                        except Exception:
+                            existing = None
+                        if existing is not None:
+                            return existing
+                        try:
+                            return group_collection.new(name=group_name)
+                        except TypeError:
+                            try:
+                                return group_collection.new(group_name)
+                            except Exception:
+                                continue
+                        except Exception:
+                            continue
+                    return None
+
                 # Create fcurves with version-appropriate parameters
                 def create_fcurve(data_path, index, group_name):
+                    fcurve = None
                     try:
-                        return channelbag.fcurves.new(data_path, index=index)
+                        fcurve = channelbag.fcurves.new(data_path, index=index)
                     except TypeError:
                         if hasattr(channelbag.fcurves, "new"):
                             for candidate in ("group_name", "action_group"):
                                 try:
-                                    return channelbag.fcurves.new(
+                                    fcurve = channelbag.fcurves.new(
                                         data_path, index=index, **{candidate: group_name}
                                     )
+                                    break
                                 except TypeError:
                                     continue
-                        return channelbag.fcurves.new(data_path, index=index)
+                        if fcurve is None:
+                            fcurve = channelbag.fcurves.new(data_path, index=index)
+
+                    group = ensure_group(group_name)
+                    if group is not None and hasattr(fcurve, "group"):
+                        try:
+                            fcurve.group = group
+                        except Exception:
+                            pass
+                    return fcurve
 
                 # Location
                 loc_fcurves = [

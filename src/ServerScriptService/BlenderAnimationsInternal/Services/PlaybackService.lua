@@ -25,7 +25,7 @@ function PlaybackService:disconnectHeartbeat()
 	end
 end
 
-function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect)
+function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect, rigModel)
 	local success, err = pcall(function()
 		if
 			animatorToStop
@@ -53,6 +53,17 @@ function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect
 						track:Destroy()
 					end
 				end
+
+				-- Reset all joint transforms to identity so the rig returns to rest pose
+				if rigModel then
+					for _, desc in ipairs(rigModel:GetDescendants()) do
+						if desc:IsA("Motor6D") then
+							desc.Transform = CFrame.identity
+						elseif desc:IsA("Bone") then
+							desc.Transform = CFrame.identity
+						end
+					end
+				end
 			end
 		end
 		task.wait()
@@ -75,21 +86,32 @@ function PlaybackService:stopAnimationAndDisconnect(options: StopOptions?)
 
 	local animatorToStop = if options and options.animatorOverride then options.animatorOverride else self.State.activeAnimator
 	local heartbeatToDisconnect = self.State.heartbeat.conn
+	local rigModel = self.State.activeRigModel
 
 	-- Immediately clear the state for the new animation, but leave the animator.
 	self.State.currentAnimTrack = nil
 	self.State.heartbeat.conn = nil
+
+	-- Always reset joints synchronously FIRST, before any yielding track cleanup.
+	-- This prevents the race where background track-stopping yields (track.Stopped:Wait())
+	-- and the joint reset never executes bc the thread gets interrupted or the rig changes.
+	if rigModel then
+		for _, desc in ipairs(rigModel:GetDescendants()) do
+			if desc:IsA("Motor6D") then
+				desc.Transform = CFrame.identity
+			elseif desc:IsA("Bone") then
+				desc.Transform = CFrame.identity
+			end
+		end
+	end
 
 	if not animatorToStop and not heartbeatToDisconnect then
 		return
 	end
 
 	local function cleanupTask()
-		self:_cleanupAnimation(animatorToStop, heartbeatToDisconnect)
+		self:_cleanupAnimation(animatorToStop, heartbeatToDisconnect, rigModel)
 	end
-
-	-- I switched to using independent tasks make sure when switching rigs that the old animation is stopped before the new one is started.
-	-- Essentially, it's now bulletproof. Very simple, I'm surprised I never thought of this before.
 
 	if doInBackground then
 		task.spawn(cleanupTask)

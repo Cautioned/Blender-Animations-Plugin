@@ -158,7 +158,7 @@ class OBJECT_OT_ManualConstraint(bpy.types.Operator):
     def execute(self, context):
         settings = getattr(context.scene, "rbx_anim_settings", None)
         armature = (
-            bpy.data.objects.get(settings.rbx_anim_armature) if settings else None
+            get_object_by_name(settings.rbx_anim_armature) if settings else None
         )
         master_collection = find_master_collection_for_object(armature)
         parts_collection = find_parts_collection_in_master(

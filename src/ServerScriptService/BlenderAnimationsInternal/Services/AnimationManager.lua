@@ -23,21 +23,50 @@ local priorityLookup = {
 	Movement = Enum.AnimationPriority.Movement,
 }
 
-local function ensureChannelSample(poseMap, poseName, keyTime)
+-- Reverse lookup: Enum -> string name
+local priorityReverseLookup = {}
+for name, enum in pairs(priorityLookup) do
+	priorityReverseLookup[enum] = name
+end
+
+type AxisSample = { time: number, value: number }
+type AxisSeries = { AxisSample }
+type AxisTimeline = {
+	Position: { X: AxisSeries, Y: AxisSeries, Z: AxisSeries },
+	Rotation: { X: AxisSeries, Y: AxisSeries, Z: AxisSeries },
+}
+
+type ChannelSample = {
+	Position: { X: number?, Y: number?, Z: number? },
+	Rotation: { X: number?, Y: number?, Z: number? },
+}
+
+type PoseMap = { [string]: { [number]: ChannelSample } }
+type FaceControlMap = { [string]: { [number]: number } }
+type NamePosePairs = { [string]: { [number]: Instance } }
+type KeyframePair = { time: number, keyframe: Keyframe }
+type KeyframeTimePairs = { [number]: KeyframePair }
+type CurveKey = { Time: number, Value: number }
+type MarkerPair = { name: string, value: string }
+
+local function ensureChannelSample(poseMap: PoseMap, poseName: string, keyTime: number): ChannelSample
 	poseMap[poseName] = poseMap[poseName] or {}
 	poseMap[poseName][keyTime] = poseMap[poseName][keyTime]
-		or { Position = {}, Rotation = {} }
+		or {
+			Position = { X = nil, Y = nil, Z = nil },
+			Rotation = { X = nil, Y = nil, Z = nil },
+		}
 	return poseMap[poseName][keyTime]
 end
 
-local function createAxisTimeline()
+local function createAxisTimeline(): AxisTimeline
 	return {
 		Position = { X = {}, Y = {}, Z = {} },
 		Rotation = { X = {}, Y = {}, Z = {} },
 	}
 end
 
-local function sampleAxisValue(series, timePosition)
+local function sampleAxisValue(series: AxisSeries?, timePosition: number): number?
 	if not series or #series == 0 then
 		return nil
 	end
@@ -68,7 +97,12 @@ local function sampleAxisValue(series, timePosition)
 	return series[#series].value
 end
 
-local function interpolateMissingAxis(finalValues, poseName, poseTime, axisTimelines)
+local function interpolateMissingAxis(
+	finalValues: { [string]: number? },
+	poseName: string,
+	poseTime: number,
+	axisTimelines: { [string]: AxisTimeline }
+)
 	local poseTimeline = axisTimelines[poseName]
 
 	local function fill(axisKind, axis)
@@ -91,7 +125,13 @@ local function interpolateMissingAxis(finalValues, poseName, poseTime, axisTimel
 	fill("Rotation", "Z")
 end
 
-local function applyPosesFromCurves(poseMap, namePosePairs, faceControlMap, keyTimes, axisTimelines)
+local function applyPosesFromCurves(
+	poseMap: PoseMap,
+	namePosePairs: NamePosePairs,
+	faceControlMap: FaceControlMap,
+	keyTimes: { number },
+	axisTimelines: { [string]: AxisTimeline }
+)
 	for _, poseTime in ipairs(keyTimes) do
 		for poseName, poseTable in pairs(namePosePairs) do
 			local pose = poseTable[poseTime]
@@ -115,7 +155,10 @@ local function applyPosesFromCurves(poseMap, namePosePairs, faceControlMap, keyT
 
 			local channelSample = jointChannels[poseTime]
 			if not channelSample then
-				channelSample = { Position = {}, Rotation = {} }
+				channelSample = {
+					Position = { X = nil, Y = nil, Z = nil },
+					Rotation = { X = nil, Y = nil, Z = nil },
+				}
 			end
 
 			local finalValues = {
@@ -128,8 +171,9 @@ local function applyPosesFromCurves(poseMap, namePosePairs, faceControlMap, keyT
 			}
 
 			interpolateMissingAxis(finalValues, poseName, poseTime, axisTimelines)
-			pose.Weight = 1
-			pose.CFrame = CFrame.new(
+			local poseInstance = pose :: Pose
+			poseInstance.Weight = 1
+			poseInstance.CFrame = CFrame.new(
 				finalValues.PX or 0,
 				finalValues.PY or 0,
 				finalValues.PZ or 0
@@ -142,18 +186,18 @@ local function applyPosesFromCurves(poseMap, namePosePairs, faceControlMap, keyT
 	end
 end
 
-local function mapCurveChannels(curveAnimation)
-	local poseMap = {}
-	local faceControlMap = {}
-	local keyTimesSet = {}
-	local axisTimelines = {}
+local function mapCurveChannels(curveAnimation: CurveAnimation): (PoseMap, { number }, FaceControlMap, { [string]: AxisTimeline })
+	local poseMap: PoseMap = {}
+	local faceControlMap: FaceControlMap = {}
+	local keyTimesSet: { [number]: boolean } = {}
+	local axisTimelines: { [string]: AxisTimeline } = {}
 	local processedCount = 0
 
-	local function registerTime(time)
+	local function registerTime(time: number)
 		keyTimesSet[time] = true
 	end
 
-	local function recordAxisSample(poseName, axisKind, axis, key)
+	local function recordAxisSample(poseName: string, axisKind: string, axis: string, key: CurveKey)
 		registerTime(key.Time)
 		local channelSample = ensureChannelSample(poseMap, poseName, key.Time)
 		channelSample[axisKind][axis] = key.Value
@@ -170,33 +214,42 @@ local function mapCurveChannels(curveAnimation)
 		end
 
 		if curve:IsA("Vector3Curve") then
-			local poseName = curve.Parent.Name
+			local curveParent = curve.Parent
+			if not curveParent then
+				continue
+			end
+			local poseName = curveParent.Name
 			for _, key in ipairs(curve:X():GetKeys()) do
-				recordAxisSample(poseName, "Position", "X", key)
+				recordAxisSample(poseName, "Position", "X", key :: CurveKey)
 			end
 			for _, key in ipairs(curve:Y():GetKeys()) do
-				recordAxisSample(poseName, "Position", "Y", key)
+				recordAxisSample(poseName, "Position", "Y", key :: CurveKey)
 			end
 			for _, key in ipairs(curve:Z():GetKeys()) do
-				recordAxisSample(poseName, "Position", "Z", key)
+				recordAxisSample(poseName, "Position", "Z", key :: CurveKey)
 			end
 		elseif curve:IsA("EulerRotationCurve") then
-			local poseName = curve.Parent.Name
+			local curveParent = curve.Parent
+			if not curveParent then
+				continue
+			end
+			local poseName = curveParent.Name
 			for _, key in ipairs(curve:X():GetKeys()) do
-				recordAxisSample(poseName, "Rotation", "X", key)
+				recordAxisSample(poseName, "Rotation", "X", key :: CurveKey)
 			end
 			for _, key in ipairs(curve:Y():GetKeys()) do
-				recordAxisSample(poseName, "Rotation", "Y", key)
+				recordAxisSample(poseName, "Rotation", "Y", key :: CurveKey)
 			end
 			for _, key in ipairs(curve:Z():GetKeys()) do
-				recordAxisSample(poseName, "Rotation", "Z", key)
+				recordAxisSample(poseName, "Rotation", "Z", key :: CurveKey)
 			end
 		elseif curve:IsA("FloatCurve") and curve.Parent and curve.Parent.Name == "FaceControls" then
 			local controlName = curve.Name
 			faceControlMap[controlName] = faceControlMap[controlName] or {}
 			for _, key in ipairs(curve:GetKeys()) do
-				registerTime(key.Time)
-				faceControlMap[controlName][key.Time] = key.Value
+				local curveKey = key :: CurveKey
+				registerTime(curveKey.Time)
+				faceControlMap[controlName][curveKey.Time] = curveKey.Value
 			end
 		end
 	end
@@ -205,15 +258,16 @@ local function mapCurveChannels(curveAnimation)
 	for _, poseTimeline in pairs(axisTimelines) do
 		for _, axisKind in pairs(poseTimeline) do
 			for axisName, series in pairs(axisKind) do
-				table.sort(series, function(a, b)
+				local axisSeries = series :: AxisSeries
+				table.sort(axisSeries, function(a: AxisSample, b: AxisSample)
 					return a.time < b.time
 				end)
-				axisKind[axisName] = series
+				axisKind[axisName] = axisSeries
 			end
 		end
 	end
 
-	local keyTimes = {}
+	local keyTimes: { number } = {}
 	for time in pairs(keyTimesSet) do
 		table.insert(keyTimes, time)
 	end
@@ -222,9 +276,13 @@ local function mapCurveChannels(curveAnimation)
 	return poseMap, keyTimes, faceControlMap, axisTimelines
 end
 
-local function createEmptyKeyframes(sequence, curveAnimation, keyTimes)
-	local keyframeTimePairs = {}
-	local namePosePairs = {}
+local function createEmptyKeyframes(
+	sequence: KeyframeSequence,
+	curveAnimation: CurveAnimation,
+	keyTimes: { number }
+): (NamePosePairs, KeyframeTimePairs)
+	local keyframeTimePairs: KeyframeTimePairs = {}
+	local namePosePairs: NamePosePairs = {}
 	local keyframeCount = 0
 
 	for _, keyTime in ipairs(keyTimes) do
@@ -236,16 +294,16 @@ local function createEmptyKeyframes(sequence, curveAnimation, keyTimes)
 		local keyframe = Instance.new("Keyframe")
 		keyframe.Time = keyTime
 		keyframe.Parent = sequence
-		keyframeTimePairs[keyTime] = { keyTime, keyframe }
+		keyframeTimePairs[keyTime] = { time = keyTime, keyframe = keyframe }
 	end
 
-	local function addChild(keyPair, node, parentPose)
+	local function addChild(keyPair: KeyframePair, node: Instance, parentPose: Instance)
 		local isFaceFloat = node.Parent and node.Parent.Name == "FaceControls" and node:IsA("FloatCurve")
 		if not (node:IsA("Folder") or isFaceFloat) then
 			return
 		end
 
-		local pose
+		local pose: Instance
 		if node.Name == "FaceControls" then
 			pose = Instance.new("Folder")
 		elseif isFaceFloat then
@@ -265,7 +323,7 @@ local function createEmptyKeyframes(sequence, curveAnimation, keyTimes)
 		pose.Parent = parentPose
 
 		namePosePairs[node.Name] = namePosePairs[node.Name] or {}
-		namePosePairs[node.Name][keyPair[1]] = pose
+		namePosePairs[node.Name][keyPair.time] = pose
 
 		for _, child in ipairs(node:GetChildren()) do
 			addChild(keyPair, child, pose)
@@ -280,37 +338,44 @@ local function createEmptyKeyframes(sequence, curveAnimation, keyTimes)
 		end
 
 		for _, child in ipairs(curveAnimation:GetChildren()) do
-			addChild(pair, child, pair[2])
+			addChild(pair, child, pair.keyframe)
 		end
 	end
 
 	return namePosePairs, keyframeTimePairs
 end
 
-local function applyMarkersFromCurves(sequence, curveAnimation, keyframeTimePairs)
-	local markersByTime = {}
+local function applyMarkersFromCurves(
+	sequence: KeyframeSequence,
+	curveAnimation: CurveAnimation,
+	keyframeTimePairs: KeyframeTimePairs
+)
+	local markersByTime: { [number]: { MarkerPair } } = {}
 	local markerCount = 0
 
 	for _, markerCurve in ipairs(curveAnimation:GetDescendants()) do
 		if not markerCurve:IsA("MarkerCurve") then
 			continue
 		end
-		for _, markerInfo in ipairs(markerCurve:GetMarkers()) do
+		local typedCurve = markerCurve :: MarkerCurve
+		for _, markerInfo in ipairs(typedCurve:GetMarkers()) do
 			markerCount = markerCount + 1
 			if markerCount % 100 == 0 then
 				task.wait()
 			end
 
-			markersByTime[markerInfo.Time] = markersByTime[markerInfo.Time] or {}
-			table.insert(markersByTime[markerInfo.Time], { markerCurve.Name, markerInfo.Value })
+			local markerTime = (markerInfo :: any).Time :: number
+			local markerValue = (markerInfo :: any).Value :: string
+			markersByTime[markerTime] = markersByTime[markerTime] or {}
+			table.insert(markersByTime[markerTime], { name = markerCurve.Name, value = markerValue })
 		end
 	end
 
 	for markerTime, markers in pairs(markersByTime) do
 		local keyframePair = keyframeTimePairs[markerTime]
-		local keyframe
+		local keyframe: Keyframe
 		if keyframePair then
-			keyframe = keyframePair[2]
+			keyframe = keyframePair.keyframe
 		else
 			keyframe = Instance.new("Keyframe")
 			keyframe.Time = markerTime
@@ -319,14 +384,14 @@ local function applyMarkersFromCurves(sequence, curveAnimation, keyframeTimePair
 
 		for _, markerInfo in ipairs(markers) do
 			local marker = Instance.new("KeyframeMarker")
-			marker.Name = markerInfo[1]
-			marker.Value = markerInfo[2]
+			marker.Name = markerInfo.name
+			marker.Value = markerInfo.value
 			marker.Parent = keyframe
 		end
 	end
 end
 
-local function curveAnimationToKeyframeSequence(curveAnimation)
+local function curveAnimationToKeyframeSequence(curveAnimation: CurveAnimation): KeyframeSequence?
 	local poseMap, keyTimes, faceControlMap, axisTimelines = mapCurveChannels(curveAnimation)
 	if #keyTimes == 0 then
 		return nil
@@ -402,6 +467,26 @@ function AnimationManager:loadAnimDataAuto(text: string)
     return self:loadAnimDataFromText(text, false)
 end
 
+-- Apply current bone toggle weights after any scaling so the final sequence honors UI toggles.
+-- Only OVERRIDE when the user has explicitly disabled a bone; otherwise preserve
+-- the animation's original Weight (which can be 0 for structural/passthrough poses).
+local function applyBoneWeights(sequence: KeyframeSequence, rig: any)
+	if not rig or not rig.bones then
+		return
+	end
+
+	for _, keyframe in ipairs(sequence:GetKeyframes()) do
+		for _, pose in ipairs(keyframe:GetDescendants()) do
+			if pose:IsA("Pose") then
+				local rigBone = rig.bones[pose.Name]
+				if rigBone and not rigBone.enabled then
+					pose.Weight = 0
+				end
+			end
+		end
+	end
+end
+
 function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 	self.playbackService:stopAnimationAndDisconnect()
 
@@ -412,6 +497,18 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 	local kfs: KeyframeSequence
 	if animationToLoad then
 		kfs = animationToLoad:Clone()
+		
+		-- Restore Loop and Priority state from loaded KeyframeSequence
+		State.loopAnimation:set(kfs.Loop)
+		local priorityName = priorityReverseLookup[kfs.Priority]
+		if priorityName then
+			State.selectedPriority:set(priorityName)
+		end
+		
+		-- Sync to Rig instance as well
+		local rigAny = State.activeRig :: any
+		rigAny.loop = kfs.Loop
+		rigAny.priority = kfs.Priority
 	else
 		kfs = State.activeRig:ToRobloxAnimation()
 	end
@@ -429,7 +526,8 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 	local function hasTorsoMotion(seq: KeyframeSequence): boolean
 		local ok, result = pcall(function()
 			for _, keyframe in ipairs(seq:GetKeyframes()) do
-				for _, pose in ipairs(keyframe:GetDescendants()) do
+				local kf = keyframe :: Keyframe
+				for _, pose in ipairs(kf:GetDescendants()) do
 					if pose:IsA("Pose") and pose.Name == "Torso" then
 						if pose.Weight > 0 then
 							local cf = pose.CFrame
@@ -456,45 +554,29 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 	local humanoid = rigModel and rigModel:FindFirstChildOfClass("Humanoid")
 	local hasTorsoData = humanoid and humanoid.RigType == Enum.HumanoidRigType.R6 and hasTorsoMotion(kfs)
 
-	-- Apply current bone toggle weights after any scaling so the final sequence honors UI toggles
-	local function applyBoneWeights(sequence: KeyframeSequence)
-		local rig = State.activeRig
-		if not rig or not rig.bones then
-			return
-		end
-
-		for _, keyframe in ipairs(sequence:GetKeyframes()) do
-			for _, pose in ipairs(keyframe:GetDescendants()) do
-				if pose:IsA("Pose") then
-					local rigBone = rig.bones[pose.Name]
-					if rigBone then
-						pose.Weight = rigBone.enabled and 1 or 0
-					end
-				end
-			end
-		end
-	end
-
-	applyBoneWeights(kfs)
+	applyBoneWeights(kfs, State.activeRig)
 
 	-- Extract KeyframeMarkers and keyframe names from the loaded animation
 	local extractedKeyframes = {}
 	for _, keyframe in ipairs(kfs:GetKeyframes()) do
+		local kf = keyframe :: Keyframe
 		-- Check for KeyframeMarkers (Events) using proper Roblox API
-		local markers = keyframe:GetMarkers()
+		local markers = kf:GetMarkers()
 		for _, marker in ipairs(markers) do
+			local typedMarker = marker :: KeyframeMarker
 			table.insert(extractedKeyframes, {
-				name = marker.Name,
-				time = keyframe.Time,
-				value = marker.Value,
+				name = typedMarker.Name,
+				time = kf.Time,
+				value = typedMarker.Value,
 				type = "Event"
 			})
 		end
 		-- Check for keyframe name (Name type)
-		if keyframe.Name ~= "Keyframe" then
+		if kf.Name ~= "Keyframe" then
 			table.insert(extractedKeyframes, {
-				name = keyframe.Name,
-				time = keyframe.Time,
+				name = kf.Name,
+				time = kf.Time,
+				value = "",
 				type = "Name"
 			})
 		end
@@ -578,15 +660,16 @@ local function addMarkersToKeyframeSequence(kfs: KeyframeSequence)
 		return
 	end
 	
-	local keyframesByTime = {}
+	local keyframesByTime: { [number]: Keyframe } = {}
 	for _, keyframe in ipairs(kfs:GetKeyframes()) do
-		keyframesByTime[keyframe.Time] = keyframe
+		local kf = keyframe :: Keyframe
+		keyframesByTime[kf.Time] = kf
 	end
 	
 	local epsilon = 0.0001
 	for _, kfData in ipairs(keyframeNames) do
 		-- Find or create keyframe at this time
-		local targetKeyframe = nil
+		local targetKeyframe: Keyframe? = nil
 		for time, keyframe in pairs(keyframesByTime) do
 			if math.abs(time - kfData.time) < epsilon then
 				targetKeyframe = keyframe
@@ -596,10 +679,14 @@ local function addMarkersToKeyframeSequence(kfs: KeyframeSequence)
 		
 		-- If no keyframe exists at this time, create one
 		if not targetKeyframe then
-			targetKeyframe = Instance.new("Keyframe")
-			targetKeyframe.Time = kfData.time
-			targetKeyframe.Parent = kfs
-			keyframesByTime[kfData.time] = targetKeyframe
+			local created = Instance.new("Keyframe")
+			created.Time = kfData.time
+			created.Parent = kfs
+			keyframesByTime[kfData.time] = created
+			targetKeyframe = created
+		end
+		if not targetKeyframe then
+			continue
 		end
 		
 		local markerType = kfData.type or "Name"
@@ -655,6 +742,10 @@ function AnimationManager:saveAnimationRig()
 	if not kfs then
 		return
 	end
+
+	-- Always apply current state properties (the clone path won't have these)
+	kfs.Loop = State.loopAnimation:get()
+	kfs.Priority = priorityLookup[State.selectedPriority:get()]
 
 	if State.animationName and State.animationName ~= "" then
 		kfs.Name = State.animationName
@@ -729,13 +820,15 @@ function AnimationManager:saveAnimationFolder(name: string)
 		kfs = Utils.scaleAnimation(kfs, State.scaleFactor:get()) -- Scale the animation
 	end
 
+	-- Always apply current state properties (the clone path won't have these)
+	kfs.Loop = State.loopAnimation:get()
+	kfs.Priority = priorityLookup[State.selectedPriority:get()]
+
 	if name then
 		kfs.Name = name
 	end
 
 	kfs.Parent = folder
-
-	kfs.Priority = priorityLookup[State.selectedPriority:get()]
 end
 
 function AnimationManager:uploadAnimation()
@@ -760,6 +853,10 @@ function AnimationManager:uploadAnimation()
 	if not kfs then
 		return
 	end
+
+	-- Always apply current state properties (the clone path won't have these)
+	kfs.Loop = State.loopAnimation:get()
+	kfs.Priority = priorityLookup[State.selectedPriority:get()]
     kfs.Parent = game.Workspace
 
     -- upload the selected KeyframeSequence
@@ -948,6 +1045,14 @@ function AnimationManager:removeKeyframeName(index)
 	table.remove(currentKeyframes, index)
 	State.keyframeNames:set(currentKeyframes)
 end
+
+-- Expose local helpers for unit testing
+AnimationManager._testing = {
+	sampleAxisValue = sampleAxisValue,
+	interpolateMissingAxis = interpolateMissingAxis,
+	ensureChannelSample = ensureChannelSample,
+	applyBoneWeights = applyBoneWeights,
+}
 
 return AnimationManager
 

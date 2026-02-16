@@ -149,9 +149,10 @@ function PlayerTab.create(services: any)
 							Size = UDim2.new(1, 0, 0, 200),
 							LayoutOrder = 2,
 							BackgroundTransparency = 1,
-							CanvasSize = UDim2.new(0.95, 0, 0, 0),
+							CanvasSize = UDim2.new(0, 0, 0, 0),
 							AutomaticCanvasSize = Enum.AutomaticSize.Y,
-							ScrollBarThickness = 0,
+							ScrollBarThickness = 4,
+							ScrollBarImageTransparency = 0.5,
 							[Children] = Computed(function()
 								local anims = State.savedAnimations:get()
 								local currentCount = #anims
@@ -230,7 +231,7 @@ function PlayerTab.create(services: any)
 										New("Frame")({
 											Size = UDim2.new(0.95, -2, 0, 30),
 											BackgroundColor3 = themeProvider:GetColor(Computed(function()
-												return isSelected and Enum.StudioStyleGuideColor.ButtonBorder
+											return isSelected and Enum.StudioStyleGuideColor.DiffFilePathBackground
 													or Enum.StudioStyleGuideColor.Button
 											end)),
 											BorderSizePixel = 0,
@@ -402,7 +403,7 @@ function PlayerTab.create(services: any)
 								end
 
 								return elements
-							end),
+							end, Fusion.cleanup),
 						}),
 					},
 				}) :: any,

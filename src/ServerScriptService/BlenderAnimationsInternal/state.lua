@@ -27,6 +27,7 @@ local State = {
     isFinished = Value(false),
 
     activeRigModel = nil :: Types.RigModelType?,
+    lastKnownRigModel = nil :: Types.RigModelType?,  -- survives selection changes
     activeAnimator = nil :: Types.AnimatorType?,
     activeRig = nil :: Types.RigType?,
     activeRigExists = Value(false),
@@ -81,6 +82,11 @@ local State = {
     fovValue = Value(game.Workspace.CurrentCamera.FieldOfView),
     
     metaParts = {} :: { Part | Model },
+
+    -- Weapon export
+    selectedWeapon = Value(nil :: Instance?),
+    selectedWeaponName = Value("No Weapon Selected"),
+    weaponConnectionStatus = Value("" :: string),  -- e.g. "Motor6D: Right Arm → Handle ✓"
 
     liveSyncEnabled = Value(false),
     lastKnownBlenderAnimHash = Value(""),

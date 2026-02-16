@@ -148,8 +148,37 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 	local dragDiffVersion = Value(0)
 	local finalizeDrag: (() -> ())?
 
+	-- Per-row reactive state that updates WITHOUT rebuilding the entire Computed tree.
+	-- Key = bone index, value = { enabled: Value<boolean> }
+	local rowStates: { [number]: { enabled: any } } = {}
+
+	local function getRowState(index: number, initialEnabled: boolean)
+		local existing = rowStates[index]
+		if existing then
+			existing.enabled:set(initialEnabled)
+			return existing
+		end
+		local state = { enabled = Value(initialEnabled) }
+		rowStates[index] = state
+		return state
+	end
+
+	local function updateRowVisuals()
+		local boneWeights = dragOriginalWeights or State.boneWeights:get()
+		for i, bone in ipairs(boneWeights) do
+			local rs = rowStates[i]
+			if rs then
+				local override = dragDiff[i]
+				local effective = if override ~= nil then override else bone.enabled
+				rs.enabled:set(effective)
+			end
+		end
+	end
+
 	local function bumpDiffVersion()
 		dragDiffVersion:set(dragDiffVersion:get() + 1)
+		-- Update per-row reactive values instead of rebuilding the whole list
+		updateRowVisuals()
 	end
 
 	local function setDragOverride(index: number, target: boolean)
@@ -246,23 +275,21 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 		return finalizeDrag
 	end
 
-	return VerticalCollapsibleSection({
+	local section = VerticalCollapsibleSection({
 		Text = "Bone Toggles",
 		Collapsed = false,
 		LayoutOrder = layoutOrder or 2,
 		Visible = State.activeRigExists,
 		[Children] = Computed(function()
-			local _ = dragDiffVersion:get()
-			local boneWeights = if isDragging:get() and dragOriginalWeights then dragOriginalWeights else State.boneWeights:get()
+			local boneWeights = State.boneWeights:get()
 			local items = {}
+			-- Reset row states when bone list changes
+			table.clear(rowStates)
 
 			for i, bone in ipairs(boneWeights) do
 				local indentWidth = bone.depth * 10
 				local iconData = getBoneIconData(bone.name)
-				local override = if isDragging:get() then dragDiff[i] else nil
-				local effectiveEnabled = if override ~= nil then override else bone.enabled
-				local checkboxValue = Value(effectiveEnabled)
-				checkboxValue:set(effectiveEnabled)
+				local rowState = getRowState(i, bone.enabled)
 
 				table.insert(
 					items,
@@ -314,7 +341,7 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 								LayoutOrder = 1,
 							}),
 							Checkbox({
-								Value = checkboxValue,
+								Value = rowState.enabled,
 								Text = "",
 								Size = UDim2.fromOffset(16, 16),
 								LayoutOrder = 2,
@@ -331,13 +358,15 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 								end,
 								OnChange = function(enabled: boolean)
 									if isDragging:get() then
+										-- Don't override dragTargetState here — it's set
+										-- once in beginDrag. Reactive Value updates from
+										-- updateRowVisuals can fire OnChange spuriously
+										-- and flip the drag direction.
 										setDragOverride(i, enabled)
-										dragTargetState:set(enabled)
 									else
 										applyBoneEnabled(boneWeights, bone, enabled, services, false, false)
 									end
 									lastPaintedIndex:set(i)
-									checkboxValue:set(enabled)
 								end,
 							}),
 							New("ImageLabel")({
@@ -348,9 +377,7 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 								ImageRectOffset = iconData and iconData.ImageRectOffset or Vector2.new(0, 0),
 								ImageRectSize = iconData and iconData.ImageRectSize or Vector2.new(0, 0),
 								ImageColor3 = Computed(function()
-									dragDiffVersion:get()
-									local overrideLocal = if isDragging:get() then dragDiff[i] else nil
-									local effectiveEnabledLocal = if overrideLocal ~= nil then overrideLocal else bone.enabled
+									local effectiveEnabledLocal = rowState.enabled:get()
 									local colorState = if effectiveEnabledLocal
 										then themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText)
 										else themeProvider:GetColor(Enum.StudioStyleGuideColor.DimmedText)
@@ -371,9 +398,7 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 										Font = themeProvider:GetFont("Default"),
 										TextSize = constants.TextSize,
 										TextColor3 = Computed(function()
-											dragDiffVersion:get()
-											local overrideLocal = if isDragging:get() then dragDiff[i] else nil
-											local effectiveEnabledLocal = if overrideLocal ~= nil then overrideLocal else bone.enabled
+											local effectiveEnabledLocal = rowState.enabled:get()
 											local colorState = if effectiveEnabledLocal
 												then themeProvider:GetColor(Enum.StudioStyleGuideColor.MainText)
 												else themeProvider:GetColor(Enum.StudioStyleGuideColor.DimmedText)
@@ -388,8 +413,17 @@ function BoneToggles.create(services: any, layoutOrder: number?)
 			end
 
 			return items
-		end),
+		end, Fusion.cleanup),
 	})
+
+	section.Destroying:Connect(function()
+		if releaseConn then
+			releaseConn:Disconnect()
+			releaseConn = nil
+		end
+	end)
+
+	return section
 end
 
 return BoneToggles

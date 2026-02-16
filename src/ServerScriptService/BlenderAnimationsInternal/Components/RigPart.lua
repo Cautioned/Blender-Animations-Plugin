@@ -25,6 +25,17 @@ local Pose = require(script.Parent.Pose)
 
 local MAX_MOTOR6D_DEPTH = 1024 -- extreme depth guard to catch pathological rigs before Luau overflows
 
+local function isAccessoryPart(inst: Instance): boolean
+	local current: Instance? = inst
+	while current do
+		if current:IsA("Accessory") or current:IsA("Accoutrement") then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
 
 
 type BuildState = {
@@ -51,7 +62,14 @@ local function formatCycle(state: BuildState, repeated: Instance)
 	return table.concat(cycleNames, " -> ")
 end
 
-function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolean, connectingJoint: Instance?, buildState: BuildState?)
+function RigPart.new(
+	rig: any,
+	part: Instance,
+	parent: any?,
+	isDeformRig: boolean,
+	connectingJoint: Instance?,
+	buildState: BuildState?
+): RigPart?
 	if not parent then
 		buildState = buildState
 			or {
@@ -191,7 +209,9 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 			rig._duplicateBoneWarnings = rig._duplicateBoneWarnings or {}
 			if not rig._duplicateBoneWarnings[part.Name] then
 				rig._duplicateBoneWarnings[part.Name] = true
-				warn("Duplicate rig part name detected:", part.Name, "for model", rig.model and rig.model.Name or "<unknown>")
+				if not isAccessoryPart(part) then
+					warn("Duplicate rig part name detected:", part.Name, "for model", rig.model and rig.model.Name or "<unknown>")
+				end
 			end
 		end
 	end
@@ -202,7 +222,7 @@ function RigPart.new(rig: any, part: Instance, parent: any?, isDeformRig: boolea
 		state.path[#state.path] = nil
 	end
 
-	return self
+	return (self :: any)
 end
 
 function RigPart:AddPose(kft, transform, isDeformBone, easingStyle, easingDirection)
@@ -225,21 +245,10 @@ function RigPart:PoseToRobloxAnimation(t)
 		end
 	end
 
-	-- If this part has no keyframe at this time, AND no children have poses, prune it.
-	if not poseToApply and #childrenPoses == 0 then
-		return nil
-	end
-
-	local pose = Instance.new("Pose")
-	pose.Name = part.Name
-	pose.Weight = enabled and 1 or 0
-
-	-- If we have children but no pose at this time, we need to fill in a value
-	-- so Roblox doesn't interpolate to identity. The approach depends on easing:
-	-- - Constant: hold the previous keyframe's value
-	-- - Linear/other: interpolate between previous and next keyframes
-	if not poseToApply and #childrenPoses > 0 then
-		-- Find previous and next keyframes
+	-- If this part has no keyframe at this exact time, synthesize one so
+	-- Roblox doesn't treat the missing Pose as CFrame.identity (which would
+	-- snap the bone to rest mid-animation).
+	if not poseToApply then
 		local prevTime, nextTime = nil, nil
 		for poseTime, _ in pairs(poses) do
 			if poseTime < t then
@@ -257,27 +266,41 @@ function RigPart:PoseToRobloxAnimation(t)
 		local prevPose = prevTime and poses[prevTime] or nil
 		local nextPose = nextTime and poses[nextTime] or nil
 
-		-- Determine easing style from the previous keyframe (that's what controls interpolation TO next)
-		local easingStyle = prevPose and prevPose.easingStyle or "Linear"
+		if prevPose then
+			local easingStyle = prevPose.easingStyle or "Linear"
+			if easingStyle == "Constant" or not nextPose or nextTime == nil then
+				-- Constant easing or no future keyframe: hold previous value
+				poseToApply = prevPose
+			else
+				-- Interpolate between prev and next (Linear/other)
+				local alpha = (t - (prevTime :: number)) / ((nextTime :: number) - (prevTime :: number))
+				local interpCFrame = prevPose.transform:Lerp(nextPose.transform, alpha)
+				poseToApply = {
+					transform = interpCFrame,
+					-- Carry forward prev's easing so the segment from this
+					-- synthetic keyframe to the next real one stays consistent
+					easingStyle = easingStyle,
+					easingDirection = prevPose.easingDirection or "In",
+				}
+			end
+		elseif nextPose then
+			-- Before the bone's first keyframe: use the next available pose.
+			-- Roblox will interpolate from this value forward, so projecting
+			-- the first real keyframe backwards keeps the bone stable until
+			-- its first actual keyframe is reached.
+			poseToApply = nextPose
+		end
+		-- else: bone has no poses at all; poseToApply stays nil → identity below
 
-		if easingStyle == "Constant" then
-			-- For Constant, just hold the previous pose
-			poseToApply = prevPose or nextPose
-		elseif prevPose and nextPose and prevTime ~= nil and nextTime ~= nil then
-			-- For Linear (and others), interpolate between prev and next
-			local alpha = (t - prevTime) / (nextTime - prevTime)
-			local interpCFrame = prevPose.transform:Lerp(nextPose.transform, alpha)
-			-- Create a synthetic pose with the interpolated value
-			poseToApply = {
-				transform = interpCFrame,
-				easingStyle = easingStyle,
-				easingDirection = prevPose.easingDirection or "Out",
-			}
-		else
-			-- Fallback: use whichever keyframe we have
-			poseToApply = prevPose or nextPose
+		-- If no pose and no children, prune this branch entirely
+		if not poseToApply and #childrenPoses == 0 then
+			return nil
 		end
 	end
+
+	local pose = Instance.new("Pose")
+	pose.Name = part.Name
+	pose.Weight = enabled and 1 or 0
 
 	if poseToApply then
 		local transform = poseToApply.transform
@@ -416,7 +439,7 @@ function RigPart:Encode(handledParts, opts)
 		children = {},
 		aux = {},
 		isDeformBone = self.bone ~= nil,
-		jointType = nil,
+		jointType = (nil :: string?),
 		auxTransform = {},
 	}
 
@@ -438,8 +461,8 @@ function RigPart:Encode(handledParts, opts)
 		-- This is a deform bone. We will make it look like a Motor6D joint
 		-- by sending its WorldCFrame and creating virtual joint data.
 		elem.transform = { bone.WorldCFrame:GetComponents() }
-		local parent = self.parent
-		if parent then
+		local boneParent = self.parent
+		if boneParent then
 			-- The bone's local CFrame becomes C0. C1 is identity.
 			elem.jointtransform0 = { bone.CFrame:GetComponents() }
 			elem.jointtransform1 = { CFrame.new():GetComponents() }
@@ -450,34 +473,35 @@ function RigPart:Encode(handledParts, opts)
 		-- Send its world CFrame.
 		elem.transform = { part.CFrame:GetComponents() }
 		-- If it's a child, also send the real joint data.
-		local parent = self.parent
-		local joint = self.joint
-		if parent and joint then
-			if joint:IsA("Motor6D") or joint:IsA("Weld") then
+		local partParent = self.parent
+		local jointInstance = self.joint
+		if partParent and jointInstance then
+			if jointInstance:IsA("Motor6D") or jointInstance:IsA("Weld") then
 				-- IMPORTANT: Normalize C0/C1 based on joint direction.
 				-- jointtransform0 should always be relative to the PARENT part.
 				-- jointtransform1 should always be relative to the CHILD part.
 				-- When jointParentIsPart0=true: Part0=parent, Part1=child -> C0 is parent-relative, C1 is child-relative (standard)
 				-- When jointParentIsPart0=false: Part0=child, Part1=parent -> C0 is child-relative, C1 is parent-relative (swapped)
 				if self.jointParentIsPart0 then
-					elem.jointtransform0 = { (joint :: any).C0:GetComponents() }
-					elem.jointtransform1 = { (joint :: any).C1:GetComponents() }
+					elem.jointtransform0 = { (jointInstance :: any).C0:GetComponents() }
+					elem.jointtransform1 = { (jointInstance :: any).C1:GetComponents() }
 				else
 					-- Swap: C1 becomes jointtransform0 (parent-relative), C0 becomes jointtransform1 (child-relative)
-					elem.jointtransform0 = { (joint :: any).C1:GetComponents() }
-					elem.jointtransform1 = { (joint :: any).C0:GetComponents() }
+					elem.jointtransform0 = { (jointInstance :: any).C1:GetComponents() }
+					elem.jointtransform1 = { (jointInstance :: any).C0:GetComponents() }
 				end
-			elseif joint:IsA("AnimationConstraint") then
+			elseif jointInstance:IsA("AnimationConstraint") then
 				-- For AnimationConstraint, the Transform property acts like C0, C1 is identity
-				elem.jointtransform0 = { (joint :: any).Transform:GetComponents() }
+				elem.jointtransform0 = { (jointInstance :: any).Transform:GetComponents() }
 				elem.jointtransform1 = { CFrame.new():GetComponents() }
-			elseif joint:IsA("WeldConstraint") then
-				local parentToChild = parent.part.CFrame:ToObjectSpace(part.CFrame)
+			elseif jointInstance:IsA("WeldConstraint") then
+				-- WeldConstraint doesn't have C0/C1, use relative transform
+				local parentToChild = (jointInstance :: any).Part0.CFrame:ToObjectSpace((jointInstance :: any).Part1.CFrame)
 				elem.jointtransform0 = { parentToChild:GetComponents() }
 				elem.jointtransform1 = { CFrame.new():GetComponents() }
 			end
+			elem.jointType = jointInstance.ClassName
 		end
-		elem.jointType = joint and joint.ClassName or nil
 	end
 
 	local children = self.children

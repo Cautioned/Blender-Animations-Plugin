@@ -90,7 +90,7 @@ function PlaybackControls.createPlaybackScrubber(services: any)
 						)
 					end
 					return indicators
-				end),
+				end, Fusion.cleanup),
 			}),
 		},
 	})

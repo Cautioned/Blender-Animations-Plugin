@@ -14,7 +14,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 3, 8),
+    "version": (2, 4, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -23,6 +23,7 @@ bl_info = {
 # Define classes once - used for both registration and unregistration
 CLASSES = (
     # Import operators
+    operators.OBJECT_OT_ConfirmWeaponTarget,  # must register before ImportModel uses it
     operators.OBJECT_OT_ImportModel,
     operators.OBJECT_OT_ImportFbxAnimation,
     # Rig operators
@@ -45,6 +46,9 @@ CLASSES = (
     operators.OBJECT_OT_ToggleRotationMomentum,
     # Weld bone visibility
     operators.OBJECT_OT_ToggleWeldBones,
+    # World-space unparent
+    operators.OBJECT_OT_WorldSpaceUnparent,
+    operators.OBJECT_OT_WorldSpaceReparent,
     # Animation operators
     operators.OBJECT_OT_ApplyTransform,
     operators.OBJECT_OT_MapKeyframes,
@@ -56,6 +60,9 @@ CLASSES = (
     # Constraint operators
     operators.OBJECT_OT_AutoConstraint,
     operators.OBJECT_OT_ManualConstraint,
+    # Weapon/accessory operators
+    operators.OBJECT_OT_AttachMeshToBone,
+    operators.OBJECT_OT_ImportAndAttach,
     # Server operators
     operators.StartServerOperator,
     operators.StopServerOperator,
@@ -69,27 +76,34 @@ def _safe_unregister_class(cls):
     import bpy
 
     try:
-        bpy.utils.unregister_class(cls)
-        return
-    except Exception:
-        pass
-
-    try:
         existing = getattr(bpy.types, cls.__name__, None)
         if existing:
             bpy.utils.unregister_class(existing)
     except Exception:
-        pass
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
 
 
 def _safe_register_class(cls):
     import bpy
 
+    existing = getattr(bpy.types, cls.__name__, None)
+    if existing:
+        try:
+            bpy.utils.unregister_class(existing)
+        except Exception:
+            pass
+
     try:
         bpy.utils.register_class(cls)
-    except ValueError:
+    except Exception:
         _safe_unregister_class(cls)
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except Exception:
+            pass
 
 
 def file_import_extend(self, context):
@@ -159,9 +173,14 @@ def unregister():
         
         # Clean up COM visualization
         try:
-            from .rig.com import enable_com_visualization, unregister_frame_handler
+            from .rig.com import (
+                enable_com_visualization,
+                unregister_frame_handler,
+                unregister_depsgraph_handler,
+            )
             enable_com_visualization(False)
             unregister_frame_handler()
+            unregister_depsgraph_handler()
         except Exception:
             pass
 
