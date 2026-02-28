@@ -138,7 +138,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             "object.rbxanims_manualconstraint", text="Manual Constraint Editor"
         )
         col.separator()
-        col.label(text="Weapon / Accessory", icon="OBJECT_DATA")
+
         # Toggle weld bone visibility
         weld_row = col.row(align=True)
         weld_row.operator(

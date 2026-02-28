@@ -1278,7 +1278,7 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
             if result == {"FINISHED"} and proxy_armature:
                 source_arm_obj = get_object_by_name(actual_rig_name, context.scene)
                 if source_arm_obj:
-                    OBJECT_OT_ConfirmWeaponTarget._clone_weapon_bones_to_proxy(
+                    OBJECT_OT_ApplyWeaponImport._clone_weapon_bones_to_proxy(
                         context, source_arm_obj, proxy_armature, meta_loaded
                     )
         finally:
@@ -1293,6 +1293,38 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
         """Create matching weapon bones on the proxy armature with COPY_TRANSFORMS
         constraints pointing back to the source armature's weapon bones."""
         from ..rig.creation import _safe_mode_set
+
+        def _ensure_object_in_view_layer(ctx, obj):
+            """Ensure object is available in current window view layer.
+
+            Returns True if available (or switched to a view layer that has it),
+            else False.
+            """
+            if not obj:
+                return False
+            try:
+                if ctx.view_layer.objects.get(obj.name) == obj:
+                    return True
+            except Exception:
+                pass
+
+            scene = getattr(ctx, "scene", None)
+            win = getattr(ctx, "window", None)
+            if scene is None:
+                return False
+
+            for vl in scene.view_layers:
+                try:
+                    if vl.objects.get(obj.name) == obj:
+                        if win is not None:
+                            try:
+                                win.view_layer = vl
+                            except Exception:
+                                pass
+                        return True
+                except Exception:
+                    continue
+            return False
 
         # find weapon bones on source (they were just created by _import_weapon)
         # weapon bones are parented under the suggested bone
@@ -1323,6 +1355,19 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
             return
 
         print(f"[WeaponImport] Cloning {len(weapon_bones)} weapon bones to proxy '{proxy_armature.name}': {weapon_bones}")
+
+        if not _ensure_object_in_view_layer(context, source_armature):
+            print(
+                f"[WeaponImport] Cannot clone weapon bones: source armature "
+                f"'{source_armature.name}' is not in any accessible view layer."
+            )
+            return
+        if not _ensure_object_in_view_layer(context, proxy_armature):
+            print(
+                f"[WeaponImport] Skipping proxy clone: armature "
+                f"'{proxy_armature.name}' is not in any accessible view layer."
+            )
+            return
 
         # collect bone data from SOURCE in edit mode (only way to get real roll)
         context.view_layer.objects.active = source_armature
