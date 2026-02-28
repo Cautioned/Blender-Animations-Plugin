@@ -3561,6 +3561,205 @@ class TestAnimationSerialization(unittest.TestCase):
                 f"it needs the rest offset from Neck to position correctly in Roblox."
             )
 
+    def test_mixed_channel_same_frame_prefers_constant_easing(self):
+        """If channels disagree on a frame, export should prefer Constant easing."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+        bone = arm.edit_bones.new("Bone")
+        bone.head = (0, 0, 0)
+        bone.tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pb = armature_obj.pose.bones["Bone"]
+        pb.bone["transform"] = mathutils.Matrix.Identity(4)
+        pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+        pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+        pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("MixedChannelConstantWins")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        # Key both channels on same frames.
+        pb.location = (0, 0, 0)
+        pb.keyframe_insert(data_path="location", frame=1, index=0)  # X
+        pb.keyframe_insert(data_path="location", frame=1, index=1)  # Y
+        pb.location = (1, 1, 0)
+        pb.keyframe_insert(data_path="location", frame=10, index=0)  # X
+        pb.keyframe_insert(data_path="location", frame=10, index=1)  # Y
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if 'pose.bones["Bone"].location' not in fcurve.data_path:
+                continue
+            if fcurve.array_index == 0:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+            elif fcurve.array_index == 1:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "LINEAR"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+        first_bone = result["kfs"][0]["kf"].get("Bone")
+        self.assertIsNotNone(first_bone, "Bone missing from first keyframe.")
+        self.assertEqual(
+            first_bone[1],
+            "Constant",
+            "Mixed-channel same-frame interpolation should resolve to Constant.",
+        )
+
+    def test_constrained_bone_ignores_unrelated_constant_frames(self):
+        """Unrelated constant keys must not force constrained bone easing to Constant."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        driver = arm.edit_bones.new("Driver")
+        driver.head = (0, 0, 0)
+        driver.tail = (0, 1, 0)
+
+        follower = arm.edit_bones.new("Follower")
+        follower.head = (1, 0, 0)
+        follower.tail = (1, 1, 0)
+
+        unrelated = arm.edit_bones.new("Unrelated")
+        unrelated.head = (2, 0, 0)
+        unrelated.tail = (2, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for name in ("Driver", "Follower", "Unrelated"):
+            pb = armature_obj.pose.bones[name]
+            pb.bone["transform"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+            pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        follower_pb = armature_obj.pose.bones["Follower"]
+        c = follower_pb.constraints.new(type="COPY_TRANSFORMS")
+        c.target = armature_obj
+        c.subtarget = "Driver"
+
+        action = bpy.data.actions.new("ConstrainedUnrelatedConstant")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        driver_pb = armature_obj.pose.bones["Driver"]
+        driver_pb.location = (0, 0, 0)
+        driver_pb.keyframe_insert(data_path="location", frame=1)
+        driver_pb.location = (2, 0, 0)
+        driver_pb.keyframe_insert(data_path="location", frame=10)
+
+        unrelated_pb = armature_obj.pose.bones["Unrelated"]
+        unrelated_pb.location = (0, 0, 0)
+        unrelated_pb.keyframe_insert(data_path="location", frame=5)
+        unrelated_pb.location = (0, 0, 0)
+        unrelated_pb.keyframe_insert(data_path="location", frame=6)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if 'pose.bones["Driver"]' in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "LINEAR"
+            if 'pose.bones["Unrelated"]' in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+
+        follower_styles = []
+        for kf in result["kfs"]:
+            follower_data = kf["kf"].get("Follower")
+            if follower_data:
+                follower_styles.append(follower_data[1])
+
+        self.assertTrue(follower_styles, "Follower bone not exported.")
+        self.assertIn("Linear", follower_styles, "Follower should preserve linear easing from driver.")
+        # Unrelated constant keys should not globally force all follower keys to Constant.
+        self.assertNotEqual(
+            set(follower_styles),
+            {"Constant"},
+            "Follower easing was globally forced to Constant by unrelated keys.",
+        )
+
+    def test_non_inheriting_constant_hold_clamps_between_keys(self):
+        """Non-inheriting bones with constant keys should hold pose between keys."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("Root")
+        root.head = (0, 0, 0)
+        root.tail = (0, 1, 0)
+
+        leg = arm.edit_bones.new("Leg")
+        leg.head = (0, 1, 0)
+        leg.tail = (0, 2, 0)
+        leg.parent = root
+        leg.use_inherit_rotation = False
+
+        bpy.ops.object.mode_set(mode="POSE")
+        for name in ("Root", "Leg"):
+            pb = armature_obj.pose.bones[name]
+            pb.bone["is_transformable"] = True
+            pb.bone["transform"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+            pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("NonInheritConstantHold")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        leg_pb = armature_obj.pose.bones["Leg"]
+        leg_pb.rotation_euler = (0, 0, 0)
+        leg_pb.keyframe_insert(data_path="rotation_euler", frame=1)
+        leg_pb.rotation_euler = (math.radians(60), 0, 0)
+        leg_pb.keyframe_insert(data_path="rotation_euler", frame=10)
+
+        from ..core.utils import get_action_fcurves
+
+        for fcurve in get_action_fcurves(action):
+            if 'pose.bones["Leg"]' in fcurve.data_path:
+                for kp in fcurve.keyframe_points:
+                    kp.interpolation = "CONSTANT"
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+
+        leg_samples = [kf["kf"]["Leg"] for kf in result["kfs"] if "Leg" in kf["kf"]]
+        # Constant holds for this case are now emitted sparsely (boundary/keys),
+        # but the hold must still be preserved.
+        self.assertGreaterEqual(
+            len(leg_samples), 2, "Expected at least boundary/key samples for non-inheriting leg."
+        )
+
+        first_cf = leg_samples[0][0]
+        mid_cf = leg_samples[len(leg_samples) // 2][0]
+        # During constant hold span, mid sample should remain at held pose.
+        for i in range(len(first_cf)):
+            self.assertAlmostEqual(
+                first_cf[i],
+                mid_cf[i],
+                places=4,
+                msg=f"Leg mid-frame component {i} should hold constant between keys.",
+            )
+
 
 # This allows running the tests from the Blender text editor
 if __name__ == "__main__":

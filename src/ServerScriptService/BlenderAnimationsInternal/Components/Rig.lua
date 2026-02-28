@@ -51,6 +51,35 @@ function Rig.new(model: Model)
 
 	self.isDeformRig = #allBones > 0
 
+	-- Reject rigs where a Bone and BasePart share the same name. The rig map
+	-- indexes by name, so collisions are ambiguous and can crash downstream logic.
+	do
+		local partNames: { [string]: boolean } = {}
+		local collisionNames: { [string]: boolean } = {}
+		local collisions: { string } = {}
+
+		for _, descendant in ipairs(model:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				partNames[descendant.Name] = true
+			end
+		end
+		for _, bone in ipairs(allBones) do
+			if partNames[bone.Name] and not collisionNames[bone.Name] then
+				collisionNames[bone.Name] = true
+				table.insert(collisions, bone.Name)
+			end
+		end
+
+		if #collisions > 0 then
+			table.sort(collisions)
+			error(
+				"PART/BONE NAME COLLISION DETECTED: "
+					.. table.concat(collisions, ", ")
+					.. ". Rename duplicates so BasePart and Bone names are unique."
+			)
+		end
+	end
+
     -- Pre-build the joint cache for fast lookups, guarding duplicate Motor6D names under the same parent
 	self._jointCache = {}
 	local duplicateGuard: { [Instance]: { [string]: boolean } } = {}

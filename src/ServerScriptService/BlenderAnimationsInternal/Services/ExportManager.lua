@@ -572,11 +572,10 @@ function ExportManager:exportWeapon()
 
 	self:clearMetaParts()
 
-	-- ---- Find the connection to the character rig (on the ORIGINAL) ----
+	-- ---- Find all connections to the character rig (on the ORIGINAL) ----
 	local gripData: { [string]: any } = {}
 	local rigModel = State.activeRigModel or State.lastKnownRigModel
-	local connectionJoint: Instance? = nil
-	local characterPart: BasePart? = nil
+	local connectionEntries: { [number]: { joint: Instance, characterPart: BasePart, weaponPart: BasePart } } = {}
 
 	if rigModel then
 		-- Build a set of ALL weapon parts so we can detect cross-connections
@@ -599,8 +598,8 @@ function ExportManager:exportWeapon()
 		end
 
 		local seenJointsConn: { [Instance]: boolean } = {}
+		local seenWeaponParts: { [Instance]: boolean } = {}
 		for _, root in ipairs(searchRoots) do
-			if connectionJoint then break end
 			for _, desc in ipairs(root:GetDescendants()) do
 				if seenJointsConn[desc] then continue end
 				if desc:IsA("Motor6D") or desc:IsA("Weld") or desc:IsA("WeldConstraint") then
@@ -610,39 +609,34 @@ function ExportManager:exportWeapon()
 					if not p0 or not p1 then continue end
 					-- Check if this joint connects a weapon part to a rig part
 					if weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p1] then
-						connectionJoint = desc
-						characterPart = p1
-						break
+						if not seenWeaponParts[p0] then
+							seenWeaponParts[p0] = true
+							table.insert(connectionEntries, {
+								joint = desc,
+								characterPart = p1,
+								weaponPart = p0,
+							})
+						end
 					elseif weaponPartSet[p1] and p0:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
-						connectionJoint = desc
-						characterPart = p0
-						break
+						if not seenWeaponParts[p1] then
+							seenWeaponParts[p1] = true
+							table.insert(connectionEntries, {
+								joint = desc,
+								characterPart = p0,
+								weaponPart = p1,
+							})
+						end
 					end
 				end
 			end
 		end
 	end
 
-	if connectionJoint and characterPart then
-		gripData.suggestedBone = characterPart.Name
-		local j = connectionJoint :: any
-		local charIsPart0 = (j.Part0 == characterPart)
-		if j:IsA("Motor6D") or j:IsA("Weld") then
-			if charIsPart0 then
-				gripData.connectionC0 = { j.C0:GetComponents() }
-				gripData.connectionC1 = { j.C1:GetComponents() }
-			else
-				gripData.connectionC0 = { j.C1:GetComponents() }
-				gripData.connectionC1 = { j.C0:GetComponents() }
-			end
-		elseif j:IsA("WeldConstraint") then
-			local relCF = characterPart.CFrame:ToObjectSpace(weaponRoot.CFrame)
-			gripData.connectionC0 = { relCF:GetComponents() }
-			gripData.connectionC1 = { CFrame.new():GetComponents() }
+	if #connectionEntries > 0 then
+		for _, entry in ipairs(connectionEntries) do
+			print(("[ExportManager] Found connection: %s -> %s via %s (%s)")
+				:format(entry.characterPart.Name, entry.weaponPart.Name, entry.joint.Name, entry.joint.ClassName))
 		end
-		gripData.connectionJointType = connectionJoint.ClassName
-		print(("[ExportManager] Found connection: %s -> %s via %s (%s)")
-			:format(characterPart.Name, weaponRoot.Name, connectionJoint.Name, connectionJoint.ClassName))
 	else
 		if rigModel then
 			warn("[ExportManager] No connection joint found between weapon and rig. Weapon will have no positional data.")
@@ -706,6 +700,7 @@ function ExportManager:exportWeapon()
 
 	-- Find weaponRoot's clone equivalent
 	local cloneWeaponRoot: BasePart? = nil
+	local originalToClone: { [Instance]: BasePart } = {}
 
 	-- If the clone source IS the weapon root (bare part, no container),
 	-- the clone itself is the weapon root — no path map lookup needed.
@@ -719,6 +714,11 @@ function ExportManager:exportWeapon()
 			end
 		end
 	end
+	for clonePart, origPart in pairs(cloneToOriginal) do
+		if clonePart:IsA("BasePart") then
+			originalToClone[origPart] = clonePart :: BasePart
+		end
+	end
 
 	if not cloneWeaponRoot then
 		warn("[ExportManager] Could not find weapon root in clone.")
@@ -726,7 +726,7 @@ function ExportManager:exportWeapon()
 		return
 	end
 
-	-- ---- BFS from cloneWeaponRoot to collect all weapon parts in the clone ----
+	-- ---- Collect all weapon parts in the clone ----
 	-- Build joint cache for the clone
 	local weaponJointCache: { [Instance]: { Instance } } = {}
 	for _, desc in ipairs(weaponClone:GetDescendants()) do
@@ -747,23 +747,16 @@ function ExportManager:exportWeapon()
 		end
 	end
 
-	local allCloneParts: { BasePart } = { cloneWeaponRoot }
-	local clonePartSet: { [Instance]: boolean } = { [cloneWeaponRoot] = true }
-	local bfsQueue = { cloneWeaponRoot }
-	while #bfsQueue > 0 do
-		local current = table.remove(bfsQueue, 1) :: BasePart
-		for _, joint in pairs(weaponJointCache[current] or {}) do
-			local j = joint :: any
-			if j.Part0 and j.Part1 then
-				local other: BasePart? = nil
-				if j.Part0 == current then other = j.Part1
-				elseif j.Part1 == current then other = j.Part0 end
-				if other and not clonePartSet[other] then
-					clonePartSet[other] = true
-					table.insert(allCloneParts, other)
-					table.insert(bfsQueue, other)
-				end
-			end
+	local allCloneParts: { BasePart } = {}
+	local clonePartSet: { [Instance]: boolean } = {}
+	if weaponClone:IsA("BasePart") then
+		table.insert(allCloneParts, weaponClone)
+		clonePartSet[weaponClone] = true
+	end
+	for _, desc in ipairs(weaponClone:GetDescendants()) do
+		if desc:IsA("BasePart") and not clonePartSet[desc] then
+			clonePartSet[desc] = true
+			table.insert(allCloneParts, desc)
 		end
 	end
 
@@ -824,7 +817,7 @@ function ExportManager:exportWeapon()
 		return
 	end
 
-	-- ---- Build weapon joint tree from the clone ----
+	-- ---- Build weapon joint trees from the clone ----
 	local visitedParts: { [Instance]: boolean } = {}
 	local hasMotor6Ds = false
 
@@ -886,10 +879,75 @@ function ExportManager:exportWeapon()
 		return elem
 	end
 
-	local weaponJointTree = encodeWeaponPart(cloneWeaponRoot, nil, nil)
-	if weaponJointTree then
-		self:reencodeJointMetadata(weaponJointTree, weaponPartEncodeMap)
-		gripData.joints = weaponJointTree
+	local attachmentByRoot: { [Instance]: { [string]: any } } = {}
+	local weaponAttachments: { [number]: { [string]: any } } = {}
+
+	for _, entry in ipairs(connectionEntries) do
+		local cloneRoot = originalToClone[entry.weaponPart]
+		if cloneRoot and not attachmentByRoot[cloneRoot] then
+			local info: { [string]: any } = {
+				rootPart = entry.weaponPart.Name,
+				suggestedBone = entry.characterPart.Name,
+				connectionJointType = entry.joint.ClassName,
+			}
+			local j = entry.joint :: any
+			local charIsPart0 = (j.Part0 == entry.characterPart)
+			if j:IsA("Motor6D") or j:IsA("Weld") then
+				if charIsPart0 then
+					info.connectionC0 = { j.C0:GetComponents() }
+					info.connectionC1 = { j.C1:GetComponents() }
+				else
+					info.connectionC0 = { j.C1:GetComponents() }
+					info.connectionC1 = { j.C0:GetComponents() }
+				end
+			elseif j:IsA("WeldConstraint") then
+				local relCF = entry.characterPart.CFrame:ToObjectSpace(entry.weaponPart.CFrame)
+				info.connectionC0 = { relCF:GetComponents() }
+				info.connectionC1 = { CFrame.new():GetComponents() }
+			end
+			attachmentByRoot[cloneRoot] = info
+			table.insert(weaponAttachments, info)
+		end
+	end
+
+	-- Build trees for connected components that have rig connections first.
+	for cloneRoot, attachment in pairs(attachmentByRoot) do
+		local tree = encodeWeaponPart(cloneRoot, nil, nil)
+		if tree then
+			self:reencodeJointMetadata(tree, weaponPartEncodeMap)
+			attachment.joints = tree
+		end
+	end
+
+	-- Encode any remaining disconnected components (no rig connection).
+	for _, part in ipairs(allCloneParts) do
+		if not visitedParts[part] then
+			local tree = encodeWeaponPart(part, nil, nil)
+			if tree then
+				self:reencodeJointMetadata(tree, weaponPartEncodeMap)
+				table.insert(weaponAttachments, {
+					rootPart = originalNameMap[part] or part.Name,
+					joints = tree,
+				})
+			end
+		end
+	end
+
+	-- Keep backward compatibility with older importers using top-level fields.
+	if #weaponAttachments > 0 then
+		gripData.weaponAttachments = weaponAttachments
+		local first = weaponAttachments[1]
+		if first.joints then
+			gripData.joints = first.joints
+		end
+		if first.suggestedBone then
+			gripData.suggestedBone = first.suggestedBone
+		end
+		if first.connectionC0 and first.connectionC1 then
+			gripData.connectionC0 = first.connectionC0
+			gripData.connectionC1 = first.connectionC1
+			gripData.connectionJointType = first.connectionJointType
+		end
 	end
 
 	-- Build metadata (mirrors generateMetadata output format)
@@ -918,8 +976,9 @@ function ExportManager:exportWeapon()
 	task.wait()
 
 	game.Selection:Set(State.metaParts)
-	print(("[ExportManager] Exporting weapon '%s' (%d parts, %s Motor6Ds)")
-		:format(gripData.weaponName, partCount, hasMotor6Ds and "with" or "no"))
+	local attachmentCount = if gripData.weaponAttachments then #gripData.weaponAttachments else 0
+	print(("[ExportManager] Exporting weapon '%s' (%d parts, %s Motor6Ds, %d attachment roots)")
+		:format(gripData.weaponName, partCount, hasMotor6Ds and "with" or "no", attachmentCount))
 	PluginManager():ExportSelection()
 end
 

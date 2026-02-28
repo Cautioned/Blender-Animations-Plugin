@@ -671,9 +671,14 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         # These are tracked separately from constrained_bones because the
         # constrained path has easing-thinning logic that would skip them.
         non_inheriting_bones: Set[str] = set()
+        worldspace_parent_map: Dict[str, str] = {}
         for bone in ao.pose.bones:
             if not bone.bone.use_inherit_rotation:
                 non_inheriting_bones.add(bone.name)
+            if bone.bone.get("worldspace_bone"):
+                original_parent = bone.bone.get("worldspace_original_parent", "")
+                if original_parent:
+                    worldspace_parent_map[bone.name] = original_parent
 
         animated_bones = set()
         all_actions = set()
@@ -730,9 +735,21 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
         # Pre-compile regex for performance
         bone_name_pattern = re.compile(r'pose\.bones\["(.+?)"\]')
+        FRAME_KEY_PRECISION = 4
+
+        def _norm_frame(v: float) -> float:
+            return round(float(v), FRAME_KEY_PRECISION)
         
-        # Define interpolation set once outside loop
-        curved_interpolations = {"BEZIER"}
+        # Interpolations with direct Roblox easing style mappings in this exporter.
+        # Any interpolation outside this set is treated as unsupported and
+        # will be densely baked between keys for fidelity.
+        roblox_mapped_interpolations = {
+            "LINEAR",
+            "CONSTANT",
+            "CUBIC",
+            "BOUNCE",
+            "ELASTIC",
+        }
 
         for fcurve in all_fcurves:
             # determine bone name for this fcurve (if any)
@@ -743,15 +760,16 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     bone_name_for_curve = m.group(1)
             # Use an indexed loop to check interpolation between keyframes
             for i, kp in enumerate(fcurve.keyframe_points):
-                frame = int(kp.co.x + 0.5)
+                frame = _norm_frame(kp.co.x)
                 if frame_start <= frame <= frame_end:
                     keyframe_times.add(frame)
 
                 # If a keyframe uses curved interpolation, we need to bake all the
                 # frames between it and the next keyframe to accurately capture the curve.
                 # only densify segments that actually curve (deviate from linear)
-                if kp.interpolation in curved_interpolations and i + 1 < len(
-                    fcurve.keyframe_points
+                if (
+                    kp.interpolation not in roblox_mapped_interpolations
+                    and i + 1 < len(fcurve.keyframe_points)
                 ):
                     next_kp = fcurve.keyframe_points[i + 1]
                     start_bezier_frame = int(kp.co.x + 0.5)
@@ -759,7 +777,8 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                     # only densify if the segment actually curves
                     if end_bezier_frame - start_bezier_frame > 1:
-                        # For BEZIER: always densify to ensure full fidelity
+                        # For unsupported interpolation styles: always densify
+                        # to preserve the curve shape.
                         keyframe_times.update(
                             range(start_bezier_frame + 1, end_bezier_frame)
                         )
@@ -773,7 +792,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
         # 4. Single Baking Pass
         collected = []
-        collected_frames: List[int] = []
+        collected_frames: List[float] = []
         # --- OPTIMIZATION: Avoid redundant set/list conversions. ---
         frame_start = ctx.scene.frame_start
         frame_end = ctx.scene.frame_end
@@ -785,25 +804,16 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
         # Map of {bone_name: {frame_index: (interpolation, easing)}} built from action fcurves
         per_bone_interpolation: Dict[
-            str, Dict[int, Tuple[Optional[str], Optional[str]]]
+            str, Dict[float, Tuple[Optional[str], Optional[str]]]
         ] = {}
         # Map of {bone_name: {frame_index}} for explicit keyframes only
-        per_bone_keyframes: Dict[str, Set[int]] = {}
-        # Track global keyframe interpolation per frame (including custom properties)
-        constant_keyframes: Set[int] = set()
-        non_constant_keyframes: Set[int] = set()
+        per_bone_keyframes: Dict[str, Set[float]] = {}
+        # Track per-bone interpolation classes by frame so constant fallbacks
+        # are local to that bone (not inherited from unrelated controller keys).
+        bone_constant_keyframes: Dict[str, Set[float]] = {}
+        bone_non_constant_keyframes: Dict[str, Set[float]] = {}
         if action:
             for fcurve in all_fcurves:
-                for keyframe_point in fcurve.keyframe_points:
-                    frame_idx = int(round(keyframe_point.co.x))
-                    if frame_idx < frame_start or frame_idx > frame_end:
-                        continue
-
-                    if keyframe_point.interpolation == "CONSTANT":
-                        constant_keyframes.add(frame_idx)
-                    else:
-                        non_constant_keyframes.add(frame_idx)
-
                 if not fcurve.data_path.startswith("pose.bones"):
                     continue
 
@@ -814,13 +824,21 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 bone_name_for_curve = match.group(1)
                 frame_map = per_bone_interpolation.setdefault(bone_name_for_curve, {})
                 keyframe_set = per_bone_keyframes.setdefault(bone_name_for_curve, set())
+                const_set = bone_constant_keyframes.setdefault(bone_name_for_curve, set())
+                nonconst_set = bone_non_constant_keyframes.setdefault(
+                    bone_name_for_curve, set()
+                )
 
                 for keyframe_point in fcurve.keyframe_points:
-                    frame_idx = int(round(keyframe_point.co.x))
+                    frame_idx = _norm_frame(keyframe_point.co.x)
                     
                     # Track keyframes within range for sparse emission
                     if frame_start <= frame_idx <= frame_end:
                         keyframe_set.add(frame_idx)
+                        if keyframe_point.interpolation == "CONSTANT":
+                            const_set.add(frame_idx)
+                        else:
+                            nonconst_set.add(frame_idx)
 
                     # But capture interpolation data even for keys just outside range
                     # so shifted keys still get correct easing
@@ -828,66 +846,79 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                         continue
 
                     existing = frame_map.get(frame_idx)
-                    # Prefer non-constant interpolation over constant when multiple curves share the same frame
-                    if (
-                        existing
-                        and existing[0] == "CONSTANT"
-                        and keyframe_point.interpolation != "CONSTANT"
-                    ):
+                    if existing is None:
                         frame_map[frame_idx] = (
                             keyframe_point.interpolation,
                             keyframe_point.easing,
                         )
-                    elif existing is None:
-                        frame_map[frame_idx] = (
-                            keyframe_point.interpolation,
-                            keyframe_point.easing,
-                        )
+                    else:
+                        # Roblox uses one easing style per pose/bone keyframe.
+                        # If channels disagree at the same frame, prefer CONSTANT
+                        # so intentional hold channels do not get softened.
+                        existing_interp, existing_easing = existing
+                        new_interp = keyframe_point.interpolation
+                        if existing_interp == "CONSTANT" or new_interp == "CONSTANT":
+                            if existing_interp != "CONSTANT":
+                                frame_map[frame_idx] = (new_interp, keyframe_point.easing)
 
-        # For constrained/driven bones, propagate CONSTANT interpolation across segments
-        # so constant holds can skip intermediate frames even when full-range baking.
-        if constrained_bones:
-            for fcurve in all_fcurves:
-                if not fcurve.data_path.startswith("pose.bones"):
+        # Propagate CONSTANT interpolation across segments so held channels stay
+        # constant between keys (important for unparented/world-space/controller rigs).
+        for fcurve in all_fcurves:
+            if not fcurve.data_path.startswith("pose.bones"):
+                continue
+
+            match = bone_name_pattern.search(fcurve.data_path)
+            if not match:
+                continue
+
+            bone_name_for_curve = match.group(1)
+            frame_map = per_bone_interpolation.setdefault(
+                bone_name_for_curve, {}
+            )
+
+            keypoints = list(fcurve.keyframe_points)
+            if len(keypoints) < 2:
+                continue
+
+            for i, kp in enumerate(keypoints[:-1]):
+                if kp.interpolation != "CONSTANT":
                     continue
 
-                match = bone_name_pattern.search(fcurve.data_path)
-                if not match:
+                start_frame = int(round(kp.co.x))
+                end_frame = int(round(keypoints[i + 1].co.x))
+                if end_frame <= start_frame + 1:
                     continue
 
-                bone_name_for_curve = match.group(1)
-                if bone_name_for_curve not in constrained_bones:
-                    continue
-
-                frame_map = per_bone_interpolation.setdefault(
-                    bone_name_for_curve, {}
-                )
-
-                keypoints = list(fcurve.keyframe_points)
-                if len(keypoints) < 2:
-                    continue
-
-                for i, kp in enumerate(keypoints[:-1]):
-                    if kp.interpolation != "CONSTANT":
-                        continue
-
-                    start_frame = int(round(kp.co.x))
-                    end_frame = int(round(keypoints[i + 1].co.x))
-                    if end_frame <= start_frame + 1:
-                        continue
-
-                    seg_start = max(start_frame + 1, frame_start)
-                    seg_end = min(end_frame, frame_end)
-                    for frame_idx in range(seg_start, seg_end):
-                        existing = frame_map.get(frame_idx)
-                        if existing is None or existing[0] == "CONSTANT":
-                            frame_map[frame_idx] = ("CONSTANT", kp.easing)
+                seg_start = max(start_frame + 1, frame_start)
+                seg_end = min(end_frame, frame_end)
+                for frame_idx in range(seg_start, seg_end):
+                    existing = frame_map.get(frame_idx)
+                    # CONSTANT should win ties because Roblox stores one easing
+                    # style per pose keyframe.
+                    if existing is None or existing[0] != "CONSTANT":
+                        frame_map[frame_idx] = ("CONSTANT", kp.easing)
 
         # Pre-compute constraint target easing data to avoid nested loops per frame
-        constraint_target_easing: Dict[str, Dict[int, Tuple[str, str]]] = {}
+        constraint_target_easing: Dict[str, Dict[float, Tuple[str, str]]] = {}
         for bone in ao.pose.bones:
             if bone.name in constrained_bones:
                 for constraint in bone.constraints:
+                    # Handle same-armature COPY constraints by inheriting easing
+                    # from the source bone's fcurves in the current action.
+                    if (
+                        constraint.type in {"COPY_TRANSFORMS", "COPY_LOCATION", "COPY_ROTATION", "COPY_SCALE"}
+                        and getattr(constraint, "target", None) == ao
+                        and getattr(constraint, "subtarget", None)
+                        and action
+                    ):
+                        source_bone = constraint.subtarget
+                        source_interp_map = per_bone_interpolation.get(source_bone)
+                        if source_interp_map:
+                            frame_map = constraint_target_easing.setdefault(bone.name, {})
+                            for frame_idx, interp_pair in source_interp_map.items():
+                                if frame_start <= frame_idx <= frame_end and frame_idx not in frame_map:
+                                    frame_map[frame_idx] = interp_pair
+
                     # Handle IK constraints where target is the same armature
                     if constraint.type == "IK" and constraint.chain_count > 0:
                         target_bones = [bone.name]
@@ -910,7 +941,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                                 if match and match.group(1) == subtarget:
                                     found_fcurves += 1
                                     for kp in fcurve.keyframe_points:
-                                        frame_idx = int(round(kp.co.x))
+                                        frame_idx = _norm_frame(kp.co.x)
                                         if frame_start <= frame_idx <= frame_end:
                                             for target_bone_name in target_bones:
                                                 frame_map = constraint_target_easing.setdefault(
@@ -942,7 +973,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                                 match = bone_name_pattern.search(fcurve.data_path)
                                 if match and match.group(1) == constraint.subtarget:
                                     for kp in fcurve.keyframe_points:
-                                        frame_idx = int(round(kp.co.x))
+                                        frame_idx = _norm_frame(kp.co.x)
                                         if frame_start <= frame_idx <= frame_end:
                                             for target_bone_name in target_bones:
                                                 frame_map = constraint_target_easing.setdefault(
@@ -954,14 +985,6 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                                                         kp.easing,
                                                     )
         
-        # Collect all IK target keyframes as a global easing reference for constrained bones
-        # This handles complex rigs where export bones are indirectly driven through parenting/constraints
-        global_ik_easing: Dict[int, Tuple[str, str]] = {}
-        for bone_frames in constraint_target_easing.values():
-            for frame_idx, easing_data in bone_frames.items():
-                if frame_idx not in global_ik_easing:
-                    global_ik_easing[frame_idx] = easing_data
-
         # Propagate constraint_target_easing through COPY constraints
         # If bone A copies from bone B, and B has easing info, A should inherit it
         copy_constraint_types = {"COPY_TRANSFORMS", "COPY_LOCATION", "COPY_ROTATION", "COPY_SCALE"}
@@ -991,17 +1014,39 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     constraint_target_easing[bone_name] = dict(constraint_target_easing[source_bone])
                     changed = True
         
-        # For constrained bones that still don't have easing info, apply global IK easing
-        # This handles bones driven indirectly through bone parenting rather than constraints
-        for bone_name in constrained_bones:
-            if bone_name not in constraint_target_easing and global_ik_easing:
-                constraint_target_easing[bone_name] = dict(global_ik_easing)
-
         def _uses_cyclic(fc):
             try:
                 return any(mod.type == "CYCLES" for mod in getattr(fc, "modifiers", []))
             except Exception:
                 return False
+
+        def _cyclic_curve_requires_dense(fc):
+            """Return True when cyclic curve should not use sparse export.
+
+            Policy:
+            - Roblox-supported interpolation styles stay sparse.
+            - Unsupported styles fall back to dense baking.
+            - Certain cycle modifier modes also force dense baking.
+            """
+            try:
+                for kp in getattr(fc, "keyframe_points", []):
+                    if kp.interpolation not in roblox_mapped_interpolations:
+                        return True
+
+                for mod in getattr(fc, "modifiers", []):
+                    if mod.type != "CYCLES":
+                        continue
+                    mode_before = getattr(mod, "mode_before", "REPEAT")
+                    mode_after = getattr(mod, "mode_after", "REPEAT")
+                    # Mirror/offset cycle modes are less reliable with sparse-only
+                    # replication.
+                    risky_modes = {"MIRROR", "REPEAT_OFFSET"}
+                    if mode_before in risky_modes or mode_after in risky_modes:
+                        return True
+            except Exception:
+                # If inspection fails, be conservative.
+                return True
+            return False
 
         fcurves_with_cycles = [fc for fc in all_fcurves if _uses_cyclic(fc)]
         cyclic_bones: Set[str] = set()
@@ -1013,8 +1058,16 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if match:
                     cyclic_bones.add(match.group(1))
 
+        # Prefer sparse replication for cyclic curves, but fall back to dense
+        # sampling for risky cyclic setups where sparse evaluation can drift.
+        force_cyclic_full_bake = any(
+            _cyclic_curve_requires_dense(fc) for fc in fcurves_with_cycles
+        )
+
         if has_constraints_local:
             all_frames_to_bake = list(range(frame_start, frame_end + 1))
+        elif force_cyclic_full_bake:
+            all_frames_to_bake = range(frame_start, frame_end + 1)
         elif fcurves_with_cycles:
             # For cyclic animations, replicate the base cycle sparsely across the range
             cycle_frames_all: Set[int] = set()
@@ -1147,13 +1200,22 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         else:
             all_frames_to_bake = sorted(keyframe_times)
 
-        # Final safety check: ensure all frames are within valid range
-        # Avoid intermediate list creation when using range
+        # Final safety check: ensure all frames are within valid range.
+        # Also preserve subframe key times to avoid collapsing tightly spaced keys.
         if isinstance(all_frames_to_bake, range):
-            # range is already bounded
-            pass
+            base_frames = [_norm_frame(f) for f in all_frames_to_bake]
         else:
-            all_frames_to_bake = [f for f in all_frames_to_bake if frame_start <= f <= frame_end]
+            base_frames = [_norm_frame(f) for f in all_frames_to_bake if frame_start <= f <= frame_end]
+
+        subframe_keys = [
+            _norm_frame(f)
+            for f in keyframe_times
+            if frame_start <= f <= frame_end and abs(float(f) - round(float(f))) > 1e-8
+        ]
+        if subframe_keys:
+            all_frames_to_bake = sorted(set(base_frames).union(subframe_keys))
+        else:
+            all_frames_to_bake = base_frames
 
         # debug: frame count chosen
         try:
@@ -1190,12 +1252,42 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
             return True
 
+        def _lookup_interp_for_frame(
+            interp_map: Optional[Dict[float, Tuple[Optional[str], Optional[str]]]],
+            frame: float,
+        ) -> Tuple[Optional[str], Optional[str]]:
+            if not interp_map:
+                return None, None
+            cached = interp_map.get(frame)
+            if cached:
+                return cached
+            most_recent_frame = None
+            for kf_frame in interp_map.keys():
+                if kf_frame < frame and (most_recent_frame is None or kf_frame > most_recent_frame):
+                    most_recent_frame = kf_frame
+            if most_recent_frame is not None:
+                return interp_map[most_recent_frame]
+            return None, None
+
+        def _frame_in_set(frames: Optional[Set[float]], frame: float, eps: float = 1e-5) -> bool:
+            if not frames:
+                return False
+            if frame in frames:
+                return True
+            for f in frames:
+                if abs(f - frame) <= eps:
+                    return True
+            return False
+
         # Set to first frame to ensure proper initialization
         # frame_set() automatically updates the depsgraph, so no need for explicit update
         ctx.scene.frame_set(frame_start)
 
+        keyframe_times_set = set(keyframe_times)
         for i, frame in enumerate(all_frames_to_bake):
-            ctx.scene.frame_set(frame)
+            frame_int = int(math.floor(frame))
+            frame_sub = float(frame - frame_int)
+            ctx.scene.frame_set(frame_int, subframe=frame_sub)
             # --- OPTIMIZATION: Pass the existing depsgraph instead of re-evaluating. ---
             ao_eval_for_frame = ao.evaluated_get(depsgraph)
 
@@ -1227,12 +1319,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 )
                 # For cyclic bones, we only care about frames where THIS bone has keyframes
                 bone_kfs = per_bone_keyframes.get(bone_name, set())
-                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and frame in bone_kfs
+                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and _frame_in_set(bone_kfs, frame)
                 # Cyclic bones should also be emitted at boundary frames
                 is_cyclic_boundary = bool(cyclic_bones) and bone_name in cyclic_bones and is_boundary_frame
                 if (
-                    (bone_keyframes and frame in bone_keyframes)
-                    or (constraint_keyframes and frame in constraint_keyframes)
+                    _frame_in_set(bone_keyframes, frame)
+                    or _frame_in_set(set(constraint_keyframes.keys()) if constraint_keyframes else None, frame)
                     or is_cyclic_key
                     or is_cyclic_boundary
                 ):
@@ -1257,13 +1349,14 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 is_constrained = bone_name in constrained_bones
                 is_non_inheriting = bone_name in non_inheriting_bones
                 is_animated = bone_name in animated_bones
+                is_cyclic_forced = force_cyclic_full_bake and bone_name in cyclic_bones
                 bone_keyframes = per_bone_keyframes.get(bone_name)
                 constraint_keyframes = constraint_target_easing.get(bone_name)
                 # For cyclic bones, only consider frames where THIS bone has keyframes
-                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and (bone_keyframes and frame in bone_keyframes)
+                is_cyclic_key = bool(cyclic_bones) and bone_name in cyclic_bones and _frame_in_set(bone_keyframes, frame)
                 is_sparse_key = (
-                    (bone_keyframes and frame in bone_keyframes)
-                    or (constraint_keyframes and frame in constraint_keyframes)
+                    _frame_in_set(bone_keyframes, frame)
+                    or _frame_in_set(set(constraint_keyframes.keys()) if constraint_keyframes else None, frame)
                     or is_cyclic_key
                 )
 
@@ -1279,6 +1372,8 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 if is_constrained:
                     should_bake = True
                 elif is_non_inheriting:
+                    should_bake = True
+                elif is_cyclic_forced:
                     should_bake = True
                 elif is_boundary_bake:
                     should_bake = True
@@ -1298,20 +1393,27 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 # Check exact frame first, then look for the most recent keyframe before this one
                 interpolation, easing = None, None
                 if bone_name in per_bone_interpolation:
-                    bone_interp_map = per_bone_interpolation[bone_name]
-                    cached = bone_interp_map.get(frame)
-                    if cached:
-                        interpolation, easing = cached
-                    else:
-                        # Find the most recent keyframe before this frame to get its interpolation
-                        # This handles shifted keys where we're between keyframes
-                        most_recent_frame = None
-                        for kf_frame in bone_interp_map.keys():
-                            if kf_frame < frame:
-                                if most_recent_frame is None or kf_frame > most_recent_frame:
-                                    most_recent_frame = kf_frame
-                        if most_recent_frame is not None:
-                            interpolation, easing = bone_interp_map[most_recent_frame]
+                    interpolation, easing = _lookup_interp_for_frame(
+                        per_bone_interpolation.get(bone_name),
+                        frame,
+                    )
+
+                # Non-inheriting/world-space bones often have no direct fcurves.
+                # In that case, borrow interpolation from their original parent
+                # (typically the master/controller bone) so Constant holds are
+                # preserved instead of defaulting to Linear smoothing.
+                if interpolation is None and is_non_inheriting:
+                    source_bone = worldspace_parent_map.get(bone_name)
+                    if source_bone:
+                        interpolation, easing = _lookup_interp_for_frame(
+                            per_bone_interpolation.get(source_bone),
+                            frame,
+                        )
+                        if interpolation is None and source_bone in constraint_target_easing:
+                            interpolation, easing = _lookup_interp_for_frame(
+                                constraint_target_easing.get(source_bone),
+                                frame,
+                            )
 
                 # Respect explicit keyframe interpolation when available. Fall back to Linear only when
                 # Blender does not provide interpolation data (e.g. constraint-only output).
@@ -1337,11 +1439,15 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
                 # If constrained bone has no interpolation but frame keys are all constant,
                 # treat as constant to avoid blending between rows of constant keys.
+                bone_const_frames = bone_constant_keyframes.get(bone_name, set())
+                bone_nonconst_frames = bone_non_constant_keyframes.get(
+                    bone_name, set()
+                )
                 if (
                     is_constrained
                     and interpolation is None
-                    and frame in constant_keyframes
-                    and frame not in non_constant_keyframes
+                    and frame in bone_const_frames
+                    and frame not in bone_nonconst_frames
                 ):
                     interpolation = "CONSTANT"
                     roblox_style, roblox_direction = ("Constant", "Out")
@@ -1353,7 +1459,6 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     and previous_state[1] == "Constant"
                     and interpolation is None
                     and not is_sparse_key
-                    and not is_non_inheriting
                 ):
                     cframe_data = previous_state[0]
                     roblox_style, roblox_direction = (
@@ -1402,7 +1507,6 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     previous_state is not None
                     and not is_sparse_key
                     and not is_constrained
-                    and not is_non_inheriting
                     and (interpolation == "CONSTANT" or roblox_style == "Constant")
                     and (not is_boundary_frame or is_cyclic_boundary)
                 ):
@@ -1417,16 +1521,16 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     and not is_sparse_key
                     and not is_boundary_frame
                     and not is_constrained
-                    and not is_non_inheriting
                 )
 
                 if is_constant_hold:
                     if previous_state is not None:
                         continue
 
-                # Skip unchanged states for non-constrained bones only
-                # Constrained bones must be included on every frame for accurate IK playback
-                # Cyclic boundary frames must always be emitted to anchor the end of the animation
+                # Skip unchanged states for unconstrained bones.
+                # We still evaluate cyclic bones every frame for correctness,
+                # but only emit frames where the sampled pose actually changes.
+                # Constrained bones must be included on every frame for accurate IK playback.
                 if not is_sparse_key and not is_boundary_frame and not is_constrained and not is_non_inheriting and not is_cyclic_boundary:
                     if previous_state and _bone_state_equivalent(
                         previous_state, candidate_state
@@ -1445,6 +1549,10 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     if held_bone in final_kf_state:
                         continue
                     if held_state[1] != "Constant":
+                        continue
+                    # Constrained/non-inheriting bones should not be force-held
+                    # by sparse carry-forward because they are evaluated explicitly.
+                    if held_bone in constrained_bones or held_bone in non_inheriting_bones:
                         continue
                     final_kf_state[held_bone] = [
                         list(held_state[0]),
@@ -1510,7 +1618,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             for i in range(1, len(collected) - 1):
                 kf_data = collected[i]
                 frame_idx = collected_frames[i]
-                is_explicit_key = frame_idx in keyframe_times
+                is_explicit_key = _frame_in_set(keyframe_times_set, frame_idx)
 
                 if is_explicit_key:
                     optimized_entries.append((kf_data, frame_idx))

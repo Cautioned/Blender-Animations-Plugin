@@ -8,6 +8,7 @@ from .import_ops import (
     OBJECT_OT_ImportModel,
     OBJECT_OT_ImportFbxAnimation,
     OBJECT_OT_ConfirmWeaponTarget,
+    OBJECT_OT_ApplyWeaponImport,
 )
 from .rig_ops import (
     OBJECT_OT_GenRig,
@@ -61,6 +62,7 @@ __all__ = [
     "OBJECT_OT_ImportModel",
     "OBJECT_OT_ImportFbxAnimation",
     "OBJECT_OT_ConfirmWeaponTarget",
+    "OBJECT_OT_ApplyWeaponImport",
     # Rig operators
     "OBJECT_OT_GenRig",
     "OBJECT_OT_GenIK",

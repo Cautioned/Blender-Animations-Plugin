@@ -61,7 +61,7 @@ def map_blender_to_roblox_easing(interpolation, easing):
     roblox_style = style_map.get(interpolation, None)
 
     # If the interpolation type from Blender isn't in our map, it's unsupported.
-    # In this case, we fall back to Linear and a default "Out" direction.
+    # Keep fallback linear; unsupported curves should be handled by bake paths.
     if roblox_style is None:
         return "Linear", "Out"
 
