@@ -34,6 +34,31 @@ function RigManager:isKeyframeSequence(object: any): boolean
 	return typeof(object) == "Instance" and object:IsA("KeyframeSequence")
 end
 
+function RigManager:_findPartBoneNameCollisions(rigModel: Model): { string }
+	local partNames: { [string]: boolean } = {}
+	local collisions: { string } = {}
+	local seen: { [string]: boolean } = {}
+
+	for _, descendant in ipairs(rigModel:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			partNames[descendant.Name] = true
+		end
+	end
+
+	for _, descendant in ipairs(rigModel:GetDescendants()) do
+		if descendant:IsA("Bone") then
+			local name = descendant.Name
+			if partNames[name] and not seen[name] then
+				seen[name] = true
+				table.insert(collisions, name)
+			end
+		end
+	end
+
+	table.sort(collisions)
+	return collisions
+end
+
 -- Extract warning checks to reduce function complexity
 function RigManager:addRigWarnings(rigModel: Types.RigModelType)
 	if rigModel.PrimaryPart and (rigModel.PrimaryPart :: BasePart).Name == "Head" then
@@ -344,11 +369,30 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 
 	State.lastKnownRigModel = rigModel
 
+	local nameCollisions = self:_findPartBoneNameCollisions(rigModel)
+	if #nameCollisions > 0 then
+		local previewCount = math.min(#nameCollisions, 8)
+		local preview = table.concat(nameCollisions, ", ", 1, previewCount)
+		local suffix = if #nameCollisions > previewCount then (", +" .. tostring(#nameCollisions - previewCount) .. " more") else ""
+		self:addWarning(
+			("Invalid rig: BasePart/Bone name collision detected. Rename duplicates and retry. Names: %s%s")
+				:format(preview, suffix)
+		)
+		State.activeRigModel = nil
+		State.activeAnimator = nil
+		State.activeRig = nil
+		State.rigModelName:set("No Rig Selected")
+		State.activeRigExists:set(false)
+		State.loadingEnabled:set(false)
+		return
+	end
+
 	if not rigModel.PrimaryPart then
 		self:addWarning("Rig has no PrimaryPart set.")
 		if rigModel:FindFirstChild("HumanoidRootPart") then
 			rigModel.PrimaryPart = rigModel:FindFirstChild("HumanoidRootPart") :: BasePart
 		else
+			State.loadingEnabled:set(false)
 			return
 		end
 	end
@@ -364,6 +408,7 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 		State.activeRig = nil
 		State.rigModelName:set("No Rig Selected")
 		State.activeRigExists:set(false)
+		State.loadingEnabled:set(false)
 		return
 	end
 

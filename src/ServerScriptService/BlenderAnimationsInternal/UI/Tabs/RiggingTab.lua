@@ -24,6 +24,28 @@ local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleS
 local StudioComponentsUtil = StudioComponents:FindFirstChild("Util")
 local themeProvider = require(StudioComponentsUtil.themeProvider)
 
+local studioLocale = game:GetService("StudioService").StudioLocaleId or "en-us"
+local localeLang = studioLocale:sub(1, 2):lower()
+
+local UPDATE_WARNING: { [string]: string } = {
+	en = "Please update to v2.4.0+ of the Blender addon if you are having issues with exports. The new export method is more robust but requires changes in the addon.",
+	es = "Actualiza a v2.4.0+ del addon de Blender si tienes problemas con las exportaciones. El nuevo método es más robusto pero requiere cambios en el addon. (esto está traducido porque sé que no vas a hacer caso jaja)",
+	pt = "Atualize para v2.4.0+ do addon do Blender se estiver com problemas nas exportações. O novo método é mais robusto, mas requer alterações no addon. (isso está traduzido porque eu sei que você não vai ouvir kk)",
+	fr = "Veuillez mettre à jour vers la v2.4.0+ de l'addon Blender si vous rencontrez des problèmes d'exportation. La nouvelle méthode est plus robuste mais nécessite des modifications de l'addon. (c'est traduit parce que je sais que vous n'écouterez pas mdr)",
+	de = "Bitte aktualisiere auf v2.4.0+ des Blender-Addons, wenn du Probleme beim Export hast. Die neue Methode ist robuster, erfordert aber Änderungen am Addon. (das ist übersetzt, weil ich weiß, dass ihr eh nicht zuhört lol)",
+	it = "Aggiorna l'addon di Blender alla v2.4.0+ se riscontri problemi con le esportazioni. Il nuovo metodo è più robusto ma richiede modifiche all'addon. (questo è tradotto perché so che non ascolterete lol)",
+	ja = "エクスポートに問題がある場合は、Blenderアドオンをv2.4.0以上に更新してください。新しいエクスポート方法はより堅牢ですが、アドオンの変更が必要です。（どうせ読まないと思って翻訳しました笑）",
+	ko = "내보내기에 문제가 있다면 Blender 애드온을 v2.4.0 이상으로 업데이트하세요. 새로운 방법이 더 견고하지만 애드온 변경이 필요합니다. (어차피 안 들을 거 알아서 번역했어요 ㅋㅋ)",
+	ar = "يرجى التحديث إلى الإصدار v2.4.0+ من إضافة Blender إذا كنت تواجه مشاكل في التصدير. الطريقة الجديدة أكثر متانة لكنها تتطلب تغييرات في الإضافة. (هذا مترجم لأني أعرف إنك مش هتسمع الكلام هه)",
+	ru = "Обновите аддон Blender до v2.4.0+, если у вас проблемы с экспортом. Новый метод надёжнее, но требует изменений в аддоне. (это переведено, потому что я знаю, что вы всё равно не послушаете лол)",
+	id = "Perbarui addon Blender ke v2.4.0+ jika ada masalah dengan ekspor. Metode baru lebih tangguh tetapi memerlukan perubahan pada addon. (ini diterjemahkan karena saya tahu kamu nggak bakal dengerin wkwk)",
+	ms = "Sila kemas kini addon Blender ke v2.4.0+ jika anda menghadapi masalah dengan eksport. Kaedah baru lebih teguh tetapi memerlukan perubahan pada addon. (ini diterjemahkan sebab saya tahu anda tak akan dengar haha)",
+	th = "กรุณาอัปเดต addon ของ Blender เป็น v2.4.0 ขึ้นไป หากมีปัญหากับการส่งออก วิธีใหม่แข็งแกร่งกว่าแต่ต้องเปลี่ยนแปลง addon (แปลให้เพราะรู้ว่าคุณไม่ฟังหรอก 555)",
+	tr = "Dışa aktarma sorunları yaşıyorsanız Blender eklentisini v2.4.0+ sürümüne güncelleyin. Yeni yöntem daha sağlam ama eklentide değişiklik gerektirir. (dinlemeyeceğinizi bildiğim için çevirdim lol)",
+	vi = "Vui lòng cập nhật addon Blender lên v2.4.0+ nếu bạn gặp vấn đề khi xuất. Phương pháp mới bền vững hơn nhưng cần thay đổi addon. (dịch ra vì biết bạn không chịu nghe đâu :v)",
+	pl = "Zaktualizuj addon Blendera do v2.4.0+, jeśli masz problemy z eksportem. Nowa metoda jest solidniejsza, ale wymaga zmian w addonie. (przetłumaczono, bo wiem że i tak nie posłuchacie lol)",
+}
+
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
 local ExportBoneToggles = require(script.Parent.Parent.Components.ExportBoneToggles)
 
@@ -386,6 +408,10 @@ function RiggingTab.create(services: any)
 						State.exportWelds:set(newValue)
 						return nil
 					end,
+				}) :: any,
+				Label({
+					Text = UPDATE_WARNING[localeLang] or UPDATE_WARNING.en,
+					TextWrapped = true,
 				}) :: any,
 				SharedComponents.AnimatedHintLabel({
 					Text = activeHint,

@@ -3,7 +3,7 @@ Constants and configuration for the Roblox Animations Blender Addon.
 """
 
 # Version number
-version = 2.40
+version = 2.41
 
 # Blender version (will be set when needed)
 blender_version = None

@@ -505,8 +505,12 @@ def get_object_by_name(name, scene=None):
     if scene is None:
         scene = getattr(bpy.context, "scene", None)
     if scene and hasattr(scene, "objects"):
-        return scene.objects.get(name)
-    return None
+        obj = scene.objects.get(name)
+        if obj is not None:
+            return obj
+    # Fallback to global datablocks so hidden/excluded objects are still
+    # resolvable by name (needed for export/import targeting).
+    return bpy.data.objects.get(name)
 
 
 def object_exists(name, scene=None):

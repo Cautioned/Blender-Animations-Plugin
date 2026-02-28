@@ -1043,7 +1043,7 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
     bl_idname = "object.rbxanims_confirm_weapon_target"
     bl_label = "Import Weapon"
     bl_description = "Confirm target rig for weapon import"
-    bl_options = {"REGISTER", "INTERNAL", "UNDO"}
+    bl_options = {"REGISTER", "INTERNAL"}
 
     target_rig: bpy.props.EnumProperty(
         name="Target Rig",
@@ -1081,43 +1081,70 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
         filtered = {k: v for k, v in constraint_map.items() if v[0] == source}
         return source, filtered
 
-    def _check_bone_match(self, context):
-        """Return (armature, suggested_bone, found_bone_name, source_armature | None).
-        Does case-insensitive lookup. If the bone isn't on the selected armature
-        but IS on a source armature (via copy constraints), returns source info."""
+    def _get_suggested_bones(self):
         data = _pending_weapon_import.get("data")
         if not data:
-            return None, "", None, None
+            return []
         meta = data["meta_loaded"]
-        suggested = meta.get("suggestedBone", "")
-        if not suggested:
-            return None, "", None, None
 
+        suggested = []
+        top = meta.get("suggestedBone", "")
+        if isinstance(top, str) and top:
+            suggested.append(top)
+
+        attachments = meta.get("weaponAttachments")
+        if isinstance(attachments, list):
+            for att in attachments:
+                if not isinstance(att, dict):
+                    continue
+                sb = att.get("suggestedBone", "")
+                if isinstance(sb, str) and sb:
+                    suggested.append(sb)
+
+        unique = []
+        seen = set()
+        for name in suggested:
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(name)
+        return unique
+
+    def _find_bone_case_insensitive(self, armature, suggested):
+        if not armature or armature.type != "ARMATURE" or not suggested:
+            return None
+        if suggested in armature.data.bones:
+            return suggested
+        suggested_lower = suggested.lower()
+        for b in armature.data.bones:
+            if b.name.lower() == suggested_lower:
+                return b.name
+        return None
+
+    def _check_bone_matches(self, context):
+        """Return (armature, matches) where matches is:
+        [{"suggested": str, "found": str|None, "source_arm": Object|None}]"""
+        suggested_bones = self._get_suggested_bones()
         armature = None
         if self.target_rig and self.target_rig != "NONE":
             armature = get_object_by_name(self.target_rig, context.scene)
         if not armature or armature.type != "ARMATURE":
-            return armature, suggested, None, None
+            return armature, [{"suggested": s, "found": None, "source_arm": None} for s in suggested_bones]
 
-        # exact match
-        if suggested in armature.data.bones:
-            return armature, suggested, suggested, None
-        # case-insensitive
-        for b in armature.data.bones:
-            if b.name.lower() == suggested.lower():
-                return armature, suggested, b.name, None
-
-        # bone not found — check if this is a proxy rig copying from a source
         source_arm, _ = self._find_source_armature(armature)
-        if source_arm:
-            # check source for the bone
-            if suggested in source_arm.data.bones:
-                return armature, suggested, suggested, source_arm
-            for b in source_arm.data.bones:
-                if b.name.lower() == suggested.lower():
-                    return armature, suggested, b.name, source_arm
-
-        return armature, suggested, None, None
+        matches = []
+        for suggested in suggested_bones:
+            found = self._find_bone_case_insensitive(armature, suggested)
+            if found:
+                matches.append({"suggested": suggested, "found": found, "source_arm": None})
+                continue
+            source_found = self._find_bone_case_insensitive(source_arm, suggested) if source_arm else None
+            if source_found:
+                matches.append({"suggested": suggested, "found": source_found, "source_arm": source_arm})
+            else:
+                matches.append({"suggested": suggested, "found": None, "source_arm": None})
+        return armature, matches
 
     def draw(self, context):
         layout = self.layout
@@ -1126,52 +1153,79 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
         layout.separator()
         layout.prop(self, "target_rig", icon="ARMATURE_DATA")
 
-        armature, suggested, found, source_arm = self._check_bone_match(context)
-        if suggested:
-            if armature and found and not source_arm:
-                row = layout.row()
-                row.label(text=f"Attaches to: {found}", icon="BONE_DATA")
-            elif armature and found and source_arm:
-                # proxy rig detected — bone found on the source armature
+        armature, matches = self._check_bone_matches(context)
+        if matches:
+            any_source = any(m["source_arm"] for m in matches)
+            if any_source:
+                src = next((m["source_arm"] for m in matches if m["source_arm"]), None)
                 box = layout.box()
                 col = box.column(align=True)
                 col.label(text="Proxy rig detected", icon="INFO")
-                col.label(text=f"Source rig: {source_arm.name}")
-                col.label(text=f"Attaches to: {found}", icon="BONE_DATA")
-                col.separator()
+                if src:
+                    col.label(text=f"Source rig: {src.name}")
                 col.label(text="Weapon bones will be created on the source rig")
                 col.label(text="with copy constraints mirrored to the proxy")
-            elif armature:
-                box = layout.box()
-                col = box.column(align=True)
-                col.alert = True
-                col.label(text=f"Bone \"{suggested}\" not found on this rig", icon="ERROR")
-                col.label(text="Choose a rig that has this bone")
-                # show available bones so the user can tell if they're close
+
+            box = layout.box()
+            col = box.column(align=True)
+            col.label(text=f"Suggested attachment bones ({len(matches)}):", icon="BONE_DATA")
+            for m in matches:
+                suggested = m["suggested"]
+                found = m["found"]
+                source_arm = m["source_arm"]
+                if found and not source_arm:
+                    col.label(text=f"{suggested} -> {found}", icon="CHECKMARK")
+                elif found and source_arm:
+                    col.label(text=f"{suggested} -> {found} (source rig)", icon="INFO")
+                else:
+                    row = col.row()
+                    row.alert = True
+                    row.label(text=f"{suggested} (missing)", icon="ERROR")
+
+            missing = [m for m in matches if not m["found"]]
+            if missing and armature:
+                col.separator()
+                warn = col.row()
+                warn.alert = True
+                warn.label(text="Some suggested bones were not found on this rig", icon="ERROR")
                 bone_names = [b.name for b in armature.data.bones]
                 if bone_names:
-                    col.separator()
-                    col.alert = False
                     preview = bone_names[:8]
+                    col.alert = False
                     col.label(text=f"Available bones ({len(bone_names)}):", icon="BONE_DATA")
                     for bn in preview:
-                        col.label(text=f"  • {bn}")
+                        col.label(text=f"  - {bn}")
                     if len(bone_names) > 8:
-                        col.label(text=f"  … and {len(bone_names) - 8} more")
+                        col.label(text=f"  ... and {len(bone_names) - 8} more")
 
     def execute(self, context):
-        data = _pending_weapon_import.get("data")
-        if data:
-            meta = data["meta_loaded"]
-            suggested = meta.get("suggestedBone", "")
-            if suggested:
-                armature, _, found, source_arm = self._check_bone_match(context)
-                if armature and not found:
-                    self.report({"ERROR"}, f"Bone \"{suggested}\" not found on \"{self.target_rig}\". Pick a different rig.")
-                    # put data back so the dialog can be re-invoked
-                    _pending_weapon_import["data"] = data
-                    bpy.ops.object.rbxanims_confirm_weapon_target("INVOKE_DEFAULT")
-                    return {"CANCELLED"}
+        armature, matches = self._check_bone_matches(context)
+        if armature and matches:
+            missing = [m["suggested"] for m in matches if not m["found"]]
+            if missing:
+                self.report(
+                    {"ERROR"},
+                    f"Missing suggested bone(s) on \"{self.target_rig}\": {', '.join(missing)}. Pick a different rig."
+                )
+                return {"CANCELLED"}
+
+        return bpy.ops.object.rbxanims_apply_weapon_import(target_rig=self.target_rig)
+
+class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
+    bl_idname = "object.rbxanims_apply_weapon_import"
+    bl_label = "Apply Weapon Import"
+    bl_description = "Apply the selected target rig for weapon import"
+    bl_options = {"REGISTER", "INTERNAL", "UNDO"}
+
+    target_rig: bpy.props.StringProperty(name="Target Rig", default="NONE")
+
+    def execute(self, context):
+        # Undo safety: normalize to object mode before any ID/collection edits.
+        try:
+            from ..rig.creation import _safe_mode_set
+            _safe_mode_set("OBJECT")
+        except Exception:
+            pass
 
         data = _pending_weapon_import.pop("data", None)
         if not data:
@@ -1193,7 +1247,7 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
         if actual_rig_name and actual_rig_name != "NONE":
             selected_arm = get_object_by_name(actual_rig_name, context.scene)
             if selected_arm and selected_arm.type == "ARMATURE":
-                source_arm, constraint_map = self._find_source_armature(selected_arm)
+                source_arm, constraint_map = OBJECT_OT_ConfirmWeaponTarget._find_source_armature(selected_arm)
                 if source_arm:
                     print(f"[WeaponImport] Proxy rig detected: {selected_arm.name} -> {source_arm.name} "
                           f"({len(constraint_map)} constrained bones)")
@@ -1224,7 +1278,7 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
             if result == {"FINISHED"} and proxy_armature:
                 source_arm_obj = get_object_by_name(actual_rig_name, context.scene)
                 if source_arm_obj:
-                    self._clone_weapon_bones_to_proxy(
+                    OBJECT_OT_ConfirmWeaponTarget._clone_weapon_bones_to_proxy(
                         context, source_arm_obj, proxy_armature, meta_loaded
                     )
         finally:
@@ -1243,19 +1297,29 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
         # find weapon bones on source (they were just created by _import_weapon)
         # weapon bones are parented under the suggested bone
         suggested = meta_loaded.get("suggestedBone", "")
+        suggested_bones = set()
+        if suggested:
+            suggested_bones.add(suggested.lower())
+        attachments = meta_loaded.get("weaponAttachments")
+        if isinstance(attachments, list):
+            for att in attachments:
+                if isinstance(att, dict):
+                    sb = att.get("suggestedBone")
+                    if isinstance(sb, str) and sb:
+                        suggested_bones.add(sb.lower())
         weapon_bones = []
         for bone in source_armature.data.bones:
             # weapon bones are typically named after the weapon parts
             # and are children (direct or indirect) of the suggested bone
             parent = bone.parent
             while parent:
-                if parent.name.lower() == suggested.lower():
+                if parent.name.lower() in suggested_bones:
                     weapon_bones.append(bone.name)
                     break
                 parent = parent.parent
 
         if not weapon_bones:
-            print(f"[WeaponImport] No weapon bones found under '{suggested}' to clone to proxy")
+            print(f"[WeaponImport] No weapon bones found under suggested roots {sorted(suggested_bones)} to clone to proxy")
             return
 
         print(f"[WeaponImport] Cloning {len(weapon_bones)} weapon bones to proxy '{proxy_armature.name}': {weapon_bones}")
@@ -1427,7 +1491,9 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
             mesh = obj.data if obj.type == "MESH" else None
             for coll in list(obj.users_collection):
                 coll.objects.unlink(obj)
-            bpy.data.objects.remove(obj, do_unlink=False)
+            # Use do_unlink=True to handle edge-cases where Blender still
+            # tracks a hidden user after manual collection unlinks.
+            bpy.data.objects.remove(obj, do_unlink=True)
             if mesh and mesh.users == 0:
                 orphan_meshes.append(mesh)
         for mesh in orphan_meshes:
@@ -1581,11 +1647,119 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
         parts_map = meta_loaded.get("parts", {})
         suggested_bone = meta_loaded.get("suggestedBone", "")
         joints_tree = meta_loaded.get("joints")  # present only for Motor6D weapons
+        weapon_attachments = meta_loaded.get("weaponAttachments")
 
         print(f"[WeaponImport] Starting import: weapon='{weapon_name}', "
               f"parts_map type={type(parts_map).__name__} len={len(parts_map) if parts_map else 0}, "
               f"has_joints={joints_tree is not None}, suggested_bone='{suggested_bone}'")
         print(f"[WeaponImport] Imported objects: {[o.name for o in rig_part_objs]}")
+
+        # New multi-piece weapon payload (v2.5+): split into independent
+        # single-root imports so each piece can attach to a different rig bone.
+        if (
+            not meta_loaded.get("_split_import_pass")
+            and isinstance(weapon_attachments, list)
+            and len(weapon_attachments) > 1
+        ):
+            print(f"[WeaponImport] Multi-attachment import: {len(weapon_attachments)} attachment roots")
+
+            # name -> idx map from partAux for p<idx>x object lookup
+            part_name_to_idx = {}
+            part_aux = meta_loaded.get("partAux")
+            if isinstance(part_aux, dict):
+                part_aux = list(part_aux.values())
+            if isinstance(part_aux, list):
+                for entry in part_aux:
+                    if isinstance(entry, dict):
+                        idx = entry.get("idx")
+                        name = entry.get("name")
+                        if isinstance(idx, str) and idx.isdigit():
+                            idx = int(idx)
+                        if isinstance(idx, int) and isinstance(name, str):
+                            part_name_to_idx[name] = idx
+                            part_name_to_idx[name.lower()] = idx
+
+            def _extract_import_part_index(obj_name: str):
+                """Extract export part index from importer-renamed object names.
+                Supports patterns like p12x, p12x.001, P12x1, P12x1.001."""
+                base = _strip_suffix(obj_name or "")
+                m = re.match(r"(?i)^p(\d+)x(?:\d+)?$", base)
+                if m:
+                    return int(m.group(1))
+                # very defensive fallback for odd importer variants
+                m = re.match(r"(?i)^p(\d+)x", base)
+                if m:
+                    return int(m.group(1))
+                return None
+
+            # parse imported object name -> idx
+            obj_by_idx = {}
+            for obj in rig_part_objs:
+                idx = _extract_import_part_index(obj.name)
+                if idx is not None:
+                    obj_by_idx[idx] = obj
+
+            def _collect_part_names(node, out):
+                if not isinstance(node, dict):
+                    return
+                pname = node.get("pname")
+                if isinstance(pname, str):
+                    out.add(pname)
+                jname = node.get("jname")
+                if isinstance(jname, str):
+                    out.add(jname)
+                for ch in node.get("children", []):
+                    _collect_part_names(ch, out)
+
+            imported_count = 0
+            for i, attachment in enumerate(weapon_attachments, start=1):
+                if not isinstance(attachment, dict):
+                    continue
+                att_joints = attachment.get("joints")
+                if not isinstance(att_joints, dict):
+                    continue
+
+                part_names = set()
+                _collect_part_names(att_joints, part_names)
+
+                subset_objs = []
+                for part_name in part_names:
+                    idx = part_name_to_idx.get(part_name)
+                    if idx is None and isinstance(part_name, str):
+                        idx = part_name_to_idx.get(part_name.lower())
+                    if idx is None:
+                        continue
+                    obj = obj_by_idx.get(idx)
+                    if obj:
+                        subset_objs.append(obj)
+
+                if not subset_objs:
+                    print(f"[WeaponImport] Attachment #{i} skipped: no matching imported objs")
+                    continue
+
+                sub_meta = dict(meta_loaded)
+                sub_meta["_split_import_pass"] = True
+                sub_meta["weaponAttachments"] = None
+                sub_meta["joints"] = att_joints
+                sub_meta["suggestedBone"] = attachment.get("suggestedBone", suggested_bone)
+                sub_meta["connectionC0"] = attachment.get("connectionC0")
+                sub_meta["connectionC1"] = attachment.get("connectionC1")
+                sub_meta["connectionJointType"] = attachment.get("connectionJointType")
+
+                # self may be a lightweight reporter proxy (no bound method),
+                # so recurse via the class method explicitly.
+                result = OBJECT_OT_ImportModel._import_weapon(
+                    self, context, sub_meta, subset_objs
+                )
+                if result == {"CANCELLED"}:
+                    return {"CANCELLED"}
+                if result == {"FINISHED"}:
+                    imported_count += 1
+
+            if imported_count > 0:
+                self.report({"INFO"}, f"Imported {imported_count} weapon attachment root(s).")
+                return {"FINISHED"}
+            return {"CANCELLED"}
 
         # ---- Early bone validation (before any scene mutations) ----
         # For Motor6D weapons we need the suggested bone to exist on the
@@ -1745,20 +1919,17 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
             context.view_layer.objects.active = armature
             armature.select_set(True)
             # unhide all bone collections so edit_bones can see hidden bones
-            self._bone_vis_ctx = _ensure_all_bone_collections_visible(armature)
-            self._bone_vis_ctx.__enter__()
-            entered = _safe_mode_set("EDIT", armature)
-            if not entered:
-                self._bone_vis_ctx.__exit__(None, None, None)
-                self.report({"ERROR"}, "Failed to enter edit mode on armature")
-                return {"CANCELLED"}
+            with _ensure_all_bone_collections_visible(armature):
+                entered = _safe_mode_set("EDIT", armature)
+                if not entered:
+                    self.report({"ERROR"}, "Failed to enter edit mode on armature")
+                    return {"CANCELLED"}
 
-            parent_edit_bone = armature.data.edit_bones.get(parent_bone_name)
-            if not parent_edit_bone:
-                _safe_mode_set("OBJECT", armature)
-                self._bone_vis_ctx.__exit__(None, None, None)
-                self.report({"ERROR"}, f"Bone '{parent_bone_name}' not found on armature in edit mode")
-                return {"CANCELLED"}
+                parent_edit_bone = armature.data.edit_bones.get(parent_bone_name)
+                if not parent_edit_bone:
+                    _safe_mode_set("OBJECT", armature)
+                    self.report({"ERROR"}, f"Bone '{parent_bone_name}' not found on armature in edit mode")
+                    return {"CANCELLED"}
 
             # ---- Weapon bone strategy ----
             # Use the SAME load_rigbone flow as normal rig import so that all
@@ -1924,12 +2095,10 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 import traceback
                 traceback.print_exc()
                 _safe_mode_set("OBJECT", armature)
-                self._bone_vis_ctx.__exit__(None, None, None)
                 self.report({"ERROR"}, f"Failed to build weapon bones: {e}")
                 return {"CANCELLED"}
 
             _safe_mode_set("OBJECT", armature)
-            self._bone_vis_ctx.__exit__(None, None, None)
 
             # Verify root bone was created
             if root_jname not in armature.data.bones:
@@ -2127,3 +2296,4 @@ class OBJECT_OT_ImportFbxAnimation(bpy.types.Operator, ImportHelper):
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
+

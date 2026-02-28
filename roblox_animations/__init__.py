@@ -14,62 +14,84 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 4, 0),
+    "version": (2, 4, 1),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
 
 
-# Define classes once - used for both registration and unregistration
-CLASSES = (
+def _resolve_operator_class(attr_name, fallback_module=None):
+    """Resolve an operator class from operators package with optional fallback module."""
+    cls = getattr(operators, attr_name, None)
+    if cls is not None:
+        return cls
+
+    if fallback_module:
+        try:
+            module = __import__(
+                f"{__package__}.operators.{fallback_module}",
+                fromlist=[attr_name],
+            )
+            return getattr(module, attr_name, None)
+        except Exception:
+            return None
+
+    return None
+
+
+_classes = [
     # Import operators
-    operators.OBJECT_OT_ConfirmWeaponTarget,  # must register before ImportModel uses it
-    operators.OBJECT_OT_ImportModel,
-    operators.OBJECT_OT_ImportFbxAnimation,
+    _resolve_operator_class(
+        "OBJECT_OT_ConfirmWeaponTarget", fallback_module="import_ops"
+    ),  # must register before ImportModel uses it
+    _resolve_operator_class("OBJECT_OT_ApplyWeaponImport", fallback_module="import_ops"),
+    _resolve_operator_class("OBJECT_OT_ImportModel", fallback_module="import_ops"),
+    _resolve_operator_class("OBJECT_OT_ImportFbxAnimation", fallback_module="import_ops"),
     # Rig operators
-    operators.OBJECT_OT_GenRig,
-    operators.OBJECT_OT_GenIK,
-    operators.OBJECT_OT_ModifyIK,
-    operators.OBJECT_OT_RemoveIK,
-    operators.OBJECT_OT_SetIKFK,
-    operators.OBJECT_OT_ToggleCOM,
-    operators.OBJECT_OT_ToggleCOMGrid,
-    operators.OBJECT_OT_EditCOMWeights,
-    operators.OBJECT_OT_ResetBoneWeight,
-    operators.OBJECT_OT_ApplyDefaultWeights,
-    operators.OBJECT_OT_ClearCOMWeights,
-    operators.OBJECT_OT_SetSelectedBoneWeight,
+    _resolve_operator_class("OBJECT_OT_GenRig"),
+    _resolve_operator_class("OBJECT_OT_GenIK"),
+    _resolve_operator_class("OBJECT_OT_ModifyIK"),
+    _resolve_operator_class("OBJECT_OT_RemoveIK"),
+    _resolve_operator_class("OBJECT_OT_SetIKFK"),
+    _resolve_operator_class("OBJECT_OT_ToggleCOM"),
+    _resolve_operator_class("OBJECT_OT_ToggleCOMGrid"),
+    _resolve_operator_class("OBJECT_OT_EditCOMWeights"),
+    _resolve_operator_class("OBJECT_OT_ResetBoneWeight"),
+    _resolve_operator_class("OBJECT_OT_ApplyDefaultWeights"),
+    _resolve_operator_class("OBJECT_OT_ClearCOMWeights"),
+    _resolve_operator_class("OBJECT_OT_SetSelectedBoneWeight"),
     # AutoPhysics operators
-    operators.OBJECT_OT_ToggleAutoPhysics,
-    operators.OBJECT_OT_AnalyzePhysics,
-    operators.OBJECT_OT_TogglePhysicsGhost,
-    operators.OBJECT_OT_ToggleRotationMomentum,
+    _resolve_operator_class("OBJECT_OT_ToggleAutoPhysics"),
+    _resolve_operator_class("OBJECT_OT_AnalyzePhysics"),
+    _resolve_operator_class("OBJECT_OT_TogglePhysicsGhost"),
+    _resolve_operator_class("OBJECT_OT_ToggleRotationMomentum"),
     # Weld bone visibility
-    operators.OBJECT_OT_ToggleWeldBones,
+    _resolve_operator_class("OBJECT_OT_ToggleWeldBones"),
     # World-space unparent
-    operators.OBJECT_OT_WorldSpaceUnparent,
-    operators.OBJECT_OT_WorldSpaceReparent,
+    _resolve_operator_class("OBJECT_OT_WorldSpaceUnparent"),
+    _resolve_operator_class("OBJECT_OT_WorldSpaceReparent"),
     # Animation operators
-    operators.OBJECT_OT_ApplyTransform,
-    operators.OBJECT_OT_MapKeyframes,
-    operators.OBJECT_OT_Bake,
-    operators.OBJECT_OT_Bake_File,
-    operators.OBJECT_OT_ValidateMotionPaths,
-    operators.OBJECT_OT_ClearMotionPathValidation,
-    operators.OBJECT_OT_RunTests,
+    _resolve_operator_class("OBJECT_OT_ApplyTransform"),
+    _resolve_operator_class("OBJECT_OT_MapKeyframes"),
+    _resolve_operator_class("OBJECT_OT_Bake"),
+    _resolve_operator_class("OBJECT_OT_Bake_File"),
+    _resolve_operator_class("OBJECT_OT_ValidateMotionPaths"),
+    _resolve_operator_class("OBJECT_OT_ClearMotionPathValidation"),
+    _resolve_operator_class("OBJECT_OT_RunTests"),
     # Constraint operators
-    operators.OBJECT_OT_AutoConstraint,
-    operators.OBJECT_OT_ManualConstraint,
+    _resolve_operator_class("OBJECT_OT_AutoConstraint"),
+    _resolve_operator_class("OBJECT_OT_ManualConstraint"),
     # Weapon/accessory operators
-    operators.OBJECT_OT_AttachMeshToBone,
-    operators.OBJECT_OT_ImportAndAttach,
+    _resolve_operator_class("OBJECT_OT_AttachMeshToBone"),
+    _resolve_operator_class("OBJECT_OT_ImportAndAttach"),
     # Server operators
-    operators.StartServerOperator,
-    operators.StopServerOperator,
+    _resolve_operator_class("StartServerOperator"),
+    _resolve_operator_class("StopServerOperator"),
     # UI panels
-    ui.OBJECT_PT_RbxAnimations,
-    ui.OBJECT_PT_RbxAnimations_Tool,
-)
+    getattr(ui, "OBJECT_PT_RbxAnimations", None),
+    getattr(ui, "OBJECT_PT_RbxAnimations_Tool", None),
+]
+CLASSES = tuple(cls for cls in _classes if cls is not None)
 
 
 def _safe_unregister_class(cls):
@@ -108,13 +130,15 @@ def _safe_register_class(cls):
 
 def file_import_extend(self, context):
     """Add import options to the file menu"""
-    self.layout.operator(
-        operators.OBJECT_OT_ImportModel.bl_idname, text="Roblox Rig (.obj)"
-    )
-    self.layout.operator(
-        operators.OBJECT_OT_ImportFbxAnimation.bl_idname,
-        text="Animation for Roblox Rig (.fbx)",
-    )
+    import_model_op = _resolve_operator_class("OBJECT_OT_ImportModel", fallback_module="import_ops")
+    import_anim_op = _resolve_operator_class("OBJECT_OT_ImportFbxAnimation", fallback_module="import_ops")
+    if import_model_op is not None:
+        self.layout.operator(import_model_op.bl_idname, text="Roblox Rig (.obj)")
+    if import_anim_op is not None:
+        self.layout.operator(
+            import_anim_op.bl_idname,
+            text="Animation for Roblox Rig (.fbx)",
+        )
 
 
 def register():
