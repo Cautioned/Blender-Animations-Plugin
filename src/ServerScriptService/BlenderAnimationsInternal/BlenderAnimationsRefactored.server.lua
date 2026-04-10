@@ -42,6 +42,7 @@ local StudioComponents = Components:FindFirstChild("StudioComponents")
 local ScrollFrame = require(StudioComponents.ScrollFrame)
 local Button = require(StudioComponents.Button)
 local Label = require(StudioComponents.Label)
+local Loading = require(StudioComponents.Loading)
 local TextInput = require(StudioComponents.TextInput)
 local VerticalCollapsibleSection = require(StudioComponents.VerticalCollapsibleSection)
 
@@ -139,6 +140,11 @@ local function cleanupAll()
 
 	-- 4. Reset state variables
 	State.loadingEnabled:set(false)
+	State.loadingTitle:set("Working")
+	State.loadingStatus:set("Please wait...")
+	State.loadingDetail:set("")
+	State.loadingProgress:set(0)
+	State.loadingCanEstimate:set(false)
 	State.rigModelName:set("No Rig Selected")
 	State.keyframeStats:set({ count = 0, totalDuration = 0 })
 	State.playhead:set(0)
@@ -164,6 +170,11 @@ local function cleanupRigSelection()
 
 	-- Reset state variables related to the rig
 	State.loadingEnabled:set(false)
+	State.loadingTitle:set("Working")
+	State.loadingStatus:set("Please wait...")
+	State.loadingDetail:set("")
+	State.loadingProgress:set(0)
+	State.loadingCanEstimate:set(false)
 	State.rigModelName:set("No Rig Selected")
 	State.keyframeStats:set({ count = 0, totalDuration = 0 })
 	State.playhead:set(0)
@@ -708,7 +719,15 @@ do -- Creates the plugin
 							_ToolsTab = tabFrames._ToolsTab,
 							_MoreTab = tabFrames._MoreTab,
 						},
-				}),
+					}),
+					Loading({
+						Enabled = State.loadingEnabled,
+						Title = State.loadingTitle,
+						Status = State.loadingStatus,
+						Detail = State.loadingDetail,
+						Progress = State.loadingProgress,
+						CanEstimate = State.loadingCanEstimate,
+					}),
 			},
 			}),
 		})

@@ -6,7 +6,6 @@ local State = require(script.Parent.Parent.state)
 local Types = require(script.Parent.Parent.types)
 
 local BaseXX = require(script.Parent.Parent.Components.BaseXX)
-local Plugin = plugin
 
 local ExportManager = {}
 ExportManager.__index = ExportManager
@@ -32,6 +31,7 @@ function ExportManager:reencodeJointMetadata(
 )
 	-- Initialize usedJointNames on first call (root node)
 	usedJointNames = usedJointNames or {}
+	local jointNames = usedJointNames :: { [string]: boolean }
 
 	-- round transform matrices (compresses data)
 	for _, transform in pairs({ "transform", "jointtransform0", "jointtransform1" }) do
@@ -61,15 +61,15 @@ function ExportManager:reencodeJointMetadata(
 	if originalJname and isWeld then
 		local uniqueJname = originalJname
 		local retryCount = 0
-		while usedJointNames[uniqueJname] do
+		while jointNames[uniqueJname] do
 			retryCount = retryCount + 1
 			uniqueJname = originalJname .. retryCount
 		end
-		usedJointNames[uniqueJname] = true
+		jointNames[uniqueJname] = true
 		rigNode.jname = uniqueJname
 	elseif originalJname then
 		-- Track Motor6D names too so welds don't collide with them
-		usedJointNames[originalJname] = true
+		jointNames[originalJname] = true
 	end
 
 	rigNode.pname = partEncodeMap[rigNode.inst]
@@ -87,7 +87,7 @@ function ExportManager:reencodeJointMetadata(
 	end
 end
 
-function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, originalMap: { [Instance]: Instance })
+function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, originalMap: { [Instance]: Instance }): any?
 	assert(State.activeRig)
 
 	local partNames = {}
@@ -161,6 +161,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 	end
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
+	print(string.format("[ExportManager] generateMetadata: exported %d parts", #partNames))
 
 	return {
 		rigName = State.activeRig.model.Name,
@@ -174,11 +175,11 @@ end
 function ExportManager:generateMetadataLegacy(
 	rigModelToExport: Types.RigModelType,
 	originalMap: { [Instance]: Instance }
-)
+): any?
 	assert(State.activeRig)
 
 	local partRoles: { [string]: string } = {} -- Maps original part names to their roles/identifiers
-	local partEncodeMap: { [BasePart]: string } = {} -- Maps original parts to their roles for encoding
+	local partEncodeMap: { [Instance]: string } = {} -- Maps original parts to their roles for encoding
 	local partAuxData = {}
 	local usedModelNames = {}
 	local partCount = 0
@@ -206,7 +207,7 @@ function ExportManager:generateMetadataLegacy(
 			if originalInst then
 				partEncodeMap[originalInst] = partRole
 			end
-			if desc ~= primaryClone then
+			if not primaryClone or desc ~= (primaryClone :: any) then
 				partRoles[desc.Name] = partRole
 			end
 
@@ -235,6 +236,7 @@ function ExportManager:generateMetadataLegacy(
 	end
 
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
+	print(string.format("[ExportManager] generateMetadataLegacy: exported %d parts", partCount))
 
 	-- print("[ExportManager] Exporting Legacy with Size/Volume Fingerprints (v1.3)")
 
@@ -258,6 +260,7 @@ function ExportManager:exportRig()
 		local currentCFrame = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
 		local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation());
 		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
+		task.wait()
 	end
 
 	local function buildArchivablePathMap(root: Instance)
@@ -704,8 +707,11 @@ function ExportManager:exportWeapon()
 
 	-- If the clone source IS the weapon root (bare part, no container),
 	-- the clone itself is the weapon root — no path map lookup needed.
+	-- Also register in the maps so connection lookup works for single-part weapons.
 	if cloneSource == weaponRoot and weaponClone:IsA("BasePart") then
 		cloneWeaponRoot = weaponClone :: BasePart
+		cloneToOriginal[weaponClone] = weaponRoot
+		originalMap[weaponClone] = weaponRoot
 	else
 		for clonePart, origPart in pairs(cloneToOriginal) do
 			if origPart == weaponRoot and clonePart:IsA("BasePart") then
@@ -993,6 +999,8 @@ function ExportManager:exportRigLegacy()
 		local currentCFrame = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
 		local newCFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation());
 		(State.activeRigModel.PrimaryPart :: BasePart).CFrame = newCFrame
+		-- Yield so physics propagates CFrame to welded descendants before cloning
+		task.wait()
 	end
 
 	local function buildArchivablePathMap(root: Instance)

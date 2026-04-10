@@ -6,6 +6,38 @@ Rig.__index = Rig
 
 local RigPart = require(script.Parent.RigPart)
 
+local LOAD_POSE_YIELD_INTERVAL = 500
+local LOAD_KEYFRAME_YIELD_INTERVAL = 25
+
+type ConnectedJoint = Motor6D | Weld | WeldConstraint
+type CacheableJoint = ConnectedJoint | AnimationConstraint
+
+local function getConnectedJointParts(joint: ConnectedJoint): (BasePart?, BasePart?)
+	return joint.Part0, joint.Part1
+end
+
+local function getJointParts(joint: CacheableJoint): (BasePart?, BasePart?)
+	if joint:IsA("AnimationConstraint") then
+		local attachment0 = joint.Attachment0
+		local attachment1 = joint.Attachment1
+		local part0 = attachment0 and attachment0.Parent
+		local part1 = attachment1 and attachment1.Parent
+		if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
+			return part0 :: BasePart, part1 :: BasePart
+		end
+		return nil, nil
+	end
+
+	local part0, part1 = getConnectedJointParts(joint)
+	if part0 and part0:IsA("BasePart") and part1 and part1:IsA("BasePart") then
+		return part0 :: BasePart, part1 :: BasePart
+	end
+
+	return nil, nil
+end
+
+type LoadProgressCallback = (progress: number, status: string?, detail: string?, canEstimate: boolean?) -> ()
+
 type self = {
 	model: Model,
 	root: RigPart.RigPart?,
@@ -17,7 +49,7 @@ type self = {
 	bonesByInstance: { [Instance]: RigPart.RigPart },
 	isDeformRig: boolean,
 	boneHierarchy: { [string]: string? },
-	_jointCache: { [Instance]: { Instance } }, -- Motor6D, Weld, or WeldConstraint
+	_jointCache: { [Instance]: { CacheableJoint } },
 	_duplicateBoneWarnings: { [string]: boolean }?,
 }
 
@@ -40,7 +72,7 @@ function Rig.new(model: Model)
 
 	-- Single traversal to gather all necessary descendants
 	local allBones = {}
-	local allJoints = {}
+	local allJoints: { CacheableJoint } = {}
 	for _, descendant in ipairs(model:GetDescendants()) do
 		if descendant:IsA("Bone") then
 			table.insert(allBones, descendant)
@@ -80,13 +112,11 @@ function Rig.new(model: Model)
 		end
 	end
 
-    -- Pre-build the joint cache for fast lookups, guarding duplicate Motor6D names under the same parent
+	-- Pre-build the joint cache for fast lookups based on actual connected parts.
 	self._jointCache = {}
-	local duplicateGuard: { [Instance]: { [string]: boolean } } = {}
 
-	local function addJointToCache(joint: Instance)
-		local p0 = (joint :: any).Part0
-		local p1 = (joint :: any).Part1
+	local function addJointToCache(joint: CacheableJoint)
+		local p0, p1 = getJointParts(joint)
 		if p0 then
 			self._jointCache[p0] = self._jointCache[p0] or {}
 			table.insert(self._jointCache[p0], joint)
@@ -98,28 +128,7 @@ function Rig.new(model: Model)
 	end
 
 	for _, joint in ipairs(allJoints) do
-		if joint:IsA("Motor6D") or joint:IsA("AnimationConstraint") then
-			local parentInst = joint.Parent
-			if parentInst then
-				local nameSet = duplicateGuard[parentInst]
-				if not nameSet then
-					nameSet = {}
-					duplicateGuard[parentInst] = nameSet
-				end
-				if nameSet[joint.Name] then
-					warn("duplicate Motor6D/AnimationConstraint name under same parent detected; ignoring subsequent joint:", parentInst:GetFullName(), joint.Name)
-					-- skip duplicate Motor6D/AnimationConstraint to avoid ambiguity
-				else
-					nameSet[joint.Name] = true
-					addJointToCache(joint)
-				end
-			else
-				addJointToCache(joint)
-			end
-		else
-			-- Welds and WeldConstraints are indexed without duplicate-name filtering
-			addJointToCache(joint)
-		end
+		addJointToCache(joint)
 	end
 
 	-- Check for cyclic motor6d dependencies before building hierarchy
@@ -398,7 +407,7 @@ function Rig:ClearPoses()
 	end
 end
 
-function Rig:LoadAnimation(data)
+function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	-- Validate animation data structure
 	if not data then
 		error("Animation data is nil")
@@ -417,10 +426,9 @@ function Rig:LoadAnimation(data)
 	end
 
 	self:ClearPoses()
-
-	local rigParts = self:GetRigParts()
 	
 	local isDeformRig = self.isDeformRig
+	local appliedPoseCount = 0
 
 	local exportInfo = data.export_info
 	local timeScale = 1
@@ -438,8 +446,26 @@ function Rig:LoadAnimation(data)
 
 	self.animTime = data.t * timeScale
 
-	-- Check if this is a deform rig animation
-	if data.is_deform_rig then
+	local totalPoseEntries = 0
+	for keyframeIndex, kfdef in pairs(data.kfs) do
+		if type(kfdef) == "table" and type((kfdef :: any).kf) == "table" then
+			for partName in pairs((kfdef :: any).kf) do
+				if type(partName) == "string" and string.sub(partName, -7) ~= "_deform" then
+					totalPoseEntries += 1
+				end
+			end
+		end
+		if keyframeIndex % 50 == 0 then
+			task.wait()
+		end
+	end
+	local processedPoseCount = 0
+	if progressCallback then
+		progressCallback(0, "Applying poses to rig", string.format("0/%d poses", totalPoseEntries), true)
+	end
+
+	-- Accept both canonical and legacy deform flags.
+	if data.is_deform_rig or data.is_deform_bone_rig then
 		self.isDeformRig = true
 		isDeformRig = true
 
@@ -491,11 +517,19 @@ function Rig:LoadAnimation(data)
 			continue
 		end
 
-		for _, rigPart in pairs(rigParts) do
-			local partName = rigPart.part.Name
-			local poseData = kfdef.kf[partName]
-			
-            if poseData then
+		for partName, poseData in pairs(kfdef.kf) do
+			if type(partName) ~= "string" then
+				continue
+			end
+
+			if string.sub(partName, -7) == "_deform" then
+				continue
+			end
+
+			processedPoseCount += 1
+
+			local rigPart = self:FindRigPart(partName)
+			if rigPart and poseData then
 				local cfc
 				local easingStyle = "Linear" -- Default
 				local easingDirection = "In" -- Default
@@ -569,12 +603,28 @@ function Rig:LoadAnimation(data)
 				end
 
 				rigPart:AddPose(kfTime, CFrame.new(unpack(cfc)), isDeformBone, easingStyle, easingDirection)
+				appliedPoseCount += 1
+				if appliedPoseCount % LOAD_POSE_YIELD_INTERVAL == 0 then
+					if progressCallback then
+						progressCallback(
+							processedPoseCount / math.max(totalPoseEntries, 1),
+							"Applying poses to rig",
+							string.format("%d/%d poses", processedPoseCount, totalPoseEntries),
+							true
+						)
+					end
+					task.wait()
+				end
 			end
 		end
 	end
+
+	if progressCallback then
+		progressCallback(1, "Applied poses to rig", string.format("%d/%d poses", processedPoseCount, totalPoseEntries), true)
+	end
 end
 
-function Rig:ToRobloxAnimation()
+function Rig:ToRobloxAnimation(progressCallback: LoadProgressCallback?)
 	if not self.root then
 		return nil
 	end
@@ -615,10 +665,21 @@ function Rig:ToRobloxAnimation()
 
 	local nextKfNameIdx = 1
 	local keyframeCount = 0
+	if progressCallback then
+		progressCallback(0, "Building preview keyframes", string.format("0/%d keyframes", #sortedTimes), true)
+	end
 
 	for _, t in ipairs(sortedTimes) do
 		keyframeCount = keyframeCount + 1
 		if keyframeCount % 100 == 0 then
+			if progressCallback then
+				progressCallback(
+					keyframeCount / math.max(#sortedTimes, 1),
+					"Building preview keyframes",
+					string.format("%d/%d keyframes", keyframeCount, #sortedTimes),
+					true
+				)
+			end
 			task.wait()
 		end
 
@@ -657,6 +718,15 @@ function Rig:ToRobloxAnimation()
 		local pose = self.root:PoseToRobloxAnimation(t)
 		if pose then
 			pose.Parent = kf
+		end
+
+		if progressCallback and (keyframeCount % LOAD_KEYFRAME_YIELD_INTERVAL == 0 or keyframeCount == #sortedTimes) then
+			progressCallback(
+				keyframeCount / math.max(#sortedTimes, 1),
+				"Building preview keyframes",
+				string.format("%d/%d keyframes", keyframeCount, #sortedTimes),
+				true
+			)
 		end
 	end
 

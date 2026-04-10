@@ -38,6 +38,311 @@ def _strip_suffix(name: str) -> str:
     return re.sub(r"\.\d+$", "", name or "")
 
 
+def _dict_get_any(data, keys):
+    """Get first present non-empty value for any key (case/underscore-insensitive)."""
+    if not isinstance(data, dict):
+        return None
+
+    for key in keys:
+        if key in data:
+            value = data.get(key)
+            if value not in (None, ""):
+                return value
+
+    normalized = {}
+    for k, v in data.items():
+        if not isinstance(k, str):
+            continue
+        nk = k.replace("_", "").lower()
+        if nk not in normalized:
+            normalized[nk] = v
+
+    for key in keys:
+        nk = key.replace("_", "").lower()
+        if nk in normalized:
+            value = normalized[nk]
+            if value not in (None, ""):
+                return value
+    return None
+
+
+def _coerce_cf12(value):
+    """Best-effort coercion to a 12-number CFrame array."""
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "to_list"):
+            value = value.to_list()
+        elif not isinstance(value, (list, tuple)):
+            value = list(value)
+    except Exception:
+        return None
+
+    if len(value) < 12:
+        return None
+    return [value[i] for i in range(12)]
+
+
+def _norm_name(value):
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[\s_]+", "", value).lower()
+
+
+def _iter_dicts_recursive(node, depth=0, max_depth=24):
+    """Yield (dict_node, depth) for nested dict/list payloads."""
+    if depth > max_depth:
+        return
+    if isinstance(node, dict):
+        yield node, depth
+        for child in node.values():
+            if isinstance(child, (dict, list, tuple)):
+                yield from _iter_dicts_recursive(child, depth + 1, max_depth)
+    elif isinstance(node, (list, tuple)):
+        for child in node:
+            if isinstance(child, (dict, list, tuple)):
+                yield from _iter_dicts_recursive(child, depth + 1, max_depth)
+
+
+def _extract_motor6d_connection(meta_loaded, weapon_root_name, preferred_parent_name=None):
+    """Find Motor6D-like connection data anywhere in metadata payload.
+
+    Returns dict with parent_name/connectionC0/connectionC1 when found.
+    """
+    if not isinstance(meta_loaded, dict):
+        return None
+
+    root_norm = _norm_name(weapon_root_name)
+    pref_norm = _norm_name(preferred_parent_name)
+    if not root_norm:
+        return None
+
+    part0_keys = ("part0", "Part0", "parentPart", "parent_part", "parent", "from")
+    part1_keys = ("part1", "Part1", "childPart", "child_part", "child", "to")
+
+    c0_keys = (
+        "connectionC0",
+        "connection_c0",
+        "C0",
+        "c0",
+        "jointtransform0",
+        "jointTransform0",
+    )
+    c1_keys = (
+        "connectionC1",
+        "connection_c1",
+        "C1",
+        "c1",
+        "jointtransform1",
+        "jointTransform1",
+    )
+
+    best = None
+
+    for node, depth in _iter_dicts_recursive(meta_loaded):
+        c0 = _coerce_cf12(_dict_get_any(node, c0_keys))
+        c1 = _coerce_cf12(_dict_get_any(node, c1_keys))
+        if not (c0 and c1):
+            continue
+
+        part0 = _dict_get_any(node, part0_keys)
+        part1 = _dict_get_any(node, part1_keys)
+        if not (isinstance(part0, str) and isinstance(part1, str)):
+            continue
+
+        p0 = _norm_name(part0)
+        p1 = _norm_name(part1)
+
+        reverse = False
+        score = 0
+
+        if p1 == root_norm:
+            score += 8
+        elif p0 == root_norm:
+            score += 6
+            reverse = True
+        else:
+            continue
+
+        parent_name = part0 if not reverse else part1
+        parent_norm = p0 if not reverse else p1
+        if pref_norm and parent_norm == pref_norm:
+            score += 4
+
+        jt = _dict_get_any(node, ("jointType", "joint_type", "type", "ClassName", "className"))
+        if isinstance(jt, str) and "motor6d" in jt.lower():
+            score += 1
+
+        # Prefer shallower nodes when score ties.
+        score -= depth * 0.01
+
+        if reverse:
+            # Swapped relation: root*C0 = parent*C1  -> parent*C1 = root*C0
+            use_c0, use_c1 = c1, c0
+        else:
+            use_c0, use_c1 = c0, c1
+
+        candidate = {
+            "parent_name": parent_name,
+            "connectionC0": use_c0,
+            "connectionC1": use_c1,
+            "jointType": jt or "Motor6D",
+            "score": score,
+            "depth": depth,
+        }
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    return best
+
+
+def _collect_weapon_suggested_bones(meta_loaded):
+    """Collect unique suggested attachment bones from weapon metadata."""
+    if not isinstance(meta_loaded, dict):
+        return []
+
+    suggested = []
+    top = _dict_get_any(
+        meta_loaded,
+        (
+            "suggestedBone",
+            "suggested_bone",
+            "attachmentBone",
+            "attachBone",
+            "parentBone",
+            "parent_bone",
+        ),
+    ) or ""
+    if isinstance(top, str) and top:
+        suggested.append(top)
+
+    attachments = meta_loaded.get("weaponAttachments")
+    if isinstance(attachments, list):
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            sb = _dict_get_any(
+                att,
+                (
+                    "suggestedBone",
+                    "suggested_bone",
+                    "attachmentBone",
+                    "attachBone",
+                    "parentBone",
+                    "parent_bone",
+                ),
+            ) or ""
+            if isinstance(sb, str) and sb:
+                suggested.append(sb)
+
+    unique = []
+    seen = set()
+    for name in suggested:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(name)
+    return unique
+
+
+def _find_bone_case_insensitive(armature, suggested):
+    """Return matched bone name from armature or None."""
+    if not armature or armature.type != "ARMATURE" or not suggested:
+        return None
+    if suggested in armature.data.bones:
+        return suggested
+    suggested_lower = suggested.lower()
+    for bone in armature.data.bones:
+        if bone.name.lower() == suggested_lower:
+            return bone.name
+    return None
+
+
+def _infer_weapon_parent_bone_from_transform(armature, joints_tree):
+    """Infer likely parent bone by nearest rest-transform position.
+
+    Uses Roblox transform props when available (preferred), falls back to
+    armature-space bone heads for older/partial rigs.
+    """
+    from mathutils import Matrix
+
+    if (
+        not armature
+        or armature.type != "ARMATURE"
+        or not isinstance(joints_tree, dict)
+        or not joints_tree.get("transform")
+    ):
+        return None, None
+
+    try:
+        t2b = get_transform_to_blender()
+        weapon_root_pos = (t2b @ cf_to_mat(joints_tree["transform"])).to_translation()
+    except Exception:
+        return None, None
+
+    best_name = None
+    best_dist = None
+
+    for bone in armature.data.bones:
+        bone_pos = None
+        tf_prop = bone.get("transform")
+        if tf_prop:
+            try:
+                bone_mat = Matrix([list(row) for row in tf_prop])
+                bone_pos = (t2b @ bone_mat).to_translation()
+            except Exception:
+                bone_pos = None
+
+        if bone_pos is None:
+            try:
+                bone_pos = armature.matrix_world @ bone.head_local
+            except Exception:
+                continue
+
+        dist = (weapon_root_pos - bone_pos).length
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_name = bone.name
+
+    return best_name, best_dist
+
+
+def _should_redirect_weapon_import(selected_armature, source_armature, meta_loaded):
+    """Decide whether to redirect weapon import from selected rig to source rig.
+    Redirect when the selected rig looks like a proxy/control rig, or when it
+    is missing suggested attach bones that exist on the detected source rig."""
+    if not selected_armature or not source_armature:
+        return False
+
+    # Prefer armatures that carry imported Roblox bone transforms.
+    # Proxy/control rigs typically do not have these custom props.
+    selected_has_transform = any(
+        "transform" in b for b in selected_armature.data.bones
+    )
+    source_has_transform = any(
+        "transform" in b for b in source_armature.data.bones
+    )
+    if source_has_transform and not selected_has_transform:
+        return True
+
+    suggested_bones = _collect_weapon_suggested_bones(meta_loaded)
+    if not suggested_bones:
+        return False
+
+    missing_on_selected = [
+        bone_name for bone_name in suggested_bones
+        if not _find_bone_case_insensitive(selected_armature, bone_name)
+    ]
+    if not missing_on_selected:
+        return False
+
+    return all(
+        _find_bone_case_insensitive(source_armature, bone_name)
+        for bone_name in missing_on_selected
+    )
+
+
 def _dims_to_ratios(sorted_dims):
     """Compute scale-invariant aspect ratios from sorted dimensions.
     
@@ -1085,42 +1390,10 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
         data = _pending_weapon_import.get("data")
         if not data:
             return []
-        meta = data["meta_loaded"]
-
-        suggested = []
-        top = meta.get("suggestedBone", "")
-        if isinstance(top, str) and top:
-            suggested.append(top)
-
-        attachments = meta.get("weaponAttachments")
-        if isinstance(attachments, list):
-            for att in attachments:
-                if not isinstance(att, dict):
-                    continue
-                sb = att.get("suggestedBone", "")
-                if isinstance(sb, str) and sb:
-                    suggested.append(sb)
-
-        unique = []
-        seen = set()
-        for name in suggested:
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(name)
-        return unique
+        return _collect_weapon_suggested_bones(data["meta_loaded"])
 
     def _find_bone_case_insensitive(self, armature, suggested):
-        if not armature or armature.type != "ARMATURE" or not suggested:
-            return None
-        if suggested in armature.data.bones:
-            return suggested
-        suggested_lower = suggested.lower()
-        for b in armature.data.bones:
-            if b.name.lower() == suggested_lower:
-                return b.name
-        return None
+        return _find_bone_case_insensitive(armature, suggested)
 
     def _check_bone_matches(self, context):
         """Return (armature, matches) where matches is:
@@ -1248,11 +1521,18 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
             selected_arm = get_object_by_name(actual_rig_name, context.scene)
             if selected_arm and selected_arm.type == "ARMATURE":
                 source_arm, constraint_map = OBJECT_OT_ConfirmWeaponTarget._find_source_armature(selected_arm)
-                if source_arm:
-                    print(f"[WeaponImport] Proxy rig detected: {selected_arm.name} -> {source_arm.name} "
-                          f"({len(constraint_map)} constrained bones)")
+                if source_arm and _should_redirect_weapon_import(selected_arm, source_arm, meta_loaded):
+                    print(
+                        f"[WeaponImport] Proxy rig redirect: {selected_arm.name} -> {source_arm.name} "
+                        f"({len(constraint_map)} constrained bones)"
+                    )
                     proxy_armature = selected_arm
                     actual_rig_name = source_arm.name
+                elif source_arm:
+                    print(
+                        f"[WeaponImport] Keeping selected rig '{selected_arm.name}' "
+                        "for import (suggested bones resolved on selected rig)"
+                    )
 
         # override the armature setting so _import_weapon picks it up
         settings = getattr(context.scene, "rbx_anim_settings", None)
@@ -1690,14 +1970,126 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
 
         weapon_name = meta_loaded.get("weaponName", "Weapon")
         parts_map = meta_loaded.get("parts", {})
-        suggested_bone = meta_loaded.get("suggestedBone", "")
-        joints_tree = meta_loaded.get("joints")  # present only for Motor6D weapons
+        suggested_bone = _dict_get_any(
+            meta_loaded,
+            (
+                "suggestedBone",
+                "suggested_bone",
+                "attachmentBone",
+                "attachBone",
+                "parentBone",
+                "parent_bone",
+            ),
+        ) or ""
+        joints_tree = _dict_get_any(meta_loaded, ("joints", "jointsTree", "jointTree"))
+        # present only for Motor6D weapons
         weapon_attachments = meta_loaded.get("weaponAttachments")
 
         print(f"[WeaponImport] Starting import: weapon='{weapon_name}', "
               f"parts_map type={type(parts_map).__name__} len={len(parts_map) if parts_map else 0}, "
               f"has_joints={joints_tree is not None}, suggested_bone='{suggested_bone}'")
         print(f"[WeaponImport] Imported objects: {[o.name for o in rig_part_objs]}")
+
+        # Single-attachment exports may place authoritative attach metadata under
+        # weaponAttachments[0] while top-level fields are empty. Normalize here
+        # so parent selection and relocation math use the same data path.
+        if (
+            not meta_loaded.get("_split_import_pass")
+            and isinstance(weapon_attachments, list)
+            and len(weapon_attachments) == 1
+            and isinstance(weapon_attachments[0], dict)
+        ):
+            attachment = weapon_attachments[0]
+
+            att_joints = _dict_get_any(attachment, ("joints", "jointsTree", "jointTree"))
+            if not isinstance(joints_tree, dict) and isinstance(att_joints, dict):
+                joints_tree = att_joints
+                meta_loaded["joints"] = joints_tree
+
+            if not suggested_bone:
+                suggested_bone = _dict_get_any(
+                    attachment,
+                    (
+                        "suggestedBone",
+                        "suggested_bone",
+                        "attachmentBone",
+                        "attachBone",
+                        "parentBone",
+                        "parent_bone",
+                    ),
+                ) or ""
+                if not suggested_bone and isinstance(joints_tree, dict):
+                    suggested_bone = _dict_get_any(
+                        joints_tree,
+                        (
+                            "parentBone",
+                            "parent_bone",
+                            "parentName",
+                            "parentPart",
+                            "parentPartName",
+                            "attachTo",
+                            "attachedTo",
+                        ),
+                    ) or ""
+                if suggested_bone:
+                    meta_loaded["suggestedBone"] = suggested_bone
+
+            conn_c0 = _coerce_cf12(
+                meta_loaded.get("connectionC0")
+                or _dict_get_any(meta_loaded, ("connection_c0", "c0", "C0"))
+                or _dict_get_any(attachment, ("connectionC0", "connection_c0", "c0", "C0"))
+                or _dict_get_any(joints_tree, ("connectionC0", "connection_c0", "c0", "C0", "jointtransform0", "jointTransform0"))
+            )
+            conn_c1 = _coerce_cf12(
+                meta_loaded.get("connectionC1")
+                or _dict_get_any(meta_loaded, ("connection_c1", "c1", "C1"))
+                or _dict_get_any(attachment, ("connectionC1", "connection_c1", "c1", "C1"))
+                or _dict_get_any(joints_tree, ("connectionC1", "connection_c1", "c1", "C1", "jointtransform1", "jointTransform1"))
+            )
+            if conn_c0 and not meta_loaded.get("connectionC0"):
+                meta_loaded["connectionC0"] = conn_c0
+            if conn_c1 and not meta_loaded.get("connectionC1"):
+                meta_loaded["connectionC1"] = conn_c1
+            if not meta_loaded.get("connectionJointType"):
+                joint_type = _dict_get_any(
+                    attachment,
+                    ("connectionJointType", "connection_joint_type", "jointType", "joint_type"),
+                ) or _dict_get_any(joints_tree, ("jointType", "joint_type"))
+                if joint_type:
+                    meta_loaded["connectionJointType"] = joint_type
+
+            print(
+                f"[WeaponImport] Normalized single attachment metadata: "
+                f"has_joints={joints_tree is not None}, suggested_bone='{suggested_bone}', "
+                f"has_connection={bool(meta_loaded.get('connectionC0') and meta_loaded.get('connectionC1'))}"
+            )
+
+        # Additional compatibility pass: some exporters store Motor6D data in
+        # nested arrays/tables not covered by the top-level/attachment schema.
+        if isinstance(joints_tree, dict):
+            root_lookup = joints_tree.get("pname") or joints_tree.get("jname") or weapon_name
+            if not isinstance(root_lookup, str):
+                root_lookup = weapon_name
+            extracted_conn = _extract_motor6d_connection(
+                meta_loaded,
+                root_lookup,
+                suggested_bone or None,
+            )
+            if extracted_conn:
+                if not suggested_bone and extracted_conn.get("parent_name"):
+                    suggested_bone = extracted_conn["parent_name"]
+                    meta_loaded["suggestedBone"] = suggested_bone
+                if not meta_loaded.get("connectionC0") and extracted_conn.get("connectionC0"):
+                    meta_loaded["connectionC0"] = extracted_conn["connectionC0"]
+                if not meta_loaded.get("connectionC1") and extracted_conn.get("connectionC1"):
+                    meta_loaded["connectionC1"] = extracted_conn["connectionC1"]
+                if not meta_loaded.get("connectionJointType") and extracted_conn.get("jointType"):
+                    meta_loaded["connectionJointType"] = extracted_conn["jointType"]
+                print(
+                    f"[WeaponImport] Extracted Motor6D connection from nested metadata: "
+                    f"parent='{meta_loaded.get('suggestedBone', suggested_bone)}', "
+                    f"score={extracted_conn['score']:.2f}, depth={extracted_conn['depth']}"
+                )
 
         # New multi-piece weapon payload (v2.5+): split into independent
         # single-root imports so each piece can attach to a different rig bone.
@@ -1786,10 +2178,29 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 sub_meta["_split_import_pass"] = True
                 sub_meta["weaponAttachments"] = None
                 sub_meta["joints"] = att_joints
-                sub_meta["suggestedBone"] = attachment.get("suggestedBone", suggested_bone)
-                sub_meta["connectionC0"] = attachment.get("connectionC0")
-                sub_meta["connectionC1"] = attachment.get("connectionC1")
-                sub_meta["connectionJointType"] = attachment.get("connectionJointType")
+                sub_meta["suggestedBone"] = _dict_get_any(
+                    attachment,
+                    (
+                        "suggestedBone",
+                        "suggested_bone",
+                        "attachmentBone",
+                        "attachBone",
+                        "parentBone",
+                        "parent_bone",
+                    ),
+                ) or suggested_bone
+                sub_meta["connectionC0"] = _coerce_cf12(
+                    _dict_get_any(attachment, ("connectionC0", "connection_c0", "c0", "C0"))
+                    or _dict_get_any(att_joints, ("connectionC0", "connection_c0", "c0", "C0", "jointtransform0", "jointTransform0"))
+                )
+                sub_meta["connectionC1"] = _coerce_cf12(
+                    _dict_get_any(attachment, ("connectionC1", "connection_c1", "c1", "C1"))
+                    or _dict_get_any(att_joints, ("connectionC1", "connection_c1", "c1", "C1", "jointtransform1", "jointTransform1"))
+                )
+                sub_meta["connectionJointType"] = _dict_get_any(
+                    attachment,
+                    ("connectionJointType", "connection_joint_type", "jointType", "joint_type"),
+                ) or _dict_get_any(att_joints, ("jointType", "joint_type"))
 
                 # self may be a lightweight reporter proxy (no bound method),
                 # so recurse via the class method explicitly.
@@ -1910,8 +2321,19 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                     parent_bone_name = None
 
             if not parent_bone_name:
-                # shouldn't reach here bc of early validation, but just in case
-                if armature.data.bones:
+                # Metadata from some exporter variants omits suggestedBone.
+                # Infer the best parent from transform proximity before any
+                # blind fallback to the first armature bone.
+                inferred_parent, inferred_dist = _infer_weapon_parent_bone_from_transform(
+                    armature, joints_tree
+                )
+                if inferred_parent:
+                    parent_bone_name = inferred_parent
+                    print(
+                        f"[WeaponImport] Inferred parent bone '{parent_bone_name}' "
+                        f"from weapon root transform (distance={inferred_dist:.4f})"
+                    )
+                elif armature.data.bones:
                     parent_bone_name = armature.data.bones[0].name
                     print(f"[WeaponImport] WARNING: falling back to "
                           f"'{parent_bone_name}' (unexpected)")
@@ -2041,18 +2463,74 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                     print("[WeaponImport] WARNING: no stored transform on "
                           "parent bone, using bone head")
 
-                conn_c0 = meta_loaded.get("connectionC0")
-                conn_c1 = meta_loaded.get("connectionC1")
+                conn_c0 = _coerce_cf12(
+                    meta_loaded.get("connectionC0")
+                    or _dict_get_any(meta_loaded, ("connection_c0", "c0", "C0"))
+                    or _dict_get_any(joints_tree, ("connectionC0", "connection_c0", "c0", "C0", "jointtransform0", "jointTransform0"))
+                )
+                conn_c1 = _coerce_cf12(
+                    meta_loaded.get("connectionC1")
+                    or _dict_get_any(meta_loaded, ("connection_c1", "c1", "C1"))
+                    or _dict_get_any(joints_tree, ("connectionC1", "connection_c1", "c1", "C1", "jointtransform1", "jointTransform1"))
+                )
+                inferred_conn = False
+                # When exporter metadata omits connectionC0/C1, derive a stable
+                # local joint from current parent/world transforms.
+                # Prefer a parent bone endpoint (head/tail) nearest the weapon
+                # root so the inferred pivot is at the limb/hand contact point,
+                # not the weapon center.
+                if not (conn_c0 and conn_c1):
+                    try:
+                        weapon_root_pos_bl = (t2b @ weapon_root_mat).to_translation()
+                        cand_head = parent_edit_bone.head.copy()
+                        cand_tail = parent_edit_bone.tail.copy()
+                        if (cand_tail - cand_head).length > 1e-5:
+                            if (weapon_root_pos_bl - cand_tail).length <= (weapon_root_pos_bl - cand_head).length:
+                                joint_anchor_bl = cand_tail
+                                anchor_name = "tail"
+                            else:
+                                joint_anchor_bl = cand_head
+                                anchor_name = "head"
+                        else:
+                            joint_anchor_bl = cand_head
+                            anchor_name = "head"
+
+                        joint_anchor_rb = (t2b.inverted() @ Matrix.Translation(joint_anchor_bl)).to_translation()
+                        joint_world_mat = weapon_root_mat.copy()
+                        joint_world_mat.translation = joint_anchor_rb
+
+                        inferred_c0_mat = parent_cf_mat.inverted() @ joint_world_mat
+                        inferred_c1_mat = weapon_root_mat.inverted() @ joint_world_mat
+                        conn_c0 = mat_to_cf(inferred_c0_mat)
+                        conn_c1 = mat_to_cf(inferred_c1_mat)
+                        if not meta_loaded.get("connectionC0"):
+                            meta_loaded["connectionC0"] = conn_c0
+                        if not meta_loaded.get("connectionC1"):
+                            meta_loaded["connectionC1"] = conn_c1
+                        if not meta_loaded.get("connectionJointType"):
+                            meta_loaded["connectionJointType"] = "Motor6D"
+                        inferred_conn = True
+                        print(
+                            f"[WeaponImport] Inferred joint anchor from parent bone {anchor_name} "
+                            f"for missing C0/C1"
+                        )
+                    except Exception:
+                        conn_c0 = None
+                        conn_c1 = None
+
+                equipped_cf = weapon_root_mat
                 if conn_c0 and conn_c1:
                     c0_mat = cf_to_mat(conn_c0)
                     c1_mat = cf_to_mat(conn_c1)
                     equipped_cf = parent_cf_mat @ c0_mat @ c1_mat.inverted()
-                    target_pos = (t2b @ equipped_cf).to_translation()
+                    if inferred_conn:
+                        print("[WeaponImport] Inferred missing C0/C1 from parent and weapon root transform")
                     print("[WeaponImport] Target = parent * C0 * C1^-1 "
                           "(equipped position)")
                 else:
-                    target_pos = (t2b @ parent_cf_mat).to_translation()
-                    print("[WeaponImport] No C0/C1 — target = parent center")
+                    print("[WeaponImport] No C0/C1 — keeping exported weapon root transform")
+
+                target_pos = (t2b @ equipped_cf).to_translation()
 
                 # Delta for BONE TRANSFORMS (CFrame-based, in roblox space)
                 delta_blender = target_pos - weapon_root_pos_blender

@@ -145,7 +145,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
             selected_obj = get_object_by_name(self.pr_rig_meta_name, context.scene)
             if selected_obj and "RigMeta" in selected_obj:
                 # Existing case: rig meta object
-                create_rig(self.pr_rigging_type, self.pr_rig_meta_name)
+                result = create_rig(self.pr_rigging_type, self.pr_rig_meta_name)
                 self.report({"INFO"}, f"Rig rebuilt from {self.pr_rig_meta_name}.")
             elif (
                 selected_obj
@@ -157,7 +157,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
             ):
                 # New case: armature with Motor6D properties
                 meta_obj_name = self.create_rig_meta_from_armature(selected_obj)
-                create_rig(self.pr_rigging_type, meta_obj_name)
+                result = create_rig(self.pr_rigging_type, meta_obj_name)
                 # Clean up temporary meta object
                 meta_obj = get_object_by_name(meta_obj_name, bpy.context.scene)
                 if meta_obj:

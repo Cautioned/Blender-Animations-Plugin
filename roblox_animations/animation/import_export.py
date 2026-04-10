@@ -6,6 +6,7 @@ import bpy
 from mathutils import Matrix
 from ..core.utils import (
     get_action_fcurves,
+    get_animation_data_action_slot,
     pose_bone_set_selected,
     get_object_by_name,
 )
@@ -230,7 +231,13 @@ def apply_ao_transform(ao):
             root.keyframe_insert(data_path="scale")
 
     # clear non-pose fcurves
-    fcurves = get_action_fcurves(ao.animation_data.action)
+    fcurves = get_action_fcurves(
+        ao.animation_data.action,
+        slot=get_animation_data_action_slot(
+            ao.animation_data,
+            action=ao.animation_data.action,
+        ),
+    )
     for c in [c for c in fcurves if not c.data_path.startswith("pose")]:
         fcurves.remove(c)
 

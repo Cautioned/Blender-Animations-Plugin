@@ -464,7 +464,6 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
 
         if found_obj:
             match_ctx["used"].add(found_obj)
-            # Queue constraint for later - can't apply in edit mode
             pending = match_ctx.setdefault("pending_constraints", [])
             pending.append((found_obj, bone.name))
             
@@ -697,12 +696,13 @@ def create_rig(rigging_type, rig_meta_obj_name):
     # Auto-constraint ONLY parts that were NOT authoritatively constrained
     # This handles any parts that weren't in the fingerprint map (legacy/fallback)
     bpy.context.view_layer.update()
-    ok, msg = auto_constraint_parts(ao.name, skip_objects=authoritatively_constrained)
+    skip_objects = set(authoritatively_constrained)
+    ok, msg = auto_constraint_parts(ao.name, skip_objects=skip_objects)
 
     # If no parts matched via fallback, retry once (but STILL skip authoritative ones)
     if ok and msg and "No matching parts found" in msg:
         # Capture the set in closure
-        _skip_set = authoritatively_constrained
+        _skip_set = skip_objects
         _ao_name = ao.name
         def _retry_auto_constraint():
             try:
@@ -718,3 +718,5 @@ def create_rig(rigging_type, rig_meta_obj_name):
     
     # Configure weld bones with custom display and lock them from animation
     _configure_weld_bones(ao)
+
+    return {}

@@ -403,7 +403,7 @@ function RiggingTab.create(services: any)
 				}) :: any,
 				Checkbox({
 					Value = State.exportWelds,
-					Text = "Export Welds (experimental)",
+					Text = "Export Welds (Recommended)",
 					OnChange = function(newValue: boolean): nil
 						State.exportWelds:set(newValue)
 						return nil

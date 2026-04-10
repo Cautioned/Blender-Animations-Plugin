@@ -17,6 +17,7 @@ from ..core.utils import (
     get_scene_fps,
     mat_to_cf,
     get_action_fcurves,
+    get_animation_data_action_slot,
     to_matrix,
     iter_scene_objects,
 )
@@ -530,6 +531,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     """Main serialization function that handles all animation export logic"""
     ctx = bpy.context
     desired_fps = get_scene_fps()
+    animation_data = getattr(ao, "animation_data", None)
 
     # Store the current frame to restore it later
     original_frame = ctx.scene.frame_current
@@ -565,10 +567,10 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     # Check if we should use a simple bake for NLA tracks.
     use_nla_bake = False
     nla_single_action = None
-    if ao.animation_data and ao.animation_data.use_nla:
+    if animation_data and animation_data.use_nla:
         active_strips = 0
         single_strip = None
-        for track in ao.animation_data.nla_tracks:
+        for track in animation_data.nla_tracks:
             if track.mute:
                 continue
             for strip in track.strips:
@@ -581,7 +583,13 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             if active_strips == 1 and single_strip and single_strip.action:
                 strip_action = single_strip.action
                 try:
-                    strip_fcurves = get_action_fcurves(strip_action)
+                    strip_fcurves = get_action_fcurves(
+                        strip_action,
+                        slot=get_animation_data_action_slot(
+                            animation_data,
+                            action=strip_action,
+                        ),
+                    )
                     has_bezier = any(
                         kp.interpolation == "BEZIER"
                         for fc in strip_fcurves
@@ -597,7 +605,11 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             else:
                 use_nla_bake = True
 
-    action = nla_single_action or (ao.animation_data.action if ao.animation_data else None)
+    action = nla_single_action or (animation_data.action if animation_data else None)
+    action_slot = get_animation_data_action_slot(animation_data, action=action)
+    action_slots = {}
+    if action is not None:
+        action_slots[action] = action_slot
 
     # consider constraints only if they actually affect bones (ik chains, copy, etc.)
     has_constraints = len(get_all_constrained_bones(ao)) > 0
@@ -685,7 +697,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
         if action:
             all_actions.add(action)
-            fcurves = get_action_fcurves(action)
+            fcurves = get_action_fcurves(action, slot=action_slot)
             for fcurve in fcurves:
                 if fcurve.data_path.startswith("pose.bones"):
                     match = re.search(r'pose\.bones\["(.+?)"\]', fcurve.data_path)
@@ -702,7 +714,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     and c.target.animation_data.action
                 ):
                     animated_bones.add(bone.name)
-                    all_actions.add(c.target.animation_data.action)
+                    target_action = c.target.animation_data.action
+                    all_actions.add(target_action)
+                    action_slots[target_action] = get_animation_data_action_slot(
+                        c.target.animation_data,
+                        action=target_action,
+                    )
 
         # decide hybrid vs sparse after we know which bones are actually constrained
         has_constraints_local = len(constrained_bones) > 0 or len(non_inheriting_bones) > 0
@@ -725,7 +742,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
 
         all_fcurves = []
         for act in all_actions:
-            fcurves = get_action_fcurves(act)
+            fcurves = get_action_fcurves(act, slot=action_slots.get(act))
             all_fcurves.extend(fcurves)
 
         # Track bezier segments per bone to force dense sampling later
@@ -962,7 +979,13 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                         and constraint.target.animation_data.action
                     ):
                         target_action = constraint.target.animation_data.action
-                        target_fcurves = get_action_fcurves(target_action)
+                        target_fcurves = get_action_fcurves(
+                            target_action,
+                            slot=get_animation_data_action_slot(
+                                constraint.target.animation_data,
+                                action=target_action,
+                            ),
+                        )
                         target_bones = [bone.name]
                         for fcurve in target_fcurves:
                             if (
