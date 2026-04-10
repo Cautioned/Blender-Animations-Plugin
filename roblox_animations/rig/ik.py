@@ -8,6 +8,8 @@ from typing import Optional, Tuple
 import bpy
 from mathutils import Vector, Matrix
 
+from ..core.utils import pose_bone_set_hidden
+
 
 def has_ik_constraint(ao: "bpy.types.Object", pose_bone: "bpy.types.PoseBone") -> bool:
     """Check if the given pose bone has an IK constraint applied to it.
@@ -242,7 +244,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                 if child_data_bone:
                     child_pose_bone = ao.pose.bones.get(child_bone.name)
                     if child_pose_bone:
-                        child_pose_bone.hide = False
+                        pose_bone_set_hidden(child_pose_bone, False)
     
     to_clear = []
     ik_target_names = []
@@ -646,7 +648,7 @@ def create_ik_config(
     if ik_stretch_name:
         stretch_pose_bone = ao.pose.bones.get(ik_stretch_name)
         if stretch_pose_bone:
-            stretch_pose_bone.hide = True
+            pose_bone_set_hidden(stretch_pose_bone, True)
 
     pose_bone = ao.pose.bones.get(ik_target_bone_name)
     if not pose_bone:
@@ -693,7 +695,7 @@ def create_ik_config(
             # Hide the controlled bone since the IK target now represents it
             controlled_pose_bone = ao.pose.bones.get(copy_rot_bone_name)
             if controlled_pose_bone:
-                controlled_pose_bone.hide = True
+                pose_bone_set_hidden(controlled_pose_bone, True)
 
     # Set up stretch drivers if requested (prevents knee/elbow popping)
     if enable_stretch and ik_stretch_name:

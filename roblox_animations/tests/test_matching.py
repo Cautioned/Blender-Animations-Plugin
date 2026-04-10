@@ -32,6 +32,10 @@ importlib.reload(constants)
 
 from ..operators.import_ops import (
     _strip_suffix,
+    _dict_get_any,
+    _coerce_cf12,
+    _extract_motor6d_connection,
+    _collect_weapon_suggested_bones,
     _dims_to_ratios,
     _hungarian_assign,
     _rename_parts_by_size_fingerprint,
@@ -242,6 +246,67 @@ class TestHungarianAssign(unittest.TestCase):
         result = _hungarian_assign(cost, 1, 3)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0], (0, 0))
+
+
+class TestWeaponMetadataHelpers(unittest.TestCase):
+    def test_dict_get_any_handles_aliases(self):
+        payload = {"suggested_bone": "RightHand"}
+        self.assertEqual(
+            _dict_get_any(payload, ("suggestedBone", "attachmentBone", "parentBone")),
+            "RightHand",
+        )
+
+    def test_coerce_cf12_accepts_longer_sequences(self):
+        value = tuple(range(16))
+        self.assertEqual(_coerce_cf12(value), list(range(12)))
+
+    def test_collect_weapon_suggested_bones_dedupes_aliases(self):
+        payload = {
+            "suggested_bone": "RightHand",
+            "weaponAttachments": [
+                {"attachmentBone": "RightHand"},
+                {"parentBone": "LeftHand"},
+            ],
+        }
+        self.assertEqual(_collect_weapon_suggested_bones(payload), ["RightHand", "LeftHand"])
+
+    def test_extract_motor6d_connection_from_nested_metadata(self):
+        payload = {
+            "weaponAttachments": [
+                {
+                    "jointType": "Motor6D",
+                    "parentPart": "RightHand",
+                    "childPart": "Handle",
+                    "jointTransform0": list(range(12)),
+                    "jointTransform1": list(range(12, 24)),
+                }
+            ]
+        }
+
+        result = _extract_motor6d_connection(payload, "Handle", preferred_parent_name="RightHand")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["parent_name"], "RightHand")
+        self.assertEqual(result["connectionC0"], list(range(12)))
+        self.assertEqual(result["connectionC1"], list(range(12, 24)))
+
+    def test_extract_motor6d_connection_swaps_reverse_links(self):
+        payload = {
+            "nested": {
+                "joint_type": "Motor6D",
+                "part0": "Handle",
+                "part1": "RightHand",
+                "c0": list(range(12)),
+                "c1": list(range(12, 24)),
+            }
+        }
+
+        result = _extract_motor6d_connection(payload, "Handle", preferred_parent_name="RightHand")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["parent_name"], "RightHand")
+        self.assertEqual(result["connectionC0"], list(range(12, 24)))
+        self.assertEqual(result["connectionC1"], list(range(12)))
 
 
 # ---------------------------------------------------------------------------

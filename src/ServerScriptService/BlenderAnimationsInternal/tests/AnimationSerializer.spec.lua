@@ -9,7 +9,44 @@ It's kinda sloppy, but it works. TDD is good for plugins.
 
 return function()
 	local AnimationSerializer = require(script.Parent.Parent.Components.AnimationSerializer)
-    local AnimationManager = require(script.Parent.Parent.Services.AnimationManager)
+	local DeflateLua = require(script.Parent.Parent.Components.DeflateLua)
+	local AnimationManager = require(script.Parent.Parent.Services.AnimationManager)
+
+	local function makeUncompressedZlib(payload: string): string
+		local chunks = { "\120\1" }
+		local offset = 1
+		local remaining = #payload
+		local checksum = 1
+
+		while remaining > 0 do
+			local blockLen = math.min(remaining, 65535)
+			local isLastBlock = remaining == blockLen
+			local nlen = 65535 - blockLen
+
+			chunks[#chunks + 1] = string.char(if isLastBlock then 1 else 0)
+			chunks[#chunks + 1] = string.char(blockLen % 256, math.floor(blockLen / 256))
+			chunks[#chunks + 1] = string.char(nlen % 256, math.floor(nlen / 256))
+
+			local block = string.sub(payload, offset, offset + blockLen - 1)
+			chunks[#chunks + 1] = block
+
+			for i = 1, #block do
+				checksum = DeflateLua.adler32(string.byte(block, i), checksum)
+			end
+
+			offset += blockLen
+			remaining -= blockLen
+		end
+
+		chunks[#chunks + 1] = string.char(
+			math.floor(checksum / 16777216) % 256,
+			math.floor(checksum / 65536) % 256,
+			math.floor(checksum / 256) % 256,
+			checksum % 256
+		)
+
+		return table.concat(chunks)
+	end
 
 	describe("AnimationSerializer", function()
 		local serializer
@@ -168,6 +205,7 @@ return function()
 				local result = serializer:serialize(kfs, rig)
 
 				expect(result).to.be.ok()
+				expect(result.is_deform_rig).to.be.ok()
 				expect(result.is_deform_bone_rig).to.be.ok()
 			end)
 
@@ -227,6 +265,19 @@ return function()
 				-- try raw json on binary path (should hit fallback)
 				pcall(function() serializer2:deserialize(json, true) end)
 				expect(true).to.equal(true)
+			end)
+
+			it("should deserialize large compressed payloads", function()
+				local serializer2 = AnimationSerializer.new()
+				local Http = game:GetService("HttpService")
+				local payload = string.rep("abcdef1234567890", 16000)
+				local json = Http:JSONEncode({ t = 0, kfs = {}, payload = payload })
+				local compressed = makeUncompressedZlib(json)
+
+				local result = serializer2:deserialize(compressed, true)
+
+				expect(result).to.be.ok()
+				expect(result.payload).to.equal(payload)
 			end)
 		end)
 	end)

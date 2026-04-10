@@ -14,9 +14,14 @@ local DeflateLua = require(Components.DeflateLua)
 local AnimationSerializer = {}
 AnimationSerializer.__index = AnimationSerializer
 
+local OUTPUT_CHUNK_SIZE = 4096
+local PROGRESS_UPDATE_INTERVAL = 4096
+local PROGRESS_YIELD_INTERVAL = 16384
+
 export type SerializedAnimation = {
 	t: number,
 	kfs: { { t: number, kf: { [string]: { components: { number }, easingStyle: string, easingDirection: string } } } },
+	is_deform_rig: boolean,
 	is_deform_bone_rig: boolean,
 }
 
@@ -30,6 +35,16 @@ type RigType = {
 	bones: { [string]: RigPart },
 	ToRobloxAnimation: (self: RigType) -> KeyframeSequence,
 }
+
+type DeserializeProgressCallback = (progress: number, status: string?, detail: string?, canEstimate: boolean?) -> ()
+
+local function formatDecodedSize(byteCount: number): string
+	local kilobytes = byteCount / 1024
+	if kilobytes >= 1024 then
+		return string.format("decoded %.2f mb", kilobytes / 1024)
+	end
+	return string.format("decoded %.1f kb", kilobytes)
+end
 
 type self = {}
 
@@ -114,6 +129,7 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 	local result: SerializedAnimation = {
 		t = maxTime,
 		kfs = collected,
+		is_deform_rig = isDeformRig,
 		is_deform_bone_rig = isDeformRig,
 	}
 
@@ -128,7 +144,11 @@ function AnimationSerializer:serializeFromRig(rig: RigType): SerializedAnimation
 	return self:serialize(keyframeSequence, rig)
 end
 
-function AnimationSerializer:deserialize(data: string, isBinary: boolean): any?
+function AnimationSerializer:deserialize(
+	data: string,
+	isBinary: boolean,
+	progressCallback: DeserializeProgressCallback?
+): any?
 	-- Cache HttpService to avoid repeated service lookups
 	local httpService = game:GetService("HttpService")
 	
@@ -142,22 +162,63 @@ function AnimationSerializer:deserialize(data: string, isBinary: boolean): any?
 		end
 	end
 
-	-- Pre-allocate buffer with better size estimation
-	local bufferSize = if isBinary then #data else math.floor(#data * 0.75)
-	local buffer = table.create(bufferSize)
-	if not buffer then
-		warn("Failed to create buffer")
-		return nil
+	local estimatedOutputSize = if isBinary then #data * 4 else math.floor(#data * 3)
+	local estimatedChunkCount = math.max(1, math.ceil(estimatedOutputSize / OUTPUT_CHUNK_SIZE))
+	local buffer = table.create(estimatedChunkCount)
+	local bufferIndex = 0
+	local chunk = table.create(OUTPUT_CHUNK_SIZE)
+	local chunkIndex = 0
+
+	local function flushChunk()
+		if chunkIndex == 0 then
+			return
+		end
+
+		bufferIndex += 1
+		buffer[bufferIndex] = table.concat(chunk, "", 1, chunkIndex)
+		table.clear(chunk)
+		chunkIndex = 0
 	end
-	local bufferIndex = 1
+
+	if progressCallback then
+		progressCallback(
+			0,
+			"Decoding animation data",
+			if isBinary then "reading compressed animation" else "reading encoded text animation",
+			true
+		)
+	end
 
 	-- Optimized byte collection function with yielding for large data
 	local byteCount = 0
+	local lastProgressByteCount = 0
+	local lastYieldByteCount = 0
 	local function collectByte(byte: number)
-		buffer[bufferIndex] = string.char(byte)
-		bufferIndex += 1
+		chunkIndex += 1
+		chunk[chunkIndex] = string.char(byte)
 		byteCount += 1
-		if byteCount % 10000 == 0 then
+		if chunkIndex >= OUTPUT_CHUNK_SIZE then
+			flushChunk()
+		end
+		if progressCallback and byteCount - lastProgressByteCount >= PROGRESS_UPDATE_INTERVAL then
+			lastProgressByteCount = byteCount
+			progressCallback(
+				math.min(byteCount / math.max(estimatedOutputSize, 1), 0.92),
+				"Decompressing animation",
+				formatDecodedSize(byteCount),
+				true
+			)
+		end
+		if byteCount - lastYieldByteCount >= PROGRESS_YIELD_INTERVAL then
+			lastYieldByteCount = byteCount
+			if progressCallback then
+				progressCallback(
+					math.min(byteCount / math.max(estimatedOutputSize, 1), 0.92),
+					"Decompressing animation",
+					formatDecodedSize(byteCount),
+					true
+				)
+			end
 			task.wait()
 		end
 	end
@@ -213,15 +274,21 @@ function AnimationSerializer:deserialize(data: string, isBinary: boolean): any?
         return nil
 	end
 
+	flushChunk()
+	if progressCallback then
+		progressCallback(0.96, "Parsing animation JSON", "finalizing animation payload", false)
+	end
+
 	-- Use table.concat with explicit length for better performance
 	-- Yield before concat if buffer is large
-	if bufferIndex > 100000 then
+	if bufferIndex > 1000 then
 		task.wait()
 	end
-	local jsonStr = table.concat(buffer, "", 1, bufferIndex - 1)
+	local jsonStr = table.concat(buffer, "", 1, bufferIndex)
 
 	-- Clear buffer to help GC
 	table.clear(buffer)
+	table.clear(chunk)
 
     -- Parse the JSON
     local jsonSuccess, jsonResult = pcall(function()
@@ -232,6 +299,19 @@ function AnimationSerializer:deserialize(data: string, isBinary: boolean): any?
         warn("JSON parsing failed: " .. tostring(jsonResult))
         return nil
     end
+
+	if progressCallback then
+		local keyframeCount = 0
+		if type(jsonResult) == "table" and type((jsonResult :: any).kfs) == "table" then
+			keyframeCount = #((jsonResult :: any).kfs)
+		end
+		progressCallback(
+			1,
+			"Decoded animation",
+			if keyframeCount > 0 then string.format("%d keyframes decoded", keyframeCount) else "decoded animation payload",
+			true
+		)
+	end
 
     return jsonResult
 end

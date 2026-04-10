@@ -48,6 +48,47 @@ type KeyframePair = { time: number, keyframe: Keyframe }
 type KeyframeTimePairs = { [number]: KeyframePair }
 type CurveKey = { Time: number, Value: number }
 type MarkerPair = { name: string, value: string }
+type LoadingProgressContext = {
+	set: (self: LoadingProgressContext, progress: number, status: string?, detail: string?, canEstimate: boolean?) -> (),
+	child: (self: LoadingProgressContext, startProgress: number, endProgress: number) -> LoadingProgressContext,
+}
+type LoadOptions = {
+	progress: LoadingProgressContext?,
+	title: string?,
+	detail: string?,
+	suppressErrors: boolean?,
+}
+
+local function clamp01(value: number): number
+	return math.max(0, math.min(1, value))
+end
+
+local function createLoadingProgressContext(manager: any, startProgress: number, endProgress: number): LoadingProgressContext
+	local contextStart = startProgress
+	local contextEnd = endProgress
+	local context = {}
+
+	function context:set(progress: number, status: string?, detail: string?, canEstimate: boolean?)
+		local alpha = clamp01(progress)
+		manager:_setLoadingProgress(
+			contextStart + (contextEnd - contextStart) * alpha,
+			status,
+			detail,
+			canEstimate
+		)
+	end
+
+	function context:child(childStart: number, childEnd: number): LoadingProgressContext
+		local range = contextEnd - contextStart
+		return createLoadingProgressContext(
+			manager,
+			contextStart + range * clamp01(childStart),
+			contextStart + range * clamp01(childEnd)
+		)
+	end
+
+	return context :: any
+end
 
 local function ensureChannelSample(poseMap: PoseMap, poseName: string, keyTime: number): ChannelSample
 	poseMap[poseName] = poseMap[poseName] or {}
@@ -419,52 +460,186 @@ function AnimationManager.new(playbackService: any, pluginObj: Plugin?)
 	return self
 end
 
+function AnimationManager:_beginLoadingSession(title: string, status: string?, detail: string?)
+	State.loadingEnabled:set(true)
+	State.loadingTitle:set(title)
+	State.loadingStatus:set(status or "Please wait...")
+	State.loadingDetail:set(detail or "")
+	State.loadingProgress:set(0)
+	State.loadingCanEstimate:set(false)
+end
+
+function AnimationManager:_setLoadingProgress(progress: number, status: string?, detail: string?, canEstimate: boolean?)
+	State.loadingEnabled:set(true)
+	State.loadingProgress:set(clamp01(progress))
+	if status ~= nil then
+		State.loadingStatus:set(status)
+	end
+	if detail ~= nil then
+		State.loadingDetail:set(detail)
+	end
+	if canEstimate ~= nil then
+		State.loadingCanEstimate:set(canEstimate)
+	end
+end
+
+function AnimationManager:_endLoadingSession()
+	State.loadingEnabled:set(false)
+	State.loadingTitle:set("Working")
+	State.loadingStatus:set("Please wait...")
+	State.loadingDetail:set("")
+	State.loadingProgress:set(0)
+	State.loadingCanEstimate:set(false)
+end
+
+function AnimationManager:_getLoadingContext(options: LoadOptions?, defaultTitle: string, defaultStatus: string): (LoadingProgressContext, boolean)
+	if options and options.progress then
+		return options.progress, false
+	end
+
+	self:_beginLoadingSession(defaultTitle, defaultStatus, if options then options.detail else "")
+	return createLoadingProgressContext(self, 0, 1), true
+end
+
 function AnimationManager:displayDetailedError(title, message)
 	warn(title, message)
 end
 
-function AnimationManager:loadAnim(data: string, isBinary: boolean)
-	local animData = self.animationSerializerService:deserialize(data, isBinary)
+function AnimationManager:loadAnim(data: string, isBinary: boolean, progressContext: LoadingProgressContext?)
+	local decodeProgress = if progressContext then progressContext:child(0, 0.985) else nil
+	local applyProgress = if progressContext then progressContext:child(0.985, 1) else nil
+	local animData = self.animationSerializerService:deserialize(
+		data,
+		isBinary,
+		if decodeProgress
+			then function(progress: number, status: string?, detail: string?, canEstimate: boolean?)
+				decodeProgress:set(progress, status, detail, canEstimate)
+			end
+			else nil
+	)
 
 	if not animData then
 		error("Failed to deserialize animation data.")
 	end
 
+	if progressContext then
+		progressContext:set(
+			0.985,
+			"Applying animation to rig",
+			string.format("%d keyframes", if type(animData.kfs) == "table" then #animData.kfs else 0),
+			true
+		)
+	end
+
+	if type(animData.kfs) == "table" and #animData.kfs >= 200 then
+		task.wait()
+	end
+
 	-- Load the animation
 	local _loadSuccess, loadError = pcall(function()
 		assert(State.activeRig, "activeRig is nil")
-		State.activeRig:LoadAnimation(animData)
+		local activeRig = State.activeRig :: any
+		activeRig:LoadAnimation(
+			animData,
+			if applyProgress
+				then function(progress: number, status: string?, detail: string?, canEstimate: boolean?)
+					applyProgress:set(progress, status, detail, canEstimate)
+				end
+				else nil
+		)
 		return true
 	end)
 
 	if not _loadSuccess then
 		error("Animation loading failed: " .. tostring(loadError))
 	end
+
+	if progressContext then
+		progressContext:set(1, "Animation data applied", "building preview animation", true)
+	end
+
+	return animData
 end
 
-function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean)
-	local ok = pcall(self.loadAnim, self, text, isBinary)
+function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean, options: LoadOptions?)
+	local progressContext, ownsSession = self:_getLoadingContext(options, "Importing Animation", if isBinary then "Reading binary animation" else "Reading text animation")
+	local suppressErrors = if options then options.suppressErrors == true else false
+	progressContext:set(0, if isBinary then "Reading binary animation" else "Reading text animation", if options then options.detail else "", false)
+
+	local ok, result = pcall(self.loadAnim, self, text, isBinary, progressContext:child(0, 0.95))
 	if ok then
-		local success, result = pcall(self.loadRig, self)
+		local success, rigResult = pcall(self.loadRig, self, nil, progressContext:child(0.95, 1))
 		if success then
+			progressContext:set(
+				1,
+				"Animation loaded",
+				string.format("%d keyframes ready", if type((result :: any).kfs) == "table" then #((result :: any).kfs) else 0),
+				true
+			)
 			print("Animation loaded successfully.")
+			if ownsSession then
+				task.wait()
+				self:_endLoadingSession()
+			end
 			return true
 		else
-			self:displayDetailedError("Error during rig loading", tostring(result))
+			if not suppressErrors then
+				self:displayDetailedError("Error during rig loading", tostring(rigResult))
+			end
+			if ownsSession then
+				self:_endLoadingSession()
+			end
 			return false
 		end
 	else
-		self:displayDetailedError("Error during animation data loading", "Unknown error")
+		if not suppressErrors then
+			self:displayDetailedError("Error during animation data loading", tostring(result))
+		end
+		if ownsSession then
+			self:_endLoadingSession()
+		end
 		return false
 	end
 end
 
 -- Legacy-friendly loader: try binary first, then base64 text fallback.
-function AnimationManager:loadAnimDataAuto(text: string)
-    if self:loadAnimDataFromText(text, true) then
-        return true
-    end
-    return self:loadAnimDataFromText(text, false)
+function AnimationManager:loadAnimDataAuto(text: string, options: LoadOptions?)
+	local progressContext, ownsSession = self:_getLoadingContext(options, "Importing Animation", "Detecting animation format")
+	local detail = if options then options.detail else ""
+	progressContext:set(0, "Detecting animation format", detail, false)
+
+	if self:loadAnimDataFromText(text, true, {
+		progress = progressContext:child(0, 1),
+		detail = detail,
+		suppressErrors = true,
+	}) then
+		progressContext:set(1, "Animation loaded", detail, true)
+		if ownsSession then
+			task.wait()
+			self:_endLoadingSession()
+		end
+		return true
+	end
+
+	progressContext:set(0, "Retrying as text animation", detail, false)
+	local success = self:loadAnimDataFromText(text, false, {
+		progress = progressContext:child(0, 1),
+		detail = detail,
+		suppressErrors = if options then options.suppressErrors == true else false,
+	})
+
+	if success then
+		progressContext:set(1, "Animation loaded", detail, true)
+	end
+
+	if ownsSession then
+		if success then
+			task.wait()
+		end
+		self:_endLoadingSession()
+	end
+
+	return success
 end
 
 -- Apply current bone toggle weights after any scaling so the final sequence honors UI toggles.
@@ -487,7 +662,7 @@ local function applyBoneWeights(sequence: KeyframeSequence, rig: any)
 	end
 end
 
-function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
+function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressContext: LoadingProgressContext?)
 	self.playbackService:stopAnimationAndDisconnect()
 
 	if not State.activeRig then
@@ -496,6 +671,9 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 
 	local kfs: KeyframeSequence
 	if animationToLoad then
+		if progressContext then
+			progressContext:set(0.15, "Preparing preview animation", "using selected animation", false)
+		end
 		kfs = animationToLoad:Clone()
 		
 		-- Restore Loop and Priority state from loaded KeyframeSequence
@@ -510,7 +688,18 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 		rigAny.loop = kfs.Loop
 		rigAny.priority = kfs.Priority
 	else
-		kfs = State.activeRig:ToRobloxAnimation()
+		local activeRig = State.activeRig :: any
+		kfs = activeRig:ToRobloxAnimation(
+			if progressContext
+				then function(progress: number, status: string?, detail: string?, canEstimate: boolean?)
+					progressContext:set(progress * 0.5, status, detail, canEstimate)
+				end
+				else nil
+		)
+	end
+
+	if progressContext then
+		progressContext:set(0.58, "Preparing animation preview", "syncing keyframes", false)
 	end
 
 	if State.scaleFactor:get() ~= 1 then
@@ -594,6 +783,15 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 	if keyframes and #keyframes > 500 then
 		task.wait()
 	end
+
+	if progressContext then
+		progressContext:set(
+			0.92,
+			"Starting animation preview",
+			string.format("%d keyframes", keyframes and #keyframes or 0),
+			true
+		)
+	end
 	
 	self.playbackService:playCurrentAnimation(State.activeAnimator, kfs)
 
@@ -650,6 +848,9 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?)
 		count = count,
 		totalDuration = totalDuration,
 	})
+	if progressContext then
+		progressContext:set(1, "Animation preview ready", string.format("%d keyframes", count), true)
+	end
 	return true
 end
 
@@ -930,31 +1131,51 @@ function AnimationManager:importAnimationsBulk()
 		local animfiles = game:GetService("StudioService"):PromptImportFiles({ "rbxanim" })
 
 		if animfiles then
-			if #animfiles > 1 then
-                for _, animfile in ipairs(animfiles) do
-					self.playbackService:stopAnimationAndDisconnect({ background = true })
+			local totalFiles = #animfiles
+			local importedCount = 0
+			self:_beginLoadingSession(
+				if totalFiles > 1 then "Bulk Importing Animations" else "Importing Animation",
+				"Preparing files",
+				string.format("0/%d selected", totalFiles)
+			)
+			local bulkProgress = createLoadingProgressContext(self, 0, 1)
 
-					local loaded = (animfile :: any):GetBinaryContents()
-                    local success = pcall(function()
-                        self:loadAnimDataAuto(loaded)
-                    end)
-					if success then
-						local name = string.gsub(animfile.Name, ".rbxanim", "")
+			for index, animfile in ipairs(animfiles) do
+				self.playbackService:stopAnimationAndDisconnect({ background = true })
+				local fileName = animfile.Name
+				local fileDetail = string.format("file %d/%d: %s", index, totalFiles, fileName)
+				local fileProgress = bulkProgress:child((index - 1) / totalFiles, index / totalFiles)
+				fileProgress:set(0, "Reading file", fileDetail, true)
+
+				local loaded = (animfile :: any):GetBinaryContents()
+				local ok, success = pcall(function()
+					return self:loadAnimDataAuto(loaded, {
+						progress = fileProgress,
+						detail = fileDetail,
+						suppressErrors = false,
+					})
+				end)
+
+				if ok and success then
+					importedCount += 1
+					if totalFiles > 1 then
+						local name = string.gsub(fileName, ".rbxanim", "")
 						self:saveAnimationFolder(name)
-					else
-						warn("Error loading animation")
 					end
-				end
-			else
-                for _, animfile in ipairs(animfiles) do
-					self.playbackService:stopAnimationAndDisconnect({ background = true })
-
-					local loaded = (animfile :: any):GetBinaryContents()
-                    pcall(function()
-                        self:loadAnimDataAuto(loaded)
-                    end)
+					fileProgress:set(1, "Imported animation", fileDetail, true)
+				else
+					warn("Error loading animation")
+					fileProgress:set(1, "Skipped animation", fileDetail, true)
 				end
 			end
+
+			bulkProgress:set(
+				1,
+				"Import finished",
+				string.format("%d/%d animations imported", importedCount, totalFiles),
+				true
+			)
+			self:_endLoadingSession()
 		else
 			-- Handle the case where no files were selected or the operation was canceled.
 			print("No files were imported.")

@@ -24,6 +24,33 @@ _action_hash_cache_timestamp = 0
 armature_anim_hashes = {}
 
 
+def get_animation_data_action_slot(animation_data, action=None):
+    """Return the action slot currently bound on an ID's animation data.
+
+    When Blender actions have multiple slots, export must prefer the slot
+    explicitly bound to the animated ID over heuristic slot selection.
+    """
+    if animation_data is None or not hasattr(animation_data, "action_slot"):
+        return None
+
+    slot = getattr(animation_data, "action_slot", None)
+    if slot is None:
+        return None
+
+    if action is None:
+        return slot
+
+    action_slots = getattr(action, "slots", None)
+    if action_slots is None:
+        return None
+
+    for candidate_slot in action_slots:
+        if candidate_slot == slot:
+            return slot
+
+    return None
+
+
 def get_action_fcurves(action, slot=None):
     """Return the channelbag F-Curves for an action (Blender 4.4+ API).
     
@@ -104,6 +131,22 @@ def pose_bone_set_selected(pose_bone, value):
 
     if hasattr(bone, "select"):
         bone.select = bool(value)
+
+
+def pose_bone_set_hidden(pose_bone, value):
+    """Compatibility helper to set pose bone visibility state."""
+    if pose_bone is None:
+        return
+
+    bone = getattr(pose_bone, "bone", None)
+    hidden = bool(value)
+
+    if bone is not None and hasattr(bone, "hide"):
+        bone.hide = hidden
+        return
+
+    if hasattr(pose_bone, "hide"):
+        pose_bone.hide = hidden
 
 
 def get_action_channelbag(action, slot=None):

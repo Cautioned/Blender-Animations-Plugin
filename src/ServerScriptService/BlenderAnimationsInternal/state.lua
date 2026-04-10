@@ -50,6 +50,11 @@ local State = {
     animationName = "KeyframeSequence",
 
     loadingEnabled = Value(false),
+    loadingTitle = Value("Working"),
+    loadingStatus = Value("Please wait..."),
+    loadingDetail = Value(""),
+    loadingProgress = Value(0),
+    loadingCanEstimate = Value(false),
     keyframeStats = Value({ count = 0, totalDuration = 0 } :: Types.KeyframeStats),
     stopSpeed = Value(2),
     setRigOrigin = Value(true),
@@ -105,7 +110,7 @@ local State = {
     autoConnectToBlender = Value(false),
     showDebugInfo = Value(true),
     reducedMotion = Value(false),
-    exportWelds = Value(false),
+    exportWelds = Value(true),
     
     -- Toolbar button image
     toolbarButtonImage = Value("rbxassetid://116041192227009"),

@@ -25,6 +25,50 @@ local Pose = require(script.Parent.Pose)
 
 local MAX_MOTOR6D_DEPTH = 1024 -- extreme depth guard to catch pathological rigs before Luau overflows
 
+type ConnectedJoint = Motor6D | Weld | WeldConstraint
+type CacheableJoint = ConnectedJoint | AnimationConstraint
+
+local function getConnectedJointParts(joint: ConnectedJoint): (BasePart?, BasePart?)
+	return joint.Part0, joint.Part1
+end
+
+local function getJointParts(joint: CacheableJoint): (BasePart?, BasePart?)
+	if joint:IsA("AnimationConstraint") then
+		local attachment0 = joint.Attachment0
+		local attachment1 = joint.Attachment1
+		local part0 = attachment0 and attachment0.Parent
+		local part1 = attachment1 and attachment1.Parent
+		if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
+			return part0 :: BasePart, part1 :: BasePart
+		end
+		return nil, nil
+	end
+
+	local part0, part1 = getConnectedJointParts(joint)
+	if part0 and part0:IsA("BasePart") and part1 and part1:IsA("BasePart") then
+		return part0 :: BasePart, part1 :: BasePart
+	end
+
+	return nil, nil
+end
+
+local function getRigPartPriority(bone: Bone?, joint: Instance?): number
+	if bone then
+		return 3
+	end
+
+	if joint then
+		if joint:IsA("Motor6D") or joint:IsA("AnimationConstraint") then
+			return 2
+		end
+		if joint:IsA("Weld") or joint:IsA("WeldConstraint") then
+			return 1
+		end
+	end
+
+	return 0
+end
+
 local function isAccessoryPart(inst: Instance): boolean
 	local current: Instance? = inst
 	while current do
@@ -139,13 +183,14 @@ function RigPart.new(
 			-- print("Setting bone for", part.Name)
 		else
 			-- Traditional joint (Motor6D/Weld/WeldConstraint/AnimationConstraint)
-			local joint: Instance? = connectingJoint
+			local joint: CacheableJoint? = connectingJoint :: CacheableJoint?
 			if not joint and rig._jointCache and rig._jointCache[part] then
 				for _, candidate in ipairs(rig._jointCache[part]) do
-					if candidate.Part0 == parent.part and candidate.Part1 == part then
+					local candidatePart0, candidatePart1 = getJointParts(candidate)
+					if candidatePart0 == parent.part and candidatePart1 == part then
 						joint = candidate
 						break
-					elseif candidate.Part1 == parent.part and candidate.Part0 == part then
+					elseif candidatePart1 == parent.part and candidatePart0 == part then
 						joint = candidate
 						break
 					end
@@ -153,7 +198,8 @@ function RigPart.new(
 			end
 			if joint then
 				self.joint = joint
-				self.jointParentIsPart0 = ((joint :: any).Part0 == parent.part)
+				local jointPart0 = getJointParts(joint)
+				self.jointParentIsPart0 = (jointPart0 == parent.part)
 				self.jointType = joint.ClassName
 			end
 			-- if self.joint then
@@ -164,14 +210,36 @@ function RigPart.new(
 		end
 	end
 
+	local existing = rig.bones[part.Name]
+	if existing == nil or existing == self then
+		rig.bones[part.Name] = self
+	else
+		local existingPriority = getRigPartPriority(existing.bone, existing.joint)
+		local selfPriority = getRigPartPriority(self.bone, self.joint)
+		local preferNew = selfPriority > existingPriority
+
+		if preferNew then
+			rig.bones[part.Name] = self
+		else
+			rig._duplicateBoneWarnings = rig._duplicateBoneWarnings or {}
+			if not rig._duplicateBoneWarnings[part.Name] then
+				rig._duplicateBoneWarnings[part.Name] = true
+				if not isAccessoryPart(part) then
+					warn("Duplicate rig part name detected:", part.Name, "for model", rig.model and rig.model.Name or "<unknown>")
+				end
+			end
+		end
+	end
+
 	-- Always look for joint-connected children (Motor6D/Weld/WeldConstraint)
 	for _, joint in pairs(rig._jointCache[part] or {}) do
-		if joint.Part0 and joint.Part1 then
+		local part0, part1 = getJointParts(joint)
+		if part0 and part1 then
 			local subpart
-			if joint.Part0 == part then
-				subpart = joint.Part1
-			elseif joint.Part1 == part then
-				subpart = joint.Part0
+			if part0 == part then
+				subpart = part1
+			elseif part1 == part then
+				subpart = part0
 			end
 			if subpart and (not parent or subpart ~= parent.part) then
 				local child = RigPart.new(rig, subpart, self, isDeformRig, joint, state)
@@ -188,30 +256,6 @@ function RigPart.new(
 			if child:IsA("Bone") then
 				-- We no longer create a RigPart for the bone here,
 				-- as that is handled by Rig:buildBoneHierarchy
-			end
-		end
-	end
-
-	local existing = rig.bones[part.Name]
-	if existing == nil or existing == self then
-		rig.bones[part.Name] = self
-	else
-		local preferNew = false
-		if self.bone and not existing.bone then
-			preferNew = true
-		elseif self.bone and existing.bone and existing.part ~= part then
-			preferNew = true
-		end
-
-		if preferNew then
-			rig.bones[part.Name] = self
-		else
-			rig._duplicateBoneWarnings = rig._duplicateBoneWarnings or {}
-			if not rig._duplicateBoneWarnings[part.Name] then
-				rig._duplicateBoneWarnings[part.Name] = true
-				if not isAccessoryPart(part) then
-					warn("Duplicate rig part name detected:", part.Name, "for model", rig.model and rig.model.Name or "<unknown>")
-				end
 			end
 		end
 	end

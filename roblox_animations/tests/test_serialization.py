@@ -3693,6 +3693,91 @@ class TestAnimationSerialization(unittest.TestCase):
             "Follower easing was globally forced to Constant by unrelated keys.",
         )
 
+    def test_serialize_prefers_bound_action_slot_over_legacy_slots(self):
+        """Export should use the armature's bound slot, not a stale legacy slot."""
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        root = arm.edit_bones.new("Root")
+        root.head = (0, 0, 0)
+        root.tail = (0, 1, 0)
+
+        limb_a = arm.edit_bones.new("LimbA")
+        limb_a.head = (0, 1, 0)
+        limb_a.tail = (0, 2, 0)
+        limb_a.parent = root
+
+        limb_b = arm.edit_bones.new("LimbB")
+        limb_b.head = (1, 1, 0)
+        limb_b.tail = (1, 2, 0)
+        limb_b.parent = root
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        for name in ("Root", "LimbA", "LimbB"):
+            pb = armature_obj.pose.bones[name]
+            pb.bone["is_transformable"] = True
+            pb.bone["transform"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+            pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+            pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        action = bpy.data.actions.new("LegacySlotsBoundExport")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        if not hasattr(action, "slots") or not hasattr(armature_obj.animation_data, "action_slot"):
+            self.skipTest("blender build does not expose action slots")
+
+        try:
+            legacy_slot = action.slots.new(id_type="OBJECT", name="Object.Legacy")
+            active_slot = action.slots.new(
+                id_type="OBJECT", name=f"Object.{armature_obj.name}"
+            )
+        except TypeError:
+            legacy_slot = action.slots.new(id_type="OBJECT")
+            active_slot = action.slots.new(id_type="OBJECT")
+
+        armature_obj.animation_data.action_slot = legacy_slot
+
+        limb_a_pb = armature_obj.pose.bones["LimbA"]
+        limb_a_pb.location = (0, 0, 0)
+        limb_a_pb.rotation_euler = (0, 0, 0)
+        limb_a_pb.scale = (1, 1, 1)
+        limb_a_pb.keyframe_insert(data_path="location", frame=1)
+        limb_a_pb.keyframe_insert(data_path="rotation_euler", frame=1)
+        limb_a_pb.keyframe_insert(data_path="scale", frame=1)
+        limb_a_pb.location = (1, 0, 0)
+        limb_a_pb.rotation_euler = (0, math.radians(25), 0)
+        limb_a_pb.scale = (1.2, 1, 1)
+        limb_a_pb.keyframe_insert(data_path="location", frame=10)
+        limb_a_pb.keyframe_insert(data_path="rotation_euler", frame=10)
+        limb_a_pb.keyframe_insert(data_path="scale", frame=10)
+
+        armature_obj.animation_data.action_slot = active_slot
+
+        limb_a_pb.location = (0, 0, 0)
+        limb_a_pb.keyframe_insert(data_path="location", frame=1)
+        limb_a_pb.location = (2, 0, 0)
+        limb_a_pb.keyframe_insert(data_path="location", frame=10)
+
+        limb_b_pb = armature_obj.pose.bones["LimbB"]
+        limb_b_pb.location = (0, 0, 0)
+        limb_b_pb.keyframe_insert(data_path="location", frame=1)
+        limb_b_pb.location = (0, 2, 0)
+        limb_b_pb.keyframe_insert(data_path="location", frame=10)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+        final_pose = result["kfs"][-1]["kf"]
+        self.assertIn("LimbA", final_pose, "Active slot bone LimbA was not exported.")
+        self.assertIn("LimbB", final_pose, "Active slot bone LimbB was not exported.")
+
     def test_non_inheriting_constant_hold_clamps_between_keys(self):
         """Non-inheriting bones with constant keys should hold pose between keys."""
         bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))

@@ -59,6 +59,205 @@ return function()
 			expect(head_rigpart.part.Name).to.equal("Head")
 		end)
 
+		it("should keep multiple same-name joints under one parent", function()
+			local left = Instance.new("Part")
+			left.Name = "LeftShoulderPart"
+			left.Parent = mock_rig
+
+			local right = Instance.new("Part")
+			right.Name = "RightShoulderPart"
+			right.Parent = mock_rig
+
+			local torso = mock_rig:FindFirstChild("Torso")
+			expect(torso).to.be.ok()
+
+			local leftJoint = Instance.new("Motor6D")
+			leftJoint.Name = "Shoulder"
+			leftJoint.Part0 = torso
+			leftJoint.Part1 = left
+			leftJoint.Parent = torso
+
+			local rightJoint = Instance.new("Motor6D")
+			rightJoint.Name = "Shoulder"
+			rightJoint.Part0 = torso
+			rightJoint.Part1 = right
+			rightJoint.Parent = torso
+
+			local rig = rig_module.new(mock_rig)
+			local rigTorso = rig:FindRigPart("Torso")
+			expect(rigTorso).to.be.ok()
+			expect(#rigTorso.children).to.equal(3)
+			expect(rig:FindRigPart("LeftShoulderPart")).to.be.ok()
+			expect(rig:FindRigPart("RightShoulderPart")).to.be.ok()
+		end)
+
+		it("should build head chains connected by animationconstraints", function()
+			local head = mock_rig:FindFirstChild("Head")
+			local torso = mock_rig:FindFirstChild("Torso")
+			expect(head).to.be.ok()
+			expect(torso).to.be.ok()
+
+			local headMotor = torso:FindFirstChild("HeadMotor")
+			if headMotor then
+				headMotor:Destroy()
+			end
+
+			local torsoAttachment = Instance.new("Attachment")
+			torsoAttachment.Name = "Neck0"
+			torsoAttachment.Parent = torso
+
+			local headAttachment = Instance.new("Attachment")
+			headAttachment.Name = "Neck1"
+			headAttachment.Parent = head
+
+			local neck = Instance.new("AnimationConstraint")
+			neck.Name = "Neck"
+			neck.Attachment0 = torsoAttachment
+			neck.Attachment1 = headAttachment
+			neck.Parent = torso
+
+			local rig = rig_module.new(mock_rig)
+			local rigTorso = rig:FindRigPart("Torso")
+			expect(rigTorso).to.be.ok()
+
+			local foundHead = false
+			for _, child in ipairs(rigTorso.children) do
+				if child.part == head then
+					foundHead = true
+					expect(child.jointType).to.equal("AnimationConstraint")
+					break
+				end
+			end
+
+			expect(foundHead).to.equal(true)
+		end)
+
+		it("should prefer animated torso and head parts over welded visual duplicates", function()
+			local torso = mock_rig:FindFirstChild("Torso")
+			local head = mock_rig:FindFirstChild("Head")
+			expect(torso).to.be.ok()
+			expect(head).to.be.ok()
+
+			local torsoVisual = Instance.new("Part")
+			torsoVisual.Name = "Torso"
+			torsoVisual.Parent = mock_rig
+
+			local torsoVisualWeld = Instance.new("Weld")
+			torsoVisualWeld.Name = "Torso"
+			torsoVisualWeld.Part0 = torso
+			torsoVisualWeld.Part1 = torsoVisual
+			torsoVisualWeld.Parent = torso
+
+			local headVisual = Instance.new("Part")
+			headVisual.Name = "Head"
+			headVisual.Parent = mock_rig
+
+			local headVisualWeld = Instance.new("Weld")
+			headVisualWeld.Name = "Head"
+			headVisualWeld.Part0 = head
+			headVisualWeld.Part1 = headVisual
+			headVisualWeld.Parent = head
+
+			local rig = rig_module.new(mock_rig)
+			local animatedTorso = rig.root.children[1]
+			local animatedHead = animatedTorso.children[1]
+
+			expect(rig:FindRigPart("Torso")).to.equal(animatedTorso)
+			expect(rig:FindRigPart("Head")).to.equal(animatedHead)
+			expect(rig:FindRigPartByInstance(torsoVisual)).to.be.ok()
+			expect(rig:FindRigPartByInstance(headVisual)).to.be.ok()
+		end)
+
+		it("should keep animation channels bound to rigpieces torso and head in wrapped rigs", function()
+			local wrappedRig = Instance.new("Model")
+			wrappedRig.Name = "WrappedRig"
+
+			local hrp = Instance.new("Part")
+			hrp.Name = "HumanoidRootPart"
+			hrp.Parent = wrappedRig
+			wrappedRig.PrimaryPart = hrp
+
+			local humanoid = Instance.new("Humanoid")
+			humanoid.Parent = wrappedRig
+
+			local rigPieces = Instance.new("Folder")
+			rigPieces.Name = "RigPieces"
+			rigPieces.Parent = wrappedRig
+
+			local animatedTorso = Instance.new("Part")
+			animatedTorso.Name = "Torso"
+			animatedTorso.Parent = rigPieces
+
+			local animatedHead = Instance.new("Part")
+			animatedHead.Name = "Head"
+			animatedHead.Parent = rigPieces
+
+			local torsoMotor = Instance.new("Motor6D")
+			torsoMotor.Name = "Torso"
+			torsoMotor.Part0 = hrp
+			torsoMotor.Part1 = animatedTorso
+			torsoMotor.Parent = hrp
+
+			local headMotor = Instance.new("Motor6D")
+			headMotor.Name = "Head"
+			headMotor.Part0 = animatedTorso
+			headMotor.Part1 = animatedHead
+			headMotor.Parent = animatedTorso
+
+			local torsoModel = Instance.new("Model")
+			torsoModel.Name = "Torso"
+			torsoModel.Parent = wrappedRig
+
+			local visibleTorso = Instance.new("Part")
+			visibleTorso.Name = "Torso"
+			visibleTorso.Parent = torsoModel
+
+			local torsoWeld = Instance.new("Weld")
+			torsoWeld.Name = "Torso"
+			torsoWeld.Part0 = animatedTorso
+			torsoWeld.Part1 = visibleTorso
+			torsoWeld.Parent = animatedTorso
+
+			local headModel = Instance.new("Model")
+			headModel.Name = "Head"
+			headModel.Parent = wrappedRig
+
+			local visibleHead = Instance.new("Part")
+			visibleHead.Name = "Head"
+			visibleHead.Parent = headModel
+
+			local headWeld = Instance.new("Weld")
+			headWeld.Name = "Head"
+			headWeld.Part0 = animatedHead
+			headWeld.Part1 = visibleHead
+			headWeld.Parent = animatedHead
+
+			local rig = rig_module.new(wrappedRig)
+			expect(rig:FindRigPart("Torso").part).to.equal(animatedTorso)
+			expect(rig:FindRigPart("Head").part).to.equal(animatedHead)
+
+			local anim_data = {
+				t = 1,
+				kfs = {
+					{
+						t = 0,
+						kf = {
+							Torso = { 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+							Head = { 0, 2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+						},
+					},
+				},
+			}
+
+			rig:LoadAnimation(anim_data)
+			expect(rig:FindRigPart("Torso").poses[0]).to.be.ok()
+			expect(rig:FindRigPart("Head").poses[0]).to.be.ok()
+			expect(rig:FindRigPartByInstance(visibleTorso).poses[0]).to.never.be.ok()
+			expect(rig:FindRigPartByInstance(visibleHead).poses[0]).to.never.be.ok()
+
+			wrappedRig:Destroy()
+		end)
+
 		it("should perform an animation data round-trip", function()
 			local rig = rig_module.new(mock_rig)
 
@@ -196,6 +395,65 @@ return function()
 			-- It should create one keyframe at t=0
 			expect(#kfs:GetKeyframes()).to.equal(1)
 			expect(kfs:GetKeyframes()[1].Time).to.be.near(0)
+		end)
+
+		it("should ignore deform marker keys while loading poses", function()
+			local rig = rig_module.new(mock_rig)
+			local anim_data = {
+				t = 1,
+				kfs = {
+					{
+						t = 0,
+						kf = {
+							Head = { 0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+							Head_deform = true,
+						},
+					},
+				},
+			}
+
+			rig:LoadAnimation(anim_data)
+			local kfs = rig:ToRobloxAnimation()
+			local keyframes = kfs:GetKeyframes()
+			local head_pose = keyframes[1].HumanoidRootPart.Torso.Head
+
+			expect(head_pose).to.be.ok()
+			expect(head_pose.CFrame).to.equal(CFrame.new(0, 3, 0))
+		end)
+
+		it("should accept the legacy deform flag name", function()
+			local deform_rig = Instance.new("Model")
+			deform_rig.Name = "LegacyDeformRig"
+
+			local root_part = Instance.new("Part")
+			root_part.Name = "RootPart"
+			root_part.Parent = deform_rig
+			deform_rig.PrimaryPart = root_part
+
+			local spine_bone = Instance.new("Bone")
+			spine_bone.Name = "Spine"
+			spine_bone.Parent = root_part
+
+			local rig = rig_module.new(deform_rig)
+			local anim_data = {
+				t = 1,
+				is_deform_bone_rig = true,
+				kfs = {
+					{
+						t = 0,
+						kf = {
+							Spine = { 0, 2, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+						},
+					},
+				},
+			}
+
+			rig:LoadAnimation(anim_data)
+
+			expect(rig.isDeformRig).to.equal(true)
+			expect(rig.bones["Spine"].isDeformBone).to.equal(true)
+
+			deform_rig:Destroy()
 		end)
 
 		it("should throw an error for invalid animation data", function()
