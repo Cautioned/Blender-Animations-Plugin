@@ -43,17 +43,6 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 - **Live Sync**: Enable real-time synchronization
 - **File Export**: Allow exporting animations to files
 
-### GitHub Pages
-- The repository can be published directly from the `docs/` folder on GitHub Pages.
-- The hosted site includes a callback relay page, privacy policy, and terms page.
-- Expected project pages url: `https://cautioned.github.io/blender-animations-plugin/`
-
-### Hosted OAuth Callback
-- The addon still supports the existing localhost redirect flow by default.
-- To use the hosted callback page, register `https://cautioned.github.io/blender-animations-plugin/callback/` in the Roblox OAuth client.
-- Launch Blender with `RBX_OAUTH_REDIRECT_URI=https://cautioned.github.io/blender-animations-plugin/callback/` set in the environment.
-- The hosted page relays the OAuth response back to the local Blender listener on `http://localhost:8181/oauth2/callback`.
-
 ## Troubleshooting
 
 ### Common Issues
