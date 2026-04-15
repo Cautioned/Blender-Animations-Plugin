@@ -373,7 +373,7 @@ function RiggingTab.create(services: any)
 					end,
 					[OnEvent("MouseEnter")] = function()
 						activeHint:set(
-							"Exports the rig with a legacy method. Roblox randomizes mesh/part names when rigs include a humanoid, so you will have to rename them in Blender and constrain them manually.")
+							"Exports the rig with the legacy method while preserving skinned mesh and wrap metadata. Roblox may still randomize mesh/part names when humanoids are involved, but Blender can now reconstruct both body skinning and layered clothing from this export path too.")
 					end,
 					[OnEvent("MouseLeave")] = function()
 						activeHint:set("")

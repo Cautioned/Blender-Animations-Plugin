@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Privacy Policy | Blender Animations Plugin</title>
+    <meta name="description" content="Simple privacy policy for the Blender Animations Plugin.">
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="stylesheet" href="assets/site.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-beta2" integrity="sha384-v+EMKtNUAo5enmQxBqgoU/FWvVvvZHvITNzurHSl4kzvCs94wdlgHUci1lliKWKz" crossorigin="anonymous"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-beta2/dist/ext/hx-preload.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="site-shell" data-page="privacy" hx-boost="true" hx-ext="preload" hx-target="this" hx-select=".site-shell" hx-swap="outerHTML swap:140ms settle:140ms show:window:top" hx-push-url="true" hx-history-elt>
+        <a class="brand-link" href="./" aria-label="Home" hx-preload="mouseover">
+            <img class="site-logo" src="assets/logo.png" alt="Blender Animations Plugin logo" width="96" height="96" decoding="async" fetchpriority="high">
+        </a>
+        <main id="page-content" class="section legal-single">
+            <article class="legal-card panel prose">
+                <div class="eyebrow">Privacy Policy</div>
+                <h2>Simple privacy policy.</h2>
+                <div class="legal-meta">
+                    <span class="meta-pill">Last updated April 15, 2026</span>
+                </div>
+
+                <h3>Scope</h3>
+                <p>
+                    This policy covers the Blender Animations Plugin itself, as well as the public pages that describe the addon,
+                    its privacy policy, and its terms of service.
+                </p>
+
+                <h3>What the plugin uses Roblox for</h3>
+                <p>
+                    The plugin uses Roblox sign-in and asset loading so you can access Roblox assets that your account is allowed to use, including private mesh content.
+                </p>
+
+                <h3>Data the plugin may handle</h3>
+                <p>
+                    Depending on how you use the plugin, it may handle your Roblox sign-in code, state value, access token, refresh token, session key,
+                    asset ids, and Roblox responses needed to import assets into Blender.
+                </p>
+
+                <h3>How credentials are stored</h3>
+                <p>
+                    The plugin keeps access tokens, refresh tokens, and session keys in memory for the current Blender session. The addon code says these values are
+                    not saved to disk by the plugin. Logging out clears local sign-in state and tries to revoke the refresh token with Roblox.
+                </p>
+
+                <h3>What we do not do</h3>
+                <p>
+                    This project does not run its own account system, does not run its own database for plugin user data, and does not intentionally use ads,
+                    tracking, or data resale. Hosting providers and Roblox services may still keep their own logs under their own policies.
+                </p>
+
+                <h3>Sharing and third parties</h3>
+                <p>
+                    To sign in and load protected assets, the plugin sends requests to Roblox. Your browser, internet provider, and Roblox may all process
+                    request data under their own terms and privacy policies.
+                </p>
+
+                <h3>Your choices</h3>
+                <p>
+                    You can avoid sign-in entirely by not logging in, and you can clear session state by logging out or closing Blender. If you enter a session key,
+                    remove it from the plugin when you no longer want it available in that session.
+                </p>
+
+                <h3>Contact</h3>
+                <p>
+                    For project questions about this policy, use the repository issue tracker or support channel linked from the project repository.
+                </p>
+            </article>
+        </main>
+
+        <footer class="footer">
+            <div>Cautioned <span data-current-year></span></div>
+            <div class="footer-links" hx-preload="mouseover">
+                <a href="./">Home</a>
+                <a href="terms.html">Terms</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="assets/site.js"></script>
+</body>
+</html>

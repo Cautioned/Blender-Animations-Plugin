@@ -3,6 +3,7 @@ Scene properties and property registration for the addon.
 """
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
     EnumProperty,
@@ -10,6 +11,14 @@ from bpy.props import (
     IntProperty,
 )
 from bpy.types import PropertyGroup
+from ..animation.face_controls import (
+    FACE_CONTROL_ORDER,
+    FACE_FACS_UI_SYNC_PROP,
+    apply_facs_properties_to_armature,
+    face_control_property_name,
+    iter_active_facs_armatures,
+    load_facs_payload_from_armature,
+)
 from ..core.utils import armature_items, get_object_by_name
 from ..core.constants import DEFAULT_SERVER_PORT
 
@@ -44,6 +53,56 @@ def _on_physics_param_update(self, context):
                     analyze_animation(armature)
     except Exception:
         pass
+
+
+def _apply_face_controls_from_properties(armature_obj):
+    if armature_obj is None or getattr(armature_obj, "type", None) != "ARMATURE":
+        return
+    try:
+        if armature_obj.get(FACE_FACS_UI_SYNC_PROP):
+            return
+    except Exception:
+        pass
+
+    payload = load_facs_payload_from_armature(armature_obj)
+    if not payload:
+        return
+
+    control_holder = getattr(armature_obj, "rbx_face_controls", None)
+    if control_holder is None:
+        return
+
+    apply_facs_properties_to_armature(armature_obj, payload=payload, persist_state=True)
+
+
+def _on_face_control_update(self, context):
+    _apply_face_controls_from_properties(getattr(self, "id_data", None))
+
+
+@persistent
+def _frame_change_face_controls_handler(scene):
+    for obj in iter_active_facs_armatures():
+        apply_facs_properties_to_armature(obj, persist_state=False)
+
+
+class RobloxFaceControlState(PropertyGroup):
+    pass
+
+
+if not hasattr(RobloxFaceControlState, "__annotations__"):
+    RobloxFaceControlState.__annotations__ = {}
+
+for _control_name in FACE_CONTROL_ORDER:
+    RobloxFaceControlState.__annotations__[face_control_property_name(_control_name)] = FloatProperty(
+        name=_control_name,
+        description=f"Drive Roblox FaceControls '{_control_name}'",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        soft_min=0.0,
+        soft_max=1.0,
+        update=_on_face_control_update,
+    )
 
 
 class RobloxAnimationSettings(PropertyGroup):
@@ -141,16 +200,34 @@ class RobloxAnimationSettings(PropertyGroup):
         default=False,
     )
 
+    rbx_face_controls_expanded: BoolProperty(
+        name="Show Face Controls",
+        description="show or hide the roblox face control sliders",
+        default=False,
+    )
+
 
 def register_properties():
+    bpy.utils.register_class(RobloxFaceControlState)
     bpy.utils.register_class(RobloxAnimationSettings)
     bpy.types.Scene.rbx_anim_settings = bpy.props.PointerProperty(
         type=RobloxAnimationSettings,
         name="Roblox Animations Settings",
     )
+    bpy.types.Object.rbx_face_controls = bpy.props.PointerProperty(
+        type=RobloxFaceControlState,
+        name="Roblox Face Controls",
+    )
+    if _frame_change_face_controls_handler not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_frame_change_face_controls_handler)
 
 
 def unregister_properties():
+    if _frame_change_face_controls_handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_frame_change_face_controls_handler)
+    if hasattr(bpy.types.Object, "rbx_face_controls"):
+        del bpy.types.Object.rbx_face_controls
     if hasattr(bpy.types.Scene, "rbx_anim_settings"):
         del bpy.types.Scene.rbx_anim_settings
     bpy.utils.unregister_class(RobloxAnimationSettings)
+    bpy.utils.unregister_class(RobloxFaceControlState)

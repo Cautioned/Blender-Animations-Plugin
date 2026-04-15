@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Blender Animations Plugin for Roblox</title>
+    <meta name="description" content="Roblox Studio plugin and Blender addon workflow for importing, exporting, and syncing animations between Blender and Roblox.">
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+    <link rel="stylesheet" href="assets/site.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-beta2" integrity="sha384-v+EMKtNUAo5enmQxBqgoU/FWvVvvZHvITNzurHSl4kzvCs94wdlgHUci1lliKWKz" crossorigin="anonymous"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/htmx.org@4.0.0-beta2/dist/ext/hx-preload.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <div class="site-shell" data-page="home" hx-boost="true" hx-ext="preload" hx-target="this" hx-select=".site-shell" hx-swap="outerHTML swap:140ms settle:140ms show:window:top" hx-push-url="true" hx-history-elt>
+        <a class="brand-link" href="./" aria-label="Home">
+            <img class="site-logo" src="assets/logo.png" alt="Blender Animations Plugin logo" width="96" height="96" decoding="async" fetchpriority="high">
+        </a>
+        <main id="page-content" class="section stack">
+            <article class="panel simple-panel">
+                <div class="eyebrow">Blender Animations Plugin</div>
+                <h1>Blender Animations Plugin for Roblox.</h1>
+                <p>
+                    A powerful Roblox Studio plugin that enables a seamless animation workflow between Blender and Roblox, with live sync, rigging tools,
+                    and animation import and export support.
+                </p>
+                <p>
+                    Download the Studio plugin from the Creator Store, install the Blender extension, or get the source and addon files from GitHub.
+                </p>
+                <div class="cta-row">
+                    <a class="button" href="https://create.roblox.com/store/asset/16708835782/Blender-Animations-ultimate-edition">Download on Creator Store</a>
+                    <a class="ghost-button" href="https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/">Blender Extension</a>
+                    <a class="ghost-button" href="https://github.com/Cautioned/Blender-Animations-Plugin">View on GitHub</a>
+                </div>
+            </article>
+        </main>
+
+        <footer class="footer">
+            <div>Cautioned <span data-current-year></span></div>
+            <div class="footer-links" hx-preload="mouseover">
+                <a href="privacy.html">Privacy</a>
+                <a href="terms.html">Terms</a>
+            </div>
+        </footer>
+    </div>
+
+    <script src="assets/site.js"></script>
+</body>
+</html>

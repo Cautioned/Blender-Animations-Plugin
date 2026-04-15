@@ -397,6 +397,47 @@ return function()
 			expect(kfs:GetKeyframes()[1].Time).to.be.near(0)
 		end)
 
+		it("should rebuild face controls into keyframes", function()
+			local rig = rig_module.new(mock_rig)
+			local anim_data = {
+				t = 1,
+				kfs = {
+					{
+						t = 0,
+						kf = {},
+						fc = {
+							JawDrop = { value = 0.25, easingStyle = "Linear", easingDirection = "Out" },
+						},
+					},
+					{
+						t = 1,
+						kf = {},
+						fc = {
+							JawDrop = { value = 0.75, easingStyle = "Linear", easingDirection = "Out" },
+						},
+					},
+				},
+			}
+
+			rig:LoadAnimation(anim_data)
+			local kfs = rig:ToRobloxAnimation()
+			local keyframes = kfs:GetKeyframes()
+
+			expect(#keyframes).to.equal(2)
+			local faceControls0 = keyframes[1]:FindFirstChild("FaceControls")
+			expect(faceControls0).to.be.ok()
+			local jawDrop0 = faceControls0:FindFirstChild("JawDrop")
+			expect(jawDrop0).to.be.ok()
+			expect(jawDrop0:IsA("NumberPose")).to.equal(true)
+			expect((jawDrop0 :: NumberPose).Value).to.be.near(0.25)
+
+			local faceControls1 = keyframes[2]:FindFirstChild("FaceControls")
+			expect(faceControls1).to.be.ok()
+			local jawDrop1 = faceControls1:FindFirstChild("JawDrop")
+			expect(jawDrop1).to.be.ok()
+			expect((jawDrop1 :: NumberPose).Value).to.be.near(0.75)
+		end)
+
 		it("should ignore deform marker keys while loading poses", function()
 			local rig = rig_module.new(mock_rig)
 			local anim_data = {

@@ -14,6 +14,7 @@ from ..animation.serialization import (
     serialize,
     is_deform_bone_rig,
 )
+from ..animation.face_controls import store_facs_payload_on_armature
 from ..core.utils import invalidate_armature_cache
 
 # Reload modules to pick up changes in Blender's test environment
@@ -3844,6 +3845,70 @@ class TestAnimationSerialization(unittest.TestCase):
                 places=4,
                 msg=f"Leg mid-frame component {i} should hold constant between keys.",
             )
+
+    def test_serialize_exports_face_controls_as_fc_payload(self):
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        arm = armature_obj.data
+
+        face_jaw = arm.edit_bones.new("FaceJaw")
+        face_jaw.head = (0, 0, 0)
+        face_jaw.tail = (0, 1, 0)
+
+        bpy.ops.object.mode_set(mode="POSE")
+
+        face_jaw_pb = armature_obj.pose.bones["FaceJaw"]
+        face_jaw_pb.bone["is_transformable"] = True
+        face_jaw_pb.bone.use_deform = True
+        face_jaw_pb.bone["transform"] = mathutils.Matrix.Identity(4)
+        face_jaw_pb.bone["transform0"] = mathutils.Matrix.Identity(4)
+        face_jaw_pb.bone["transform1"] = mathutils.Matrix.Identity(4)
+        face_jaw_pb.bone["nicetransform"] = mathutils.Matrix.Identity(4)
+
+        store_facs_payload_on_armature(
+            armature_obj,
+            {
+                "face_bone_names": ["FaceJaw"],
+                "face_control_names": ["JawDrop"],
+                "facs_pose_names": ["JawDrop"],
+                "two_pose_correctives": [],
+                "three_pose_correctives": [],
+                "bone_pose_transforms": {
+                    "FaceJaw": {
+                        "JawDrop": {
+                            "position": (0.0, 0.0, 0.0),
+                            "rotation": (0.0, 0.0, 10.0),
+                        }
+                    }
+                },
+            },
+        )
+
+        action = bpy.data.actions.new("FaceControlsExport")
+        armature_obj.animation_data_create()
+        armature_obj.animation_data.action = action
+
+        armature_obj.rbx_face_controls.rbx_facs_jaw_drop = 0.0
+        armature_obj.keyframe_insert(data_path="rbx_face_controls.rbx_facs_jaw_drop", frame=1)
+        armature_obj.rbx_face_controls.rbx_facs_jaw_drop = 0.75
+        armature_obj.keyframe_insert(data_path="rbx_face_controls.rbx_facs_jaw_drop", frame=10)
+
+        bpy.context.scene.frame_start = 1
+        bpy.context.scene.frame_end = 10
+        invalidate_armature_cache()
+        result = serialize(armature_obj)
+
+        self.assertTrue(result and result.get("kfs"), "Serialization returned no keyframes.")
+        self.assertIn("fc", result["kfs"][0], "Face control keyframe payload missing.")
+        self.assertIn("JawDrop", result["kfs"][0]["fc"], "JawDrop face control missing.")
+        self.assertAlmostEqual(result["kfs"][0]["fc"]["JawDrop"]["value"], 0.0)
+        self.assertAlmostEqual(result["kfs"][-1]["fc"]["JawDrop"]["value"], 0.75)
+        self.assertEqual(result["kfs"][-1]["fc"]["JawDrop"]["easingStyle"], "Linear")
+        self.assertNotIn(
+            "FaceJaw",
+            result["kfs"][-1]["kf"],
+            "Face deform bone should not be exported as a duplicate pose when fc is present.",
+        )
 
 
 # This allows running the tests from the Blender text editor
