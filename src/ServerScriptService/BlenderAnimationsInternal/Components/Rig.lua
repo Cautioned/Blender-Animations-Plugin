@@ -37,6 +37,13 @@ local function getJointParts(joint: CacheableJoint): (BasePart?, BasePart?)
 end
 
 type LoadProgressCallback = (progress: number, status: string?, detail: string?, canEstimate: boolean?) -> ()
+type FaceControlPose = {
+	value: number,
+	easingStyle: string,
+	easingDirection: string,
+}
+type FaceControlTimeline = { [number]: FaceControlPose }
+type FaceControls = { [string]: FaceControlTimeline }
 
 type self = {
 	model: Model,
@@ -45,6 +52,7 @@ type self = {
 	loop: boolean,
 	priority: Enum.AnimationPriority,
 	keyframeNames: { { t: number, name: string, value: string?, type: string? } },
+	faceControls: FaceControls,
 	bones: { [string]: RigPart.RigPart },
 	bonesByInstance: { [Instance]: RigPart.RigPart },
 	isDeformRig: boolean,
@@ -61,6 +69,7 @@ function Rig.new(model: Model)
 		loop = true,
 		priority = Enum.AnimationPriority.Action,
 		keyframeNames = {}, -- table with values each in the format: {t = number, name = string, value = string?, type = string?}
+		faceControls = {},
 		bones = {}, -- Initialize bones property
 		bonesByInstance = {},
 		isDeformRig = false, -- Flag to indicate if this is a deform bone rig
@@ -405,6 +414,124 @@ function Rig:ClearPoses()
 	for _, rigPart in pairs(self:GetRigParts()) do
 		rigPart.poses = {}
 	end
+	self.faceControls = {}
+end
+
+local function decodeFaceControlState(faceData: any): (number, string, string)
+	local value = 0
+	local easingStyle = "Linear"
+	local easingDirection = "Out"
+
+	if type(faceData) == "table" then
+		if type(faceData[1]) == "number" then
+			value = faceData[1]
+			if type(faceData[2]) == "string" then
+				easingStyle = faceData[2]
+			end
+			if type(faceData[3]) == "string" then
+				easingDirection = faceData[3]
+			end
+		else
+			if type(faceData.value) == "number" then
+				value = faceData.value
+			end
+			if type(faceData.easingStyle) == "string" then
+				easingStyle = faceData.easingStyle
+			end
+			if type(faceData.easingDirection) == "string" then
+				easingDirection = faceData.easingDirection
+			end
+		end
+	elseif type(faceData) == "number" then
+		value = faceData
+	end
+
+	return value, easingStyle, easingDirection
+end
+
+local function buildFaceControlPose(
+	faceControls: FaceControls,
+	controlName: string,
+	t: number
+): FaceControlPose?
+	local controlTimeline = faceControls[controlName]
+	if not controlTimeline then
+		return nil
+	end
+
+	local exact = controlTimeline[t]
+	if exact then
+		return exact
+	end
+
+	local prevTime: number? = nil
+	local nextTime: number? = nil
+	for poseTime, _ in pairs(controlTimeline) do
+		if poseTime < t then
+			if prevTime == nil or poseTime > prevTime then
+				prevTime = poseTime
+			end
+		elseif poseTime > t then
+			if nextTime == nil or poseTime < nextTime then
+				nextTime = poseTime
+			end
+		end
+	end
+
+	if prevTime == nil then
+		return nil
+	end
+
+	local prevPose = controlTimeline[prevTime]
+	if not prevPose then
+		return nil
+	end
+
+	local nextPose = nextTime and controlTimeline[nextTime] or nil
+	if prevPose.easingStyle == "Constant" or not nextPose or nextTime == nil then
+		return prevPose
+	end
+
+	local alpha = (t - prevTime) / (nextTime - prevTime)
+	return {
+		value = prevPose.value + ((nextPose.value - prevPose.value) * alpha),
+		easingStyle = prevPose.easingStyle,
+		easingDirection = prevPose.easingDirection,
+	}
+end
+
+local function createFaceControlsFolder(
+	faceControls: FaceControls,
+	t: number
+): Folder?
+	if next(faceControls) == nil then
+		return nil
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = "FaceControls"
+	local added = false
+
+	for controlName in pairs(faceControls) do
+		local poseData = buildFaceControlPose(faceControls, controlName, t)
+		if poseData then
+			local numberPose = Instance.new("NumberPose")
+			numberPose.Name = controlName
+			numberPose.Value = poseData.value
+			pcall(function()
+				(numberPose :: any).Weight = 1
+			end)
+			numberPose.Parent = folder
+			added = true
+		end
+	end
+
+	if not added then
+		folder:Destroy()
+		return nil
+	end
+
+	return folder
 end
 
 function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
@@ -445,6 +572,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	end
 
 	self.animTime = data.t * timeScale
+	self.faceControls = {}
 
 	local totalPoseEntries = 0
 	for keyframeIndex, kfdef in pairs(data.kfs) do
@@ -512,12 +640,14 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 
 		local kfTime = kfdef.t * timeScale
 
-		if not kfdef.kf or type(kfdef.kf) ~= "table" then
+		local poseTable = if type(kfdef.kf) == "table" then kfdef.kf else {}
+		local faceTable = if type((kfdef :: any).fc) == "table" then (kfdef :: any).fc else nil
+		if next(poseTable) == nil and faceTable == nil then
 			warn("Skipping keyframe with invalid pose data at time " .. kfTime)
 			continue
 		end
 
-		for partName, poseData in pairs(kfdef.kf) do
+		for partName, poseData in pairs(poseTable) do
 			if type(partName) ~= "string" then
 				continue
 			end
@@ -617,6 +747,20 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 				end
 			end
 		end
+
+		if faceTable then
+			for controlName, faceData in pairs(faceTable) do
+				if type(controlName) == "string" then
+					local value, easingStyle, easingDirection = decodeFaceControlState(faceData)
+					self.faceControls[controlName] = self.faceControls[controlName] or {}
+					self.faceControls[controlName][kfTime] = {
+						value = value,
+						easingStyle = easingStyle,
+						easingDirection = easingDirection,
+					}
+				end
+			end
+		end
 	end
 
 	if progressCallback then
@@ -650,6 +794,11 @@ function Rig:ToRobloxAnimation(progressCallback: LoadProgressCallback?)
 	local timePoints = { [0] = true } -- Always have a keyframe at t=0
 	for _, rigPart in pairs(allRigParts) do
 		for poseT, _ in pairs(rigPart.poses) do
+			timePoints[poseT] = true
+		end
+	end
+	for _, controlTimeline in pairs(self.faceControls) do
+		for poseT, _ in pairs(controlTimeline) do
 			timePoints[poseT] = true
 		end
 	end
@@ -718,6 +867,11 @@ function Rig:ToRobloxAnimation(progressCallback: LoadProgressCallback?)
 		local pose = self.root:PoseToRobloxAnimation(t)
 		if pose then
 			pose.Parent = kf
+		end
+
+		local faceFolder = createFaceControlsFolder(self.faceControls, t)
+		if faceFolder then
+			faceFolder.Parent = kf
 		end
 
 		if progressCallback and (keyframeCount % LOAD_KEYFRAME_YIELD_INTERVAL == 0 or keyframeCount == #sortedTimes) then

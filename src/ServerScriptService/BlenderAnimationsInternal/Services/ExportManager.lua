@@ -24,6 +24,131 @@ function ExportManager:clearMetaParts()
 	end
 end
 
+local function meshPartHasSkinning(meshPart: MeshPart): boolean
+	if meshPart:FindFirstChildWhichIsA("Bone", true) ~= nil then
+		return true
+	end
+
+	local ok, hasSkinnedMesh = pcall(function()
+		return meshPart.HasSkinnedMesh
+	end)
+
+	return ok and hasSkinnedMesh == true
+end
+
+local function cfComponents(cf: CFrame): { number }
+	return { cf:GetComponents() }
+end
+
+local function tryReadProperty(inst: Instance, propName: string)
+	local ok, value = pcall(function()
+		return (inst :: any)[propName]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+local function tryStoreContentId(data: { [string]: any }, key: string, inst: Instance, propName: string)
+	local value = tryReadProperty(inst, propName)
+	if value and tostring(value) ~= "" then
+		data[key] = tostring(value)
+	end
+end
+
+local function getWrapLayerData(meshPart: MeshPart): any?
+	local wrapLayer = meshPart:FindFirstChildWhichIsA("WrapLayer", true)
+	if not wrapLayer then
+		return nil
+	end
+
+	local data = {
+		name = wrapLayer.Name,
+		enabled = wrapLayer.Enabled,
+	}
+
+	local autoSkin = tryReadProperty(wrapLayer, "AutoSkin")
+	if autoSkin ~= nil then
+		data.auto_skin = tostring(autoSkin)
+	end
+
+	tryStoreContentId(data, "reference_mesh_id", wrapLayer, "ReferenceMeshId")
+	tryStoreContentId(data, "cage_mesh_id", wrapLayer, "CageMeshId")
+	tryStoreContentId(data, "temporary_reference_id", wrapLayer, "TemporaryReferenceId")
+	tryStoreContentId(data, "temporary_cage_mesh_id", wrapLayer, "TemporaryCageMeshId")
+	tryStoreContentId(data, "hsr_asset_id", wrapLayer, "HSRAssetId")
+
+	local referenceOrigin = tryReadProperty(wrapLayer, "ReferenceOrigin")
+	if typeof(referenceOrigin) == "CFrame" then
+		data.reference_origin = cfComponents(referenceOrigin)
+	end
+
+	local cageOrigin = tryReadProperty(wrapLayer, "CageOrigin")
+	if typeof(cageOrigin) == "CFrame" then
+		data.cage_origin = cfComponents(cageOrigin)
+	end
+
+	local bindOffset = tryReadProperty(wrapLayer, "BindOffset")
+	if typeof(bindOffset) == "CFrame" then
+		data.bind_offset = cfComponents(bindOffset)
+	end
+
+	local importOrigin = tryReadProperty(wrapLayer, "ImportOrigin")
+	if typeof(importOrigin) == "CFrame" then
+		data.import_origin = cfComponents(importOrigin)
+	end
+
+	local order = tryReadProperty(wrapLayer, "Order")
+	if type(order) == "number" then
+		data.order = order
+	end
+
+	local puffiness = tryReadProperty(wrapLayer, "Puffiness")
+	if type(puffiness) == "number" then
+		data.puffiness = puffiness
+	end
+
+	local shrinkFactor = tryReadProperty(wrapLayer, "ShrinkFactor")
+	if type(shrinkFactor) == "number" then
+		data.shrink_factor = shrinkFactor
+	end
+
+	return data
+end
+
+local function getWrapTargetData(meshPart: MeshPart): any?
+	local wrapTarget = meshPart:FindFirstChildWhichIsA("WrapTarget", true)
+	if not wrapTarget then
+		return nil
+	end
+
+	local data = {
+		name = wrapTarget.Name,
+	}
+
+	tryStoreContentId(data, "cage_mesh_id", wrapTarget, "CageMeshId")
+	tryStoreContentId(data, "temporary_cage_mesh_id", wrapTarget, "TemporaryCageMeshId")
+	tryStoreContentId(data, "hsr_asset_id", wrapTarget, "HSRAssetId")
+
+	local cageOrigin = tryReadProperty(wrapTarget, "CageOrigin")
+	if typeof(cageOrigin) == "CFrame" then
+		data.cage_origin = cfComponents(cageOrigin)
+	end
+
+	local importOrigin = tryReadProperty(wrapTarget, "ImportOrigin")
+	if typeof(importOrigin) == "CFrame" then
+		data.import_origin = cfComponents(importOrigin)
+	end
+
+	local stiffness = tryReadProperty(wrapTarget, "Stiffness")
+	if type(stiffness) == "number" then
+		data.stiffness = stiffness
+	end
+
+	return data
+end
+
 function ExportManager:reencodeJointMetadata(
 	rigNode: any,
 	partEncodeMap: { [Instance]: string },
@@ -103,6 +228,8 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 			partCount = partCount + 1
 
 			local originalInst = originalMap[desc]
+			local sourceInst = (originalInst or desc) :: BasePart
+			local originalSize = sourceInst.Size
 
 			-- Verify (Optional, but good for debugging if ever needed)
 			-- if originalInst and originalInst.Name ~= desc.Name then warn("Mismatch mapping?") end
@@ -133,12 +260,33 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 			desc.Size = desc.Size + perturbation
 
 			-- Store Expected Dimensions/Volume (use table.insert for proper JSON array serialization)
-			table.insert(partAuxData, {
+			local auxEntry = {
 				idx = partCount,
 				name = desc.Name,
 				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
 				vol_fp = desc.Size.X * desc.Size.Y * desc.Size.Z, -- Fallback for Mesh Volume calculation
-			})
+				part_size = { originalSize.X, originalSize.Y, originalSize.Z },
+				part_cf = { sourceInst.CFrame:GetComponents() },
+			}
+
+			if sourceInst:IsA("MeshPart") then
+				local meshSource = sourceInst :: MeshPart
+				local hasSkinning = meshPartHasSkinning(meshSource)
+				local wrapLayerData = getWrapLayerData(meshSource)
+				local wrapTargetData = getWrapTargetData(meshSource)
+				auxEntry.mesh_class = "MeshPart"
+				auxEntry.mesh_id = tostring(meshSource.MeshId)
+				auxEntry.mesh_size = { meshSource.MeshSize.X, meshSource.MeshSize.Y, meshSource.MeshSize.Z }
+				auxEntry.has_skinning = hasSkinning
+				if wrapLayerData then
+					auxEntry.wrap_layer = wrapLayerData
+				end
+				if wrapTargetData then
+					auxEntry.wrap_target = wrapTargetData
+				end
+			end
+
+			table.insert(partAuxData, auxEntry)
 
 			if originalInst then
 				partEncodeMap[originalInst] = desc.Name
@@ -168,7 +316,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 		parts = partNames,
 		rig = encodedRig,
 		partAux = partAuxData,
-		version = "1.2",
+		version = "1.6",
 	}
 end
 
@@ -191,6 +339,8 @@ function ExportManager:generateMetadataLegacy(
 			partCount = partCount + 1
 
 			local originalInst = originalMap[desc]
+			local sourceInst = (originalInst or desc) :: BasePart
+			local originalSize = sourceInst.Size
 
 			-- IMPORTANT: Uniquify names even for Legacy export to prevent collision ambiguities
 			-- The user can rename them back in Blender if they really want duplicates, but for matching we need unique keys.
@@ -219,11 +369,33 @@ function ExportManager:generateMetadataLegacy(
 			desc.Size = desc.Size + perturbation
 
 			-- use table.insert for proper JSON array serialization
-			table.insert(partAuxData, {
+			local auxEntry = {
 				idx = partCount,
 				name = desc.Name,
 				dims_fp = { desc.Size.X, desc.Size.Y, desc.Size.Z },
-			})
+				vol_fp = desc.Size.X * desc.Size.Y * desc.Size.Z,
+				part_size = { originalSize.X, originalSize.Y, originalSize.Z },
+				part_cf = { sourceInst.CFrame:GetComponents() },
+			}
+
+			if sourceInst:IsA("MeshPart") then
+				local meshSource = sourceInst :: MeshPart
+				local hasSkinning = meshPartHasSkinning(meshSource)
+				local wrapLayerData = getWrapLayerData(meshSource)
+				local wrapTargetData = getWrapTargetData(meshSource)
+				auxEntry.mesh_class = "MeshPart"
+				auxEntry.mesh_id = tostring(meshSource.MeshId)
+				auxEntry.mesh_size = { meshSource.MeshSize.X, meshSource.MeshSize.Y, meshSource.MeshSize.Z }
+				auxEntry.has_skinning = hasSkinning
+				if wrapLayerData then
+					auxEntry.wrap_layer = wrapLayerData
+				end
+				if wrapTargetData then
+					auxEntry.wrap_target = wrapTargetData
+				end
+			end
+
+			table.insert(partAuxData, auxEntry)
 		end
 		-- No need to destroy Humanoid or AnimationController
 	end
@@ -238,14 +410,14 @@ function ExportManager:generateMetadataLegacy(
 	self:reencodeJointMetadata(encodedRig, partEncodeMap)
 	print(string.format("[ExportManager] generateMetadataLegacy: exported %d parts", partCount))
 
-	-- print("[ExportManager] Exporting Legacy with Size/Volume Fingerprints (v1.3)")
+	-- print("[ExportManager] Exporting Legacy with skinned mesh + wrap metadata (v1.5)")
 
 	return {
 		rigName = State.activeRig.model.Name,
 		parts = partRoles,
 		rig = encodedRig,
 		partAux = partAuxData,
-		version = "1.1",
+		version = "1.6",
 	}
 end
 

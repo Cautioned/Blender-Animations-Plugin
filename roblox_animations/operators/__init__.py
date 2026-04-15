@@ -56,6 +56,11 @@ from .validation_ops import (
 from .test_ops import (
     OBJECT_OT_RunTests,
 )
+from .auth_ops import (
+    OBJECT_OT_RbxOAuthLogin,
+    OBJECT_OT_RbxOAuthCancelLogin,
+    OBJECT_OT_RbxOAuthLogout,
+)
 
 __all__ = [
     # Import operators
@@ -101,4 +106,8 @@ __all__ = [
     "StopServerOperator",
     # Test operators
     "OBJECT_OT_RunTests",
+    # OAuth operators
+    "OBJECT_OT_RbxOAuthLogin",
+    "OBJECT_OT_RbxOAuthCancelLogin",
+    "OBJECT_OT_RbxOAuthLogout",
 ]

@@ -5,8 +5,25 @@ This addon provides tools for importing Roblox rigs and exporting animations
 with live sync capabilities to Roblox Studio.
 """
 
+import bpy
+from bpy.props import StringProperty
+from bpy.types import AddonPreferences
+
 # Import modules once at module level
 from . import operators, ui, server
+
+
+class RbxAnimationsPreferences(AddonPreferences):
+    """Addon preferences for non-secret addon settings."""
+
+    bl_idname = __name__
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(
+            text="Authentication is session-only and is never saved to disk.",
+            icon="LOCKED",
+        )
 
 
 # Define bl_info directly to avoid import issues
@@ -14,7 +31,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 4, 2),
+    "version": (2, 5, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -87,11 +104,35 @@ _classes = [
     # Server operators
     _resolve_operator_class("StartServerOperator"),
     _resolve_operator_class("StopServerOperator"),
+    # OAuth operators
+    _resolve_operator_class("OBJECT_OT_RbxOAuthLogin", fallback_module="auth_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxOAuthCancelLogin", fallback_module="auth_ops"),
+    _resolve_operator_class("OBJECT_OT_RbxOAuthLogout", fallback_module="auth_ops"),
     # UI panels
     getattr(ui, "OBJECT_PT_RbxAnimations", None),
     getattr(ui, "OBJECT_PT_RbxAnimations_Tool", None),
+    # Addon preferences (must be last so bl_idname resolves correctly)
+    RbxAnimationsPreferences,
 ]
 CLASSES = tuple(cls for cls in _classes if cls is not None)
+
+
+def _register_runtime_auth_properties() -> None:
+    bpy.types.WindowManager.rbx_api_key_session = StringProperty(
+        name="Roblox API Key",
+        description=(
+            "Session-only API key from create.roblox.com/dashboard/credentials. "
+            "This value is never saved to disk."
+        ),
+        default="",
+        subtype="PASSWORD",
+        options={"SKIP_SAVE"},
+    )
+
+
+def _unregister_runtime_auth_properties() -> None:
+    if hasattr(bpy.types.WindowManager, "rbx_api_key_session"):
+        del bpy.types.WindowManager.rbx_api_key_session
 
 
 def _safe_unregister_class(cls):
@@ -155,6 +196,7 @@ def register():
             ui.unregister_properties()
         except Exception:
             pass
+        _register_runtime_auth_properties()
         ui.register_properties()
 
         # Add import menu items
@@ -217,6 +259,12 @@ def unregister():
             ui.unregister_properties()
         except Exception:
             pass
+
+        try:
+            bpy.context.window_manager.rbx_api_key_session = ""
+        except Exception:
+            pass
+        _unregister_runtime_auth_properties()
 
         # Remove import menu items
         try:

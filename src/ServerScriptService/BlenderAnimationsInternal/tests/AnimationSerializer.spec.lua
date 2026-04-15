@@ -136,6 +136,33 @@ return function()
 				expect(#result.kfs).to.equal(1)
 			end)
 
+			it("should serialize face controls from number poses", function()
+				local kfs = Instance.new("KeyframeSequence")
+				local kf1 = Instance.new("Keyframe")
+				kf1.Time = 0
+				kf1.Parent = kfs
+
+				local faceFolder = Instance.new("Folder")
+				faceFolder.Name = "FaceControls"
+				faceFolder.Parent = kf1
+
+				local smile = Instance.new("NumberPose")
+				smile.Name = "JawDrop"
+				smile.Value = 0.75
+				smile.Parent = faceFolder
+
+				local rig = { isDeformRig = false, bones = {}, ToRobloxAnimation = function() return kfs end }
+				local result = serializer:serialize(kfs, rig)
+
+				expect(result).to.be.ok()
+				expect(#result.kfs).to.equal(1)
+				expect(result.kfs[1].fc).to.be.ok()
+				expect(result.kfs[1].fc.JawDrop).to.be.ok()
+				expect(result.kfs[1].fc.JawDrop.value).to.be.near(0.75)
+				expect(result.kfs[1].fc.JawDrop.easingStyle).to.equal("Linear")
+				expect(result.kfs[1].fc.JawDrop.easingDirection).to.equal("Out")
+			end)
+
 			it("should return nil for a KeyframeSequence with no keyframes", function()
 				local kfs = Instance.new("KeyframeSequence")
 				local rig = { isDeformRig = false, bones = {}, ToRobloxAnimation = function() return kfs end }

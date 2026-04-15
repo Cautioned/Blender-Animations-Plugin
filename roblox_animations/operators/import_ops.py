@@ -10,7 +10,7 @@ from bpy_extras.io_utils import ImportHelper
 from ..core.utils import get_unique_name, get_object_by_name, iter_scene_objects
 from ..core.utils import cf_to_mat, mat_to_cf
 from ..core.constants import get_transform_to_blender
-from ..rig.creation import get_unique_collection_name
+from ..rig.creation import create_rig, get_unique_collection_name
 from contextlib import contextmanager
 
 
@@ -102,6 +102,52 @@ def _iter_dicts_recursive(node, depth=0, max_depth=24):
         for child in node:
             if isinstance(child, (dict, list, tuple)):
                 yield from _iter_dicts_recursive(child, depth + 1, max_depth)
+
+
+def _iter_part_aux_entries(meta_loaded):
+    if not isinstance(meta_loaded, dict):
+        return []
+    part_aux = meta_loaded.get("partAux") or []
+    if isinstance(part_aux, dict):
+        return list(part_aux.values())
+    return list(part_aux)
+
+
+def _meta_has_skinned_meshes(meta_loaded):
+    """Return True when metadata explicitly marks any skinned mesh part entries."""
+    for entry in _iter_part_aux_entries(meta_loaded):
+        if isinstance(entry, dict) and entry.get("has_skinning") and entry.get("mesh_id"):
+            return True
+    return False
+
+
+def _meta_has_filemesh_candidates(meta_loaded):
+    """Return True when metadata includes any MeshPart filemesh candidates.
+
+    Studio does not always expose skinning via Bone descendants, so Blender must
+    sometimes inspect the FileMesh directly to determine whether weights exist.
+    """
+    for entry in _iter_part_aux_entries(meta_loaded):
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("mesh_id"):
+            continue
+        mesh_class = entry.get("mesh_class")
+        if mesh_class in (None, "", "MeshPart"):
+            return True
+    return False
+
+
+def _rig_contains_deform_bones(node):
+    """Return True when the exported rig tree contains deform bone nodes."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("isDeformBone") or node.get("jointType") == "Bone":
+        return True
+    for child in node.get("children", []):
+        if _rig_contains_deform_bones(child):
+            return True
+    return False
 
 
 def _extract_motor6d_connection(meta_loaded, weapon_root_name, preferred_parent_name=None):
@@ -460,6 +506,8 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         
         idx = item["idx"]
         target_name = item.get("name", f"{rig_name}{idx}")
+        target_lower = str(target_name).lower()
+        target_family = "accessory" if (target_lower.startswith("handle") or item.get("wrap_layer")) else "body"
         
         dims = item.get("dims_fp")
         if dims and len(dims) == 3:
@@ -467,6 +515,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
             ratios = _dims_to_ratios(sorted_dims)
             fp_targets.append({
                 "target": target_name,
+                "family": target_family,
                 "dims": sorted_dims,
                 "ratios": ratios,
                 "sig": sum(sorted_dims),
@@ -476,6 +525,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
             vol = float(item["vol_fp"])
             fp_targets.append({
                 "target": target_name,
+                "family": target_family,
                 "dims": (vol,),
                 "ratios": (1.0, 1.0),
                 "sig": vol,
@@ -492,6 +542,8 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     all_candidates = []
     
     for obj in mesh_objects:
+        base_name = _strip_suffix(obj.name).lower()
+        candidate_family = "accessory" if base_name.startswith("handle") else "body"
         d = obj.dimensions
         sorted_dims = tuple(sorted([d.x, d.y, d.z]))
         sig = sum(sorted_dims)
@@ -499,6 +551,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         
         cand = {
             "obj": obj,
+            "family": candidate_family,
             "dims": sorted_dims,
             "ratios": ratios,
             "sig": sig,
@@ -560,6 +613,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     for ti, target in enumerate(fp_targets):
         target_name = target["target"]
         target_lower = target_name.lower()
+        target_family = target.get("family") or "body"
         target_dims = target["dims"]
         target_sig = target["sig"]
         target_ratios = target["ratios"]
@@ -569,6 +623,9 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         for ci, cand in enumerate(all_candidates):
             obj = cand["obj"]
             mesh_center = mesh_centers[obj]
+
+            if cand.get("family") != target_family:
+                continue
             
             # --- size compatibility check ---
             if is_vol:
@@ -875,6 +932,10 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         print("[RigImport] No rig definition provided")
         return False
 
+    allow_aux_renames = not bool(meta_loaded and meta_loaded.get("partAux"))
+    if not allow_aux_renames:
+        print("[RigImport] partAux present - skipping aux-name rename targets")
+
     t2b = get_transform_to_blender()
     used = set()
     
@@ -886,9 +947,10 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         jname = node.get("jname") or node.get("pname") or ""
         if jname:
             all_rig_names.add(jname.lower())
-        for aux_name in (node.get("aux") or []):
-            if aux_name:
-                all_rig_names.add(aux_name.lower())
+        if allow_aux_renames:
+            for aux_name in (node.get("aux") or []):
+                if aux_name:
+                    all_rig_names.add(aux_name.lower())
         for child in (node.get("children") or []):
             collect_names(child)
     collect_names(rig_def)
@@ -927,6 +989,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     # on size compatibility — prevents tiny meshes from being grabbed by
     # distant or wrong-sized bones.
     expected_dims_by_name = {}  # target_name_lower -> sorted dims tuple
+    synth_preferred_targets = set()
     if meta_loaded:
         part_aux_raw = meta_loaded.get("partAux")
         if part_aux_raw:
@@ -939,6 +1002,14 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
                 if name and dims and len(dims) == 3:
                     sd = tuple(sorted([float(x) for x in dims]))
                     expected_dims_by_name[name.lower()] = sd
+                mesh_class = item.get("mesh_class")
+                if (
+                    name
+                    and item.get("mesh_id")
+                    and mesh_class in (None, "", "MeshPart")
+                    and item.get("wrap_target")
+                ):
+                    synth_preferred_targets.add(name.lower())
     if expected_dims_by_name:
         print(f"[RigImport] Loaded expected sizes for {len(expected_dims_by_name)} parts")
 
@@ -1049,7 +1120,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         if jname and not is_root:
             nodes_to_match.append((jname, node_transform, False))
         
-        if not is_root:
+        if allow_aux_renames and not is_root:
             for idx, aux_name in enumerate(aux_names):
                 if aux_name:
                     cf = aux_transforms[idx] if idx < len(aux_transforms) else None
@@ -1060,6 +1131,9 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     
     collect_nodes(rig_def)
     print(f"[RigImport] Collected {len(nodes_to_match)} nodes to match")
+
+    if synth_preferred_targets:
+        print(f"[RigImport] Hidden-body synthesis preferred for {len(synth_preferred_targets)} wrap targets")
     
     # Check if meshes already have names matching the rig bones
     # If so, use name-based matching. If not, use position-based matching.
@@ -1084,27 +1158,32 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     
     for target_name, transform, is_aux in nodes_to_match:
         # Skip parts already locked by fingerprint pass
-        if target_name.lower() in fp_matched_names:
+        target_lower = target_name.lower()
+        if target_lower in fp_matched_names:
             continue
         
         obj = None
         prefix = "AUX " if is_aux else ""
+        allow_position_fallback = not (target_lower in synth_preferred_targets and not is_aux)
         
         if use_name_matching:
             # Use name matching
             obj = match_by_name(target_name)
             if obj:
                 print(f"[RigImport] {prefix}'{target_name}' matched by NAME -> '{obj.name}'")
-            elif transform:
+            elif transform and allow_position_fallback:
                 obj = match_by_position(transform, target_name, allow_reserved_override=True)
                 if obj:
                     print(f"[RigImport] {prefix}'{target_name}' matched by POSITION -> '{obj.name}'")
         else:
             # Use position matching
-            if transform:
+            if transform and allow_position_fallback:
                 obj = match_by_position(transform, target_name)
                 if obj:
                     print(f"[RigImport] {prefix}'{target_name}' matched by POSITION -> '{obj.name}'")
+
+        if obj is None and transform and not allow_position_fallback:
+            print(f"[RigImport] {prefix}'{target_name}' skipped POSITION fallback -> synthesize hidden wrap target")
         
         if obj:
             current_base = _strip_suffix(obj.name)
@@ -1866,6 +1945,12 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 )
                 return {"CANCELLED"}
 
+            print(
+                f"[RigImport] import_ops build=2.4.6 export_version={meta_loaded.get('version', 'unknown')} "
+                f"has_skinned_mesh_metadata={_meta_has_skinned_meshes(meta_loaded)} "
+                f"has_filemesh_candidates={_meta_has_filemesh_candidates(meta_loaded)}"
+            )
+
             # --- WEAPON IMPORT PATH ---
             if meta_loaded.get("exportType") == "weapon":
                 weapon_name = meta_loaded.get("weaponName", "Weapon")
@@ -1933,6 +2018,45 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection, renamed_via_fp, fp_map, rig_scale, meta_loaded=meta_loaded)
             else:
                 print("[RigImport] Indexed rename succeeded, skipping fingerprint passes")
+
+            has_skinned_mesh_metadata = _meta_has_skinned_meshes(meta_loaded)
+            has_filemesh_candidates = _meta_has_filemesh_candidates(meta_loaded)
+            has_deform_bones = _rig_contains_deform_bones(meta_loaded.get("rig"))
+
+            print(
+                f"[RigImport] deform-detect has_deform_bones={has_deform_bones} "
+                f"has_skinned_mesh_metadata={has_skinned_mesh_metadata} "
+                f"has_filemesh_candidates={has_filemesh_candidates}"
+            )
+
+            if has_deform_bones or has_filemesh_candidates:
+                try:
+                    print("[RigImport] auto-generating armature for deform/filemesh-candidate rig")
+                    create_rig("LOCAL_YAXIS_EXTEND", ob.name)
+                    if has_skinned_mesh_metadata:
+                        print("[RigImport] automatic skinning path completed")
+                        self.report({"INFO"}, "skinned rig detected: armature generated and skinning applied")
+                    elif has_filemesh_candidates:
+                        print(
+                            "[RigImport] mesh file candidates detected without explicit Studio skinning signal; "
+                            "FileMesh parsing will determine whether weights can be reconstructed"
+                        )
+                    else:
+                        export_version = meta_loaded.get("version", "unknown")
+                        self.report(
+                            {"WARNING"},
+                            "deform rig detected and armature generated, but this export is missing skin metadata; "
+                            f"re-export from the updated studio plugin to reconstruct weights (export version: {export_version})",
+                        )
+                        print(
+                            "[RigImport] deform bones detected, but partAux has no mesh_id/has_skinning data; "
+                            f"skinning cannot be rebuilt from this export (version={export_version})"
+                        )
+                except Exception as exc:
+                    self.report(
+                        {"WARNING"},
+                        f"imported deform/skinned rig, but automatic armature generation failed: {exc}",
+                    )
 
             return {"FINISHED"}
         except KeyError as e:

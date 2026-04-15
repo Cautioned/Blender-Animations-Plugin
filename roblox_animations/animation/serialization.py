@@ -22,6 +22,171 @@ from ..core.utils import (
     iter_scene_objects,
 )
 from .easing import map_blender_to_roblox_easing
+from .face_controls import (
+    face_control_property_name,
+    is_face_control_bone,
+    load_facs_payload_from_armature,
+    property_group_control_state,
+)
+
+
+_ROBLOX_MAPPED_INTERPOLATIONS = {
+    "LINEAR",
+    "CONSTANT",
+    "CUBIC",
+    "BOUNCE",
+    "ELASTIC",
+}
+
+_FACE_CONTROL_FCURVE_RE = re.compile(r'^rbx_face_controls\.([A-Za-z0-9_]+)$')
+
+
+def _lookup_interp_for_frame(
+    interp_map: Optional[Dict[float, Tuple[Optional[str], Optional[str]]]],
+    frame: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    if not interp_map:
+        return None, None
+    cached = interp_map.get(frame)
+    if cached:
+        return cached
+    most_recent_frame = None
+    for kf_frame in interp_map.keys():
+        if kf_frame < frame and (most_recent_frame is None or kf_frame > most_recent_frame):
+            most_recent_frame = kf_frame
+    if most_recent_frame is not None:
+        return interp_map[most_recent_frame]
+    return None, None
+
+
+def _face_control_states_equal(
+    prev_state: Optional[Dict[str, float]],
+    next_state: Dict[str, float],
+    tol: float = 1e-6,
+) -> bool:
+    if prev_state is None:
+        return False
+    if prev_state.keys() != next_state.keys():
+        return False
+    for key, prev_value in prev_state.items():
+        if abs(prev_value - next_state.get(key, 0.0)) > tol:
+            return False
+    return True
+
+
+def _build_face_control_export_context(
+    armature_obj: "bpy.types.Object",
+    actions: Optional[Set["bpy.types.Action"]] = None,
+    action_slots: Optional[Dict["bpy.types.Action", Any]] = None,
+) -> Dict[str, Any]:
+    payload = load_facs_payload_from_armature(armature_obj)
+    if not payload:
+        return {
+            "enabled": False,
+            "control_names": [],
+            "animated_controls": set(),
+            "keyed_frames": set(),
+            "interpolation": {},
+            "face_bone_names": set(),
+        }
+
+    control_names = list(payload.get("face_control_names") or [])
+    property_to_control = {
+        face_control_property_name(control_name): control_name for control_name in control_names
+    }
+    keyed_frames: Set[float] = set()
+    animated_controls: Set[str] = set()
+    interpolation: Dict[str, Dict[float, Tuple[Optional[str], Optional[str]]]] = {}
+
+    for action in actions or set():
+        try:
+            fcurves = get_action_fcurves(action, slot=(action_slots or {}).get(action))
+        except Exception:
+            continue
+        for fcurve in fcurves:
+            match = _FACE_CONTROL_FCURVE_RE.match(getattr(fcurve, "data_path", ""))
+            if not match:
+                continue
+            control_name = property_to_control.get(match.group(1))
+            if not control_name:
+                continue
+            animated_controls.add(control_name)
+            interp_map = interpolation.setdefault(control_name, {})
+            for keyframe_point in getattr(fcurve, "keyframe_points", []):
+                frame = float(keyframe_point.co.x)
+                keyed_frames.add(frame)
+                interp_map[frame] = (
+                    getattr(keyframe_point, "interpolation", None),
+                    getattr(keyframe_point, "easing", None),
+                )
+
+    current_state = property_group_control_state(
+        getattr(armature_obj, "rbx_face_controls", None),
+        control_names,
+    )
+    has_nonzero_state = any(abs(value) > 1e-6 for value in current_state.values())
+
+    return {
+        "enabled": bool(animated_controls or has_nonzero_state),
+        "control_names": control_names,
+        "animated_controls": animated_controls,
+        "keyed_frames": keyed_frames,
+        "interpolation": interpolation,
+        "face_bone_names": set(payload.get("face_bone_names") or []),
+    }
+
+
+def _serialize_face_control_state_for_frame(
+    armature_obj: "bpy.types.Object",
+    export_context: Dict[str, Any],
+    frame: float,
+    last_state: Optional[Dict[str, float]] = None,
+    tol: float = 1e-6,
+) -> Tuple[Optional[Dict[str, Dict[str, Any]]], Dict[str, float]]:
+    control_names = export_context.get("control_names") or []
+    raw_state = property_group_control_state(
+        getattr(armature_obj, "rbx_face_controls", None),
+        control_names,
+    )
+    explicit_key = frame in (export_context.get("keyed_frames") or set())
+    changed = not _face_control_states_equal(last_state, raw_state, tol)
+    any_nonzero = any(abs(value) > tol for value in raw_state.values())
+    animated_controls = export_context.get("animated_controls") or set()
+
+    if not explicit_key and not changed and not any_nonzero:
+        return None, raw_state
+
+    if animated_controls:
+        export_names = [control_name for control_name in control_names if control_name in animated_controls]
+    else:
+        export_names = [control_name for control_name in control_names if abs(raw_state.get(control_name, 0.0)) > tol]
+        if not export_names and any_nonzero:
+            export_names = list(control_names)
+        if not export_names and changed and last_state is not None:
+            export_names = [
+                control_name
+                for control_name in control_names
+                if abs((last_state or {}).get(control_name, 0.0) - raw_state.get(control_name, 0.0)) > tol
+            ]
+
+    if not export_names and not explicit_key:
+        return None, raw_state
+
+    face_state = {}
+    interpolation = export_context.get("interpolation") or {}
+    for control_name in export_names:
+        interp, easing = _lookup_interp_for_frame(interpolation.get(control_name), frame)
+        if interp:
+            easing_style, easing_direction = map_blender_to_roblox_easing(interp, easing)
+        else:
+            easing_style, easing_direction = ("Linear", "Out")
+        face_state[control_name] = {
+            "value": float(raw_state.get(control_name, 0.0)),
+            "easingStyle": easing_style,
+            "easingDirection": easing_direction,
+        }
+
+    return (face_state or None), raw_state
 
 
 def is_deform_bone_rig(armature: "bpy.types.Object") -> bool:
@@ -56,6 +221,8 @@ def extract_bone_hierarchy(armature: "bpy.types.Object") -> Dict[str, Optional[s
         return hierarchy
 
     for bone in armature.data.bones:
+        if is_face_control_bone(bone):
+            continue
         if bone.parent:
             hierarchy[bone.name] = bone.parent.name
         else:
@@ -108,12 +275,16 @@ def serialize_animation_state(
     # Build a lookup for world-space bones and their original parents
     worldspace_bones: Dict[str, str] = {}  # bone_name -> original_parent_name
     for bone in pose_bones:
+        if is_face_control_bone(bone):
+            continue
         if bone.bone.get("worldspace_bone"):
             original_parent = bone.bone.get("worldspace_original_parent", "")
             if original_parent:
                 worldspace_bones[bone.name] = original_parent
 
     for bone in pose_bones:
+        if is_face_control_bone(bone):
+            continue
         has_motor6d_props = (
             "transform" in bone.bone
             and "transform1" in bone.bone
@@ -254,6 +425,7 @@ def serialize_deform_animation_state(
     scale_factor_cached: Optional[float] = None,
     static_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     state: Optional[Dict[str, List[float]]] = None,
+    excluded_bones: Optional[Set[str]] = None,
 ) -> Dict[str, List[float]]:
     """Serialize Deform Bone animation state with static caching"""
     state = state if state is not None else {}
@@ -281,6 +453,10 @@ def serialize_deform_animation_state(
     # Pre-populate cache for all non-Motor6D bones to simplify parent lookups
     bones_to_process = []
     for bone in ao.pose.bones:
+        if is_face_control_bone(bone):
+            continue
+        if excluded_bones and bone.name in excluded_bones:
+            continue
         # Exclude Motor6D bones from deform serialization
         if (
             "transform" in bone.bone
@@ -416,6 +592,7 @@ def serialize_combined_animation_state(
     static_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     motor_state_reuse: Optional[Dict[str, List[float]]] = None,
     deform_state_reuse: Optional[Dict[str, List[float]]] = None,
+    excluded_deform_bones: Optional[Set[str]] = None,
 ) -> Dict[str, List[float]]:
     """
     Serializes the animation state by running both Motor6D and Deform Bone
@@ -444,6 +621,7 @@ def serialize_combined_animation_state(
             scale_factor_cached,
             static_cache,
             deform_state_reuse,
+            excluded_deform_bones,
         )
         state.update(deform_state)
 
@@ -549,6 +727,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             and "transform1" in bone.bone
             and "nicetransform" in bone.bone
         )
+        and not is_face_control_bone(bone)
         for bone in ao_eval.pose.bones
     )
     settings = getattr(ctx.scene, "rbx_anim_settings", None)
@@ -611,6 +790,16 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
     if action is not None:
         action_slots[action] = action_slot
 
+    face_export_context = _build_face_control_export_context(
+        ao,
+        {action} if action is not None else set(),
+        action_slots,
+    )
+    export_face_controls = bool(face_export_context.get("enabled"))
+    excluded_face_bones = (
+        face_export_context.get("face_bone_names", set()) if export_face_controls else set()
+    )
+
     # consider constraints only if they actually affect bones (ik chains, copy, etc.)
     has_constraints = len(get_all_constrained_bones(ao)) > 0
     has_drivers = len(get_all_driven_bones(ao)) > 0
@@ -655,6 +844,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 shared_cache,
                 motor_state_reuse,
                 deform_state_reuse,
+                excluded_face_bones,
+            )
+            face_state, _ = _serialize_face_control_state_for_frame(
+                ao,
+                face_export_context,
+                float(i),
             )
 
             # Wrap the raw state in the same format as the hybrid baker for consistency.
@@ -663,7 +858,13 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             for bone_name, cframe_data in state.items():
                 wrapped_state[bone_name] = [cframe_data, "Linear", "Out"]
 
-            collected.append({"t": (i - frame_start) / fps, "kf": wrapped_state})
+            keyframe_payload: Dict[str, Any] = {
+                "t": (i - frame_start) / fps,
+                "kf": wrapped_state,
+            }
+            if face_state:
+                keyframe_payload["fc"] = face_state
+            collected.append(keyframe_payload)
 
         result = {"t": (frames - 1) / desired_fps, "kfs": collected}
 
@@ -704,6 +905,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     if match:
                         animated_bones.add(match.group(1))
 
+        face_export_context = _build_face_control_export_context(ao, all_actions, action_slots)
+        export_face_controls = bool(face_export_context.get("enabled"))
+        excluded_face_bones = (
+            face_export_context.get("face_bone_names", set()) if export_face_controls else set()
+        )
+
         # Also find bones driven by constrained targets and gather their actions
         for bone in ao.pose.bones:
             for c in bone.constraints:
@@ -739,6 +946,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         frame_start = ctx.scene.frame_start
         frame_end = ctx.scene.frame_end
         keyframe_times = {frame_start, frame_end}
+        keyframe_times.update(face_export_context.get("keyed_frames") or set())
 
         all_fcurves = []
         for act in all_actions:
@@ -760,14 +968,6 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         # Interpolations with direct Roblox easing style mappings in this exporter.
         # Any interpolation outside this set is treated as unsupported and
         # will be densely baked between keys for fidelity.
-        roblox_mapped_interpolations = {
-            "LINEAR",
-            "CONSTANT",
-            "CUBIC",
-            "BOUNCE",
-            "ELASTIC",
-        }
-
         for fcurve in all_fcurves:
             # determine bone name for this fcurve (if any)
             bone_name_for_curve = None
@@ -785,7 +985,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                 # frames between it and the next keyframe to accurately capture the curve.
                 # only densify segments that actually curve (deviate from linear)
                 if (
-                    kp.interpolation not in roblox_mapped_interpolations
+                    kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS
                     and i + 1 < len(fcurve.keyframe_points)
                 ):
                     next_kp = fcurve.keyframe_points[i + 1]
@@ -1053,7 +1253,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             """
             try:
                 for kp in getattr(fc, "keyframe_points", []):
-                    if kp.interpolation not in roblox_mapped_interpolations:
+                    if kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS:
                         return True
 
                 for mod in getattr(fc, "modifiers", []):
@@ -1251,6 +1451,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         motor_state_reuse: Dict[str, List[float]] = {}
         deform_state_reuse: Dict[str, List[float]] = {}
         last_baked_states: Dict[str, List[Any]] = {}
+        last_face_state: Optional[Dict[str, float]] = None
         current_full_pose: Dict[str, List[float]] = {}
         final_kf_state: Dict[str, List[Any]] = {}
 
@@ -1328,10 +1529,17 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     shared_cache,
                     motor_state_reuse,
                     deform_state_reuse,
+                    excluded_face_bones,
                 )
             )
             final_kf_state.clear()
             is_boundary_frame = frame == frame_start or frame == frame_end
+            face_kf_state, last_face_state = _serialize_face_control_state_for_frame(
+                ao,
+                face_export_context,
+                float(frame),
+                last_face_state,
+            )
 
             for bone_name in animated_bones:
                 bone_keyframes = per_bone_keyframes.get(bone_name)
@@ -1583,10 +1791,16 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                         held_state[2],
                     ]
 
-            if final_kf_state:
+            if final_kf_state or face_kf_state:
                 time_in_seconds = (frame - frame_start) / fps
                 # Store a copy of the frame state to avoid reuse mutation across frames
-                collected.append({"t": time_in_seconds, "kf": dict(final_kf_state)})
+                keyframe_payload: Dict[str, Any] = {
+                    "t": time_in_seconds,
+                    "kf": dict(final_kf_state),
+                }
+                if face_kf_state:
+                    keyframe_payload["fc"] = face_kf_state
+                collected.append(keyframe_payload)
                 collected_frames.append(frame)
                 for baked_bone, state in final_kf_state.items():
                     last_baked_states[baked_bone] = state
@@ -1620,10 +1834,12 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
         if len(collected) > 2:
 
             def _kf_states_equivalent(
-                prev_state: Dict[str, List[Any]],
-                new_state: Dict[str, List[Any]],
+                prev_keyframe: Dict[str, Any],
+                new_keyframe: Dict[str, Any],
                 tol: float = 1e-6,
             ) -> bool:
+                prev_state = prev_keyframe.get("kf", {})
+                new_state = new_keyframe.get("kf", {})
                 if prev_state.keys() != new_state.keys():
                     return False
 
@@ -1633,6 +1849,21 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                         return False
 
                     if not _bone_state_equivalent(prev_values, new_values, tol):
+                        return False
+
+                prev_fc = prev_keyframe.get("fc", {})
+                new_fc = new_keyframe.get("fc", {})
+                if prev_fc.keys() != new_fc.keys():
+                    return False
+                for control_name, prev_values in prev_fc.items():
+                    new_values = new_fc.get(control_name)
+                    if new_values is None:
+                        return False
+                    if prev_values.get("easingStyle") != new_values.get("easingStyle"):
+                        return False
+                    if prev_values.get("easingDirection") != new_values.get("easingDirection"):
+                        return False
+                    if abs(float(prev_values.get("value", 0.0)) - float(new_values.get("value", 0.0))) > tol:
                         return False
 
                 return True
@@ -1647,8 +1878,7 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
                     optimized_entries.append((kf_data, frame_idx))
                     continue
 
-                prev_kf_state = optimized_entries[-1][0]["kf"]
-                if not _kf_states_equivalent(prev_kf_state, kf_data["kf"]):
+                if not _kf_states_equivalent(optimized_entries[-1][0], kf_data):
                     optimized_entries.append((kf_data, frame_idx))
 
             optimized_entries.append((collected[-1], collected_frames[-1]))
@@ -1673,12 +1903,21 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             back_trans_cached,
             world_transform_cached,
             scale_factor_cached,
+            excluded_deform_bones=excluded_face_bones,
         )
         # For consistency with other code paths, wrap with default easing
         wrapped_state = {}
         for bone_name, cframe_data in state.items():
             wrapped_state[bone_name] = [cframe_data, "Linear", "Out"]
-        collected = [{"t": 0, "kf": wrapped_state}]
+        keyframe_payload: Dict[str, Any] = {"t": 0, "kf": wrapped_state}
+        face_state, _ = _serialize_face_control_state_for_frame(
+            ao,
+            face_export_context,
+            float(ctx.scene.frame_start),
+        )
+        if face_state:
+            keyframe_payload["fc"] = face_state
+        collected = [keyframe_payload]
         result = {"t": 0, "kfs": collected}
 
     if is_skinned_rig:
@@ -1715,11 +1954,20 @@ def serialize(ao: "bpy.types.Object") -> Dict[str, Any]:
             back_trans_cached,
             world_transform_cached,
             scale_factor_cached,
+            excluded_deform_bones=excluded_face_bones,
         )
         wrapped_state = {}
         for bone_name, cframe_data in state.items():
             wrapped_state[bone_name] = [cframe_data, "Linear", "Out"]
-        result["kfs"] = [{"t": 0, "kf": wrapped_state}]
+        keyframe_payload = {"t": 0, "kf": wrapped_state}
+        face_state, _ = _serialize_face_control_state_for_frame(
+            ao,
+            face_export_context,
+            float(ctx.scene.frame_start),
+        )
+        if face_state:
+            keyframe_payload["fc"] = face_state
+        result["kfs"] = [keyframe_payload]
         result["t"] = 0
 
     return result

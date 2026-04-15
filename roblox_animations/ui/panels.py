@@ -3,6 +3,11 @@ UI panels for the Roblox Animations Blender Addon.
 """
 
 import bpy
+from ..animation.face_controls import (
+    face_control_property_name,
+    grouped_face_controls,
+    load_facs_payload_from_armature,
+)
 from ..animation.serialization import is_deform_bone_rig
 from ..server.server import get_server_status
 from ..core.utils import get_object_by_name
@@ -78,6 +83,28 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             row.operator("object.stop_server", text="Stop Server", icon="PAUSE")
         settings = getattr(scene, "rbx_anim_settings", None)
         row.prop(settings, "rbx_server_port", text="")
+
+        # --- 2b. ROBLOX ACCOUNT ---
+        from ..core import auth  # noqa: PLC0415
+
+        account_box = layout.box()
+        account_box.label(text="Roblox Account", icon="USER")
+        account_box.prop(context.window_manager, "rbx_api_key_session", text="API Key")
+        account_box.label(text="Session only; never saved to disk.", icon="LOCKED")
+
+        if auth.is_login_in_progress():
+            account_box.label(text="Logging in…", icon="TIME")
+            account_box.operator("rbx.oauth_cancel_login", text="Cancel", icon="CANCEL")
+        elif auth.is_logged_in():
+            account_box.label(text="Authenticated", icon="CHECKMARK")
+            account_box.operator("rbx.oauth_logout", text="Log Out", icon="LOCKED")
+        else:
+            account_box.label(text="Not logged in (public assets only)", icon="INFO")
+            account_box.operator(
+                "rbx.oauth_login",
+                text="Log In to Roblox",
+                icon="LINKED",
+            )
 
         # --- 3. ARMATURE OPERATIONS ---
         layout.separator()
@@ -308,6 +335,34 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         # else:
         #     col.label(text="Motor-style Rig", icon="POSE_HLT")
 
+        facs_payload = load_facs_payload_from_armature(selected_armature)
+        facs_groups = grouped_face_controls(
+            (facs_payload or {}).get("face_control_names") or []
+        )
+        if facs_groups and settings:
+            face_box = inner_box.box()
+            header = face_box.row(align=True)
+            header.prop(
+                settings,
+                "rbx_face_controls_expanded",
+                text="Face Controls",
+                emboss=False,
+                icon="TRIA_DOWN" if settings.rbx_face_controls_expanded else "TRIA_RIGHT",
+            )
+            if settings.rbx_face_controls_expanded:
+                face_box.label(text="sliders drive decoded facs pose solves", icon="INFO")
+                face_props = selected_armature.rbx_face_controls
+                for group_label, control_names in facs_groups:
+                    group_box = face_box.box()
+                    group_box.label(text=group_label)
+                    group_col = group_box.column(align=True)
+                    for control_name in control_names:
+                        group_col.prop(
+                            face_props,
+                            face_control_property_name(control_name),
+                            slider=True,
+                        )
+
         # --- Animation Sub-panel ---
         animation_box = inner_box.box()
         col = animation_box.column()
@@ -324,11 +379,11 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col.operator("object.rbxanims_bake_file", text="Bake to File", icon="FILE")
 
         # # Add the force deform serialization checkbox for testing
-        # dev_box = inner_box.box()
+        dev_box = inner_box.box()
         # # Add test button to setup section so it's always visible
-        # dev_box.label(text="Developer Options", icon='SCRIPT')
-        # dev_box.separator()
-        # dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
+        dev_box.label(text="Developer Options", icon='SCRIPT')
+        dev_box.separator()
+        dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
 
         # --- Validation Sub-panel ---
         validation_box = inner_box.box()

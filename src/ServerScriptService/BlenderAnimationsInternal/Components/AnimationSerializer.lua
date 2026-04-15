@@ -20,7 +20,7 @@ local PROGRESS_YIELD_INTERVAL = 16384
 
 export type SerializedAnimation = {
 	t: number,
-	kfs: { { t: number, kf: { [string]: { components: { number }, easingStyle: string, easingDirection: string } } } },
+	kfs: { { t: number, kf: { [string]: { components: { number }, easingStyle: string, easingDirection: string } }, fc: { [string]: { value: number, easingStyle: string, easingDirection: string } }? } },
 	is_deform_rig: boolean,
 	is_deform_bone_rig: boolean,
 }
@@ -82,6 +82,7 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 		if kf:IsA("Keyframe") then
 			-- Pre-allocate state table as a proper dictionary
 			local state = {}
+			local faceState = {}
 			
 			-- Get descendants once and cache the result
 			local descendants = kf:GetDescendants()
@@ -96,22 +97,32 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 							easingDirection = pose.EasingDirection.Name,
 						}
 					end
+				elseif pose:IsA("NumberPose") then
+					faceState[pose.Name] = {
+						value = pose.Value,
+						easingStyle = "Linear",
+						easingDirection = "Out",
+					}
 				end
 			end
 			
-			-- Only add keyframe if it has poses
-			if next(state) then
+			-- Only add keyframe if it has transform poses or face controls
+			if next(state) or next(faceState) then
 				collectedCount += 1
-				collected[collectedCount] = { 
+				local serializedKeyframe = {
 					t = (kf :: any).Time - startTime, 
 					kf = state 
 				}
+				if next(faceState) then
+					(serializedKeyframe :: any).fc = faceState
+				end
+				collected[collectedCount] = serializedKeyframe
 			end
 		end
 	end
 
 	if collectedCount == 0 then
-		warn("Animation has no poses to serialize.")
+		warn("Animation has no poses or face controls to serialize.")
 		return nil
 	end
 

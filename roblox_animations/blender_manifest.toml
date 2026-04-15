@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 # Roblox Animations Blender Addon Manifest
 id = "roblox_animations_importer_exporter"
-version = "2.4.2"
+version = "2.5.0"
 name = "Roblox Animations Importer/Exporter"
 tagline = "Seamless animation workflow between Blender and Roblox Studio"
 maintainer = "Cautioned"
@@ -26,7 +26,6 @@ tags = ["Animation", "Import-Export", "Rigging"]
 
 # Permissions required by the addon
 [permissions]
-# I'm going to assume that localhost doesn't fall under network. Let me know if it does.
-# network = "Localhost HTTP server for live sync with Roblox Studio (no external connections)"
+network = "Fetch Roblox FileMesh assets for skinned mesh weight reconstruction during rig import"
 files = "Import/export Roblox rig models and animation files"
 clipboard = "Optionally used for import/export"
