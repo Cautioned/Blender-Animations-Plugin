@@ -18,11 +18,7 @@ class RbxAnimationsPreferences(AddonPreferences):
     bl_idname = __name__
 
     def draw(self, context):
-        layout = self.layout
-        layout.label(
-            text="Authentication is session-only and is never saved to disk.",
-            icon="LOCKED",
-        )
+        pass
 
 
 # Define bl_info directly to avoid import issues
@@ -117,7 +113,6 @@ CLASSES = tuple(cls for cls in _classes if cls is not None)
 
 
 def _safe_unregister_class(cls):
-    import bpy
 
     try:
         existing = getattr(bpy.types, cls.__name__, None)
@@ -131,7 +126,6 @@ def _safe_unregister_class(cls):
 
 
 def _safe_register_class(cls):
-    import bpy
 
     existing = getattr(bpy.types, cls.__name__, None)
     if existing:
@@ -165,7 +159,6 @@ def file_import_extend(self, context):
 
 def register():
     """Register the addon"""
-    import bpy
 
     try:
         # Register all classes
@@ -199,7 +192,6 @@ def register():
 
 def unregister():
     """Unregister the addon"""
-    import bpy
 
     try:
         # Clean up draw handlers first

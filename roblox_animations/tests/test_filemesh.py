@@ -238,6 +238,41 @@ def _make_v5_mesh():
     return b"version 5.00\n" + header + body
 
 
+def _make_v5_mesh_with_invalid_facs_format():
+    name_table = _make_name_table()
+    facs_block = _make_v5_facs_block()
+    header = struct.pack(
+        "<HHIIHHIHBBII",
+        32,
+        0,
+        2,
+        1,
+        1,
+        2,
+        len(name_table),
+        1,
+        0,
+        0,
+        2,
+        len(facs_block),
+    )
+    body = b"".join(
+        [
+            _make_vertex(0.0, 0.0, 0.0),
+            _make_vertex(1.0, 0.0, 0.0),
+            _make_skinning_block(),
+            _make_faces_block(),
+            struct.pack("<I", 0),
+            _make_bone(0),
+            _make_bone(5),
+            name_table,
+            _make_subset(),
+            facs_block,
+        ]
+    )
+    return b"version 5.00\n" + header + body
+
+
 def _make_v6_mesh():
     name_table = _make_name_table()
     coremesh = b"".join(
@@ -434,17 +469,23 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(parsed["num_high_quality_lods"], 1)
         self.assertEqual(parsed["lod_offsets"], [0, 24])
 
-    def test_parse_v7_skinning_without_positions(self):
-        parsed = parse_filemesh(_make_v7_mesh())
-        self.assertEqual(parsed["version"], "version 7.00")
-        self.assertIsNone(parsed["positions"])
-        self.assertEqual(parsed["faces"], [])
-        self.assertEqual(parsed["num_vertices"], 2)
-        self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
-        self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
+    def test_parse_v7_requires_draco_geometry(self):
+        with mock.patch.object(filemesh, "_load_blender_draco_dll", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "draco decoder is unavailable"):
+                parse_filemesh(_make_v7_mesh())
 
     def test_parse_v7_reads_lods_chunk_metadata(self):
-        parsed = parse_filemesh(_make_v7_mesh_with_lods())
+        decoded_vertices = [
+            {"position": (0.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (0.0, 0.0)},
+            {"position": (1.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (1.0, 0.0)},
+        ]
+
+        with mock.patch.object(
+            filemesh,
+            "_decode_draco_coremesh_v2",
+            return_value=(decoded_vertices, [(0, 1, 1)], 2),
+        ):
+            parsed = parse_filemesh(_make_v7_mesh_with_lods())
 
         self.assertEqual(parsed["lod_type"], 3)
         self.assertEqual(parsed["num_high_quality_lods"], 2)
@@ -515,6 +556,15 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertAlmostEqual(brow_corrective["rotation"][0], expected_channels["rx"][1][4], places=3)
         self.assertEqual(brow_corrective["rotation"][1], expected_channels["ry"][1][4])
         self.assertAlmostEqual(brow_corrective["rotation"][2], expected_channels["rz"][1][4], places=4)
+
+    def test_parse_v5_ignores_unsupported_facs_format(self):
+        parsed = parse_filemesh(_make_v5_mesh_with_invalid_facs_format())
+
+        self.assertFalse(parsed["has_facs"])
+        self.assertEqual(parsed["face_bone_names"], [])
+        self.assertEqual(parsed["face_control_names"], [])
+        self.assertEqual(parsed["facs_data"]["format"], 2)
+        self.assertIn("unsupported facs data format", parsed["facs_data"]["parse_error"])
 
     def test_parse_v6_facs_chunk(self):
         parsed = parse_filemesh(_make_v6_mesh_with_facs())

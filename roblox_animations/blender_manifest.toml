@@ -26,6 +26,6 @@ tags = ["Animation", "Import-Export", "Rigging"]
 
 # Permissions required by the addon
 [permissions]
-network = "Fetch Roblox FileMesh assets for skinned mesh weight reconstruction during rig import"
+network = "Roblox OAuth and FileMesh asset requests"
 files = "Import/export Roblox rig models and animation files"
 clipboard = "Optionally used for import/export"

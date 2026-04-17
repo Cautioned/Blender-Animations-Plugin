@@ -116,6 +116,7 @@ def generate_state() -> str:
 
 def _token_post(url: str, data: dict) -> dict:
     """POST application/x-www-form-urlencoded to a token endpoint, return JSON."""
+    _require_online_access("contact Roblox")
     encoded = urllib.parse.urlencode(data).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -151,6 +152,22 @@ def _get_window_manager():
         return bpy.context.window_manager
     except Exception:
         return None
+
+
+def is_online_access_allowed() -> bool:
+    try:
+        import bpy  # noqa: PLC0415
+
+        return bool(getattr(bpy.app, "online_access", True))
+    except Exception:
+        return True
+
+
+def _require_online_access(action: str) -> None:
+    if not is_online_access_allowed():
+        raise RuntimeError(
+            f"Blender online access is disabled. Enable Online Access to {action}."
+        )
 
 
 def _get_client_id() -> str:
@@ -415,6 +432,8 @@ def start_login_async() -> None:
     at all (the error is also stored in ``_login_result["error"]`` for the timer).
     """
     global _login_thread
+
+    _require_online_access("authenticate with Roblox")
 
     client_id = _get_client_id()
     if not client_id:

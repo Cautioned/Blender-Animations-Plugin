@@ -177,13 +177,8 @@ def _annotate_weapon_original_parents(joints_tree, attachment_parent_name, attac
             if joint_name:
                 assignments[joint_name] = best_parent_name
 
-        next_candidates = list(candidates)
-        node_part_world = _get_joint_part_world_matrix(node)
-        if joint_name and node_part_world is not None:
-            next_candidates.append((joint_name, node_part_world))
-
         for child in node.get("children", []) or []:
-            recurse(child, next_candidates)
+            recurse(child, candidates)
 
     recurse(joints_tree, [(attachment_parent_name, attachment_parent_transform)])
     return assignments
@@ -1319,6 +1314,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         used.add(obj)
     
     matched_count = 0
+    locked_match_count = 0
     unmatched_names = []
     pending_renames = []  # List of (obj, target_name)
     matched_objects = []  # List of (obj, target_name)
@@ -1379,6 +1375,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         # Skip parts already locked by fingerprint pass
         target_lower = target_name.lower()
         if target_lower in fp_matched_names:
+            locked_match_count += 1
             continue
         
         obj = None
@@ -1449,7 +1446,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         obj.name = target_name
     
     print("[RigImport] " + "="*50)
-    print(f"[RigImport] SUMMARY: {matched_count} parts renamed, {len(unmatched_names)} unmatched")
+    print(f"[RigImport] SUMMARY: {matched_count} parts renamed, {locked_match_count} prelocked, {len(unmatched_names)} unmatched")
     if unmatched_names:
         print(f"[RigImport] Unmatched parts: {unmatched_names}")
 
@@ -1492,7 +1489,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
             updated_fp_map[obj.name] = obj
         meta_loaded["_fingerprint_object_map"] = updated_fp_map
 
-    return matched_count > 0
+    return bool(matched_objects or locked_match_count)
 
 
 def _parts_list_from_rig_def(rig_def):

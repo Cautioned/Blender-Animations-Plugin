@@ -2,7 +2,6 @@
 Operators for Roblox OAuth 2.0 authentication.
 """
 
-import bpy
 from bpy.types import Operator
 
 
@@ -23,6 +22,8 @@ class OBJECT_OT_RbxOAuthLogin(Operator):
                 {"INFO"},
                 "Browser opened for Roblox login — waiting for callback…",
             )
+        except RuntimeError as exc:
+            self.report({"ERROR"}, str(exc))
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
         except Exception as exc:
@@ -34,7 +35,11 @@ class OBJECT_OT_RbxOAuthLogin(Operator):
     def poll(cls, context):
         from ..core import auth
 
-        return not auth.is_login_in_progress() and not auth.is_logged_in()
+        return (
+            auth.is_online_access_allowed()
+            and not auth.is_login_in_progress()
+            and not auth.is_logged_in()
+        )
 
 
 class OBJECT_OT_RbxOAuthCancelLogin(Operator):

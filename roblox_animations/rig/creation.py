@@ -13,7 +13,7 @@ from ..animation.face_controls import (
     store_facs_payload_on_armature,
 )
 from ..core.constants import get_transform_to_blender
-from .cage_solver import build_mesh_vertices, link_targets_to_sources_by_position, link_vertices_by_position, link_vertices_by_uv, solve_two_stage_cage_deformation
+from .cage_solver import build_mesh_vertices, link_targets_to_sources_by_position, link_vertices_by_uv, solve_two_stage_cage_deformation
 from .filemesh import fetch_and_parse_filemesh
 from ..core.utils import (
     cf_to_mat,

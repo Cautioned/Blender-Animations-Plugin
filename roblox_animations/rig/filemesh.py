@@ -97,6 +97,16 @@ def _empty_facs_metadata() -> dict:
     }
 
 
+def _unsupported_facs_metadata(raw_size: int, facs_format: int, message: str) -> dict:
+    metadata = _empty_facs_metadata()
+    metadata["facs_data"] = {
+        "raw_size": raw_size,
+        "format": facs_format,
+        "parse_error": message,
+    }
+    return metadata
+
+
 def _split_null_terminated_names(blob: bytes) -> List[str]:
     if not blob:
         return []
@@ -499,12 +509,29 @@ def _looks_like_filemesh_payload(data: bytes) -> bool:
     return data.startswith(b"version ")
 
 
+def _is_online_access_allowed() -> bool:
+    try:
+        import bpy  # noqa: PLC0415
+
+        return bool(getattr(bpy.app, "online_access", True))
+    except Exception:
+        return True
+
+
+def _require_online_access(action: str) -> None:
+    if not _is_online_access_allowed():
+        raise RuntimeError(
+            f"Blender online access is disabled. Enable Online Access to {action}."
+        )
+
+
 def _fetch_url_response(
     url: str,
     timeout: float = 15.0,
     follow_redirects: bool = True,
     extra_headers: Optional[Dict[str, str]] = None,
 ):
+    _require_online_access("fetch Roblox mesh data")
     headers: Dict[str, str] = {
         "User-Agent": "RobloxStudio/WinInet",
         "Accept": "*/*",
@@ -954,9 +981,10 @@ def _infer_v4_vertex_size(total_len: int, offset: int, num_verts: int, num_faces
 
 
 def _parse_v4_or_v5(data: bytes, version: str, offset: int) -> dict:
+    facs_format = 0
     if version.startswith("version 5"):
         header = struct.unpack_from("<HHIIHHIHBBII", data, offset)
-        header_size, lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, hq_lods, _unused, _facs_format, facs_size = header
+        header_size, lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, hq_lods, _unused, facs_format, facs_size = header
     else:
         header = struct.unpack_from("<HHIIHHIHBB", data, offset)
         header_size, lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, hq_lods, _unused = header
@@ -990,7 +1018,16 @@ def _parse_v4_or_v5(data: bytes, version: str, offset: int) -> dict:
     bones = _attach_bone_names(bones, bone_names)
     subsets, offset = _parse_subsets(data, offset, num_subsets)
     vertex_weights = _resolve_vertex_weights(num_verts, skinning, subsets, bone_names)
-    facs_metadata = _parse_facs_data(data[offset : offset + facs_size]) if facs_size > 0 else _empty_facs_metadata()
+    facs_metadata = _empty_facs_metadata()
+    if facs_size > 0:
+        if facs_format == 1:
+            facs_metadata = _parse_facs_data(data[offset : offset + facs_size])
+        elif facs_format != 0:
+            facs_metadata = _unsupported_facs_metadata(
+                facs_size,
+                int(facs_format),
+                f"unsupported facs data format {facs_format}",
+            )
 
     return {
         "version": version,
@@ -1139,17 +1176,17 @@ def _decode_draco_coremesh_v2(chunk: bytes) -> Optional[Tuple[List[dict], List[T
 
     dll = _load_blender_draco_dll()
     if dll is None:
-        return None
+        raise RuntimeError("draco decoder is unavailable for version 7 coremesh")
 
     bitstream = chunk[4 : 4 + draco_bitstream_size]
     bitstream_buffer = ctypes.create_string_buffer(bitstream, len(bitstream))
     decoder = dll.decoderCreate()
     if not decoder:
-        return None
+        raise RuntimeError("failed to create draco decoder for version 7 coremesh")
 
     try:
         if not dll.decoderDecode(decoder, bitstream_buffer, len(bitstream)):
-            return None
+            raise RuntimeError("failed to decode draco bitstream for version 7 coremesh")
 
         vertex_count = int(dll.decoderGetVertexCount(decoder))
         index_count = int(dll.decoderGetIndexCount(decoder))
@@ -1185,7 +1222,7 @@ def _decode_draco_coremesh_v2(chunk: bytes) -> Optional[Tuple[List[dict], List[T
         )
 
         if positions is None:
-            return None
+            raise RuntimeError("draco coremesh did not expose a position attribute")
 
         faces: List[Tuple[int, int, int]] = []
         if index_count > 0 and dll.decoderReadIndices(decoder, _GLTF_COMPONENT_TYPE_UINT32):
@@ -1286,9 +1323,7 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
         if chunk_type == "COREMESH" and chunk_version == 1:
             vertices, faces, num_vertices = _parse_coremesh_v1(chunk_data)
         elif chunk_type == "COREMESH" and chunk_version == 2:
-            decoded = _decode_draco_coremesh_v2(chunk_data)
-            if decoded is not None:
-                vertices, faces, num_vertices = decoded
+            vertices, faces, num_vertices = _decode_draco_coremesh_v2(chunk_data)
         elif chunk_type == "SKINNING" and chunk_version == 1:
             skinning_data = _parse_skinning_chunk(chunk_data)
             num_vertices = max(num_vertices, skinning_data["num_vertices"])
@@ -1300,6 +1335,9 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
             lod_metadata = _parse_lods_chunk(chunk_data)
         elif chunk_type == "FACS" and chunk_version == 1:
             facs_metadata = _parse_facs_chunk(chunk_data)
+
+    if version.startswith("version 7") and vertices is None:
+        raise RuntimeError("version 7 filemesh could not decode draco coremesh data")
 
     if not vertex_weights and num_vertices > 0:
         vertex_weights = [{} for _ in range(num_vertices)]
