@@ -2,7 +2,15 @@
 UI panels for the Roblox Animations Blender Addon.
 """
 
+from pathlib import Path
+
 import bpy
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
 from ..animation.face_controls import (
     face_control_property_name,
     grouped_face_controls,
@@ -11,6 +19,29 @@ from ..animation.face_controls import (
 from ..animation.serialization import is_deform_bone_rig
 from ..server.server import get_server_status
 from ..core.utils import get_object_by_name
+
+
+def _load_addon_version_text():
+    manifest_path = Path(__file__).resolve().parent.parent / "blender_manifest.toml"
+    try:
+        with manifest_path.open("rb") as manifest_file:
+            if tomllib is not None:
+                manifest_data = tomllib.load(manifest_file)
+                return str(manifest_data.get("version", "unknown"))
+    except Exception:
+        pass
+
+    try:
+        for line in manifest_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version ="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+ADDON_VERSION_TEXT = _load_addon_version_text()
 
 
 class OBJECT_PT_RbxAnimations(bpy.types.Panel):
@@ -28,6 +59,10 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+
+        version_row = layout.row()
+        version_row.alignment = "RIGHT"
+        version_row.label(text=f"v{ADDON_VERSION_TEXT}")
 
         # --- 1. SETUP & IMPORT ---
         setup_box = layout.box()
@@ -89,6 +124,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
 
         account_box = layout.box()
         account_box.label(text="Roblox Account", icon="USER")
+        online_access_allowed = auth.is_online_access_allowed()
 
         if auth.is_login_in_progress():
             account_box.label(text="Logging in…", icon="TIME")
@@ -96,8 +132,17 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         elif auth.is_logged_in():
             account_box.label(text="Authenticated", icon="CHECKMARK")
             account_box.operator("rbx.oauth_logout", text="Log Out", icon="LOCKED")
+        elif not online_access_allowed:
+            account_box.label(text="Online access is disabled in Blender preferences.", icon="ERROR")
+            login_row = account_box.row()
+            login_row.enabled = False
+            login_row.operator(
+                "rbx.oauth_login",
+                text="Log In to Roblox",
+                icon="LINKED",
+            )
         else:
-            account_box.label(text="Not logged in", icon="INFO")
+            account_box.label(text="Not logged in, required for deform/skinned rigs.", icon="INFO")
             account_box.operator(
                 "rbx.oauth_login",
                 text="Log In to Roblox",
@@ -376,12 +421,12 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         col.operator("object.rbxanims_bake", text="Bake (Clipboard)", icon="EXPORT")
         col.operator("object.rbxanims_bake_file", text="Bake to File", icon="FILE")
 
-        # # Add the force deform serialization checkbox for testing
-        dev_box = inner_box.box()
-        # # Add test button to setup section so it's always visible
-        dev_box.label(text="Developer Options", icon='SCRIPT')
-        dev_box.separator()
-        dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
+        # # # Add the force deform serialization checkbox for testing
+        # dev_box = inner_box.box()
+        # # # Add test button to setup section so it's always visible
+        # dev_box.label(text="Developer Options", icon='SCRIPT')
+        # dev_box.separator()
+        # dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
 
         # --- Validation Sub-panel ---
         validation_box = inner_box.box()

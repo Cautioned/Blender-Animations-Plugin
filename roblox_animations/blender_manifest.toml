@@ -2,7 +2,7 @@ schema_version = "1.0.0"
 
 # Roblox Animations Blender Addon Manifest
 id = "roblox_animations_importer_exporter"
-version = "2.5.0"
+version = "2.5.1"
 name = "Roblox Animations Importer/Exporter"
 tagline = "Seamless animation workflow between Blender and Roblox Studio"
 maintainer = "Cautioned"
@@ -26,6 +26,6 @@ tags = ["Animation", "Import-Export", "Rigging"]
 
 # Permissions required by the addon
 [permissions]
-network = "Fetch Roblox FileMesh assets for skinned mesh weight reconstruction during rig import"
+network = "Roblox OAuth and FileMesh asset requests"
 files = "Import/export Roblox rig models and animation files"
 clipboard = "Optionally used for import/export"

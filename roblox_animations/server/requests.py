@@ -32,12 +32,24 @@ transform_to_blender = bpy_extras.io_utils.axis_conversion(
 
 def _get_reported_bone_parent_name(bone):
     bone_data = getattr(bone, "bone", bone)
-    original_parent = bone_data.get("rbx_original_parent", "") if bone_data else ""
+    original_parent = bone_data.get("rbx_original_parent", "") if bone_data is not None else ""
     if isinstance(original_parent, str) and original_parent:
         return original_parent
 
     parent = getattr(bone, "parent", None)
-    return parent.name if parent else None
+    if parent is None:
+        return None
+
+    parent_name = getattr(parent, "name", None)
+    if isinstance(parent_name, str) and parent_name:
+        return parent_name
+
+    parent_bone = getattr(parent, "bone", None)
+    parent_bone_name = getattr(parent_bone, "name", None)
+    if isinstance(parent_bone_name, str) and parent_bone_name:
+        return parent_bone_name
+
+    return None
 
 
 def process_pending_requests():

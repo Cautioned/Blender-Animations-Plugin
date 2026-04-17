@@ -4,14 +4,41 @@ import unittest
 from unittest import mock
 
 from ..animation.face_controls import (
+    apply_facs_properties_to_armature,
     compute_facs_bone_transforms,
     compute_facs_state_weights,
     face_control_property_name,
     facs_payload_from_mesh_data,
     grouped_face_controls,
 )
+from ..ui import properties as ui_properties
 from ..rig import filemesh
 from ..rig.filemesh import extract_asset_id, parse_filemesh
+
+
+class _FakeFaceControls:
+    def __init__(self, **values):
+        for key, value in values.items():
+            setattr(self, key, value)
+
+
+class _FakePoseBone:
+    def __init__(self):
+        self.rotation_mode = "QUATERNION"
+        self.location = (0.0, 0.0, 0.0)
+        self.rotation_euler = (0.0, 0.0, 0.0)
+
+
+class _FakePose:
+    def __init__(self, bones):
+        self.bones = bones
+
+
+class _FakeArmature:
+    def __init__(self, face_controls, face_bones):
+        self.type = "ARMATURE"
+        self.rbx_face_controls = face_controls
+        self.pose = _FakePose(face_bones)
 
 
 def _make_vertex(px, py, pz):
@@ -238,6 +265,41 @@ def _make_v5_mesh():
     return b"version 5.00\n" + header + body
 
 
+def _make_v5_mesh_with_invalid_facs_format():
+    name_table = _make_name_table()
+    facs_block = _make_v5_facs_block()
+    header = struct.pack(
+        "<HHIIHHIHBBII",
+        32,
+        0,
+        2,
+        1,
+        1,
+        2,
+        len(name_table),
+        1,
+        0,
+        0,
+        2,
+        len(facs_block),
+    )
+    body = b"".join(
+        [
+            _make_vertex(0.0, 0.0, 0.0),
+            _make_vertex(1.0, 0.0, 0.0),
+            _make_skinning_block(),
+            _make_faces_block(),
+            struct.pack("<I", 0),
+            _make_bone(0),
+            _make_bone(5),
+            name_table,
+            _make_subset(),
+            facs_block,
+        ]
+    )
+    return b"version 5.00\n" + header + body
+
+
 def _make_v6_mesh():
     name_table = _make_name_table()
     coremesh = b"".join(
@@ -434,17 +496,23 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(parsed["num_high_quality_lods"], 1)
         self.assertEqual(parsed["lod_offsets"], [0, 24])
 
-    def test_parse_v7_skinning_without_positions(self):
-        parsed = parse_filemesh(_make_v7_mesh())
-        self.assertEqual(parsed["version"], "version 7.00")
-        self.assertIsNone(parsed["positions"])
-        self.assertEqual(parsed["faces"], [])
-        self.assertEqual(parsed["num_vertices"], 2)
-        self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
-        self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
+    def test_parse_v7_requires_draco_geometry(self):
+        with mock.patch.object(filemesh, "_load_blender_draco_dll", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "draco decoder is unavailable"):
+                parse_filemesh(_make_v7_mesh())
 
     def test_parse_v7_reads_lods_chunk_metadata(self):
-        parsed = parse_filemesh(_make_v7_mesh_with_lods())
+        decoded_vertices = [
+            {"position": (0.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (0.0, 0.0)},
+            {"position": (1.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (1.0, 0.0)},
+        ]
+
+        with mock.patch.object(
+            filemesh,
+            "_decode_draco_coremesh_v2",
+            return_value=(decoded_vertices, [(0, 1, 1)], 2),
+        ):
+            parsed = parse_filemesh(_make_v7_mesh_with_lods())
 
         self.assertEqual(parsed["lod_type"], 3)
         self.assertEqual(parsed["num_high_quality_lods"], 2)
@@ -515,6 +583,15 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertAlmostEqual(brow_corrective["rotation"][0], expected_channels["rx"][1][4], places=3)
         self.assertEqual(brow_corrective["rotation"][1], expected_channels["ry"][1][4])
         self.assertAlmostEqual(brow_corrective["rotation"][2], expected_channels["rz"][1][4], places=4)
+
+    def test_parse_v5_ignores_unsupported_facs_format(self):
+        parsed = parse_filemesh(_make_v5_mesh_with_invalid_facs_format())
+
+        self.assertFalse(parsed["has_facs"])
+        self.assertEqual(parsed["face_bone_names"], [])
+        self.assertEqual(parsed["face_control_names"], [])
+        self.assertEqual(parsed["facs_data"]["format"], 2)
+        self.assertIn("unsupported facs data format", parsed["facs_data"]["parse_error"])
 
     def test_parse_v6_facs_chunk(self):
         parsed = parse_filemesh(_make_v6_mesh_with_facs())
@@ -599,6 +676,72 @@ class TestFileMeshParsing(unittest.TestCase):
                 ("Other", ["UnknownControl"]),
             ],
         )
+
+    def test_apply_facs_properties_reapplies_held_state_on_new_frame(self):
+        jaw_bone = _FakePoseBone()
+        armature = _FakeArmature(
+            _FakeFaceControls(rbx_facs_jaw_drop=1.0),
+            {"FaceJaw": jaw_bone},
+        )
+        payload = {
+            "face_bone_names": ["FaceJaw"],
+            "face_control_names": ["JawDrop"],
+            "facs_pose_names": ["JawDrop"],
+            "two_pose_correctives": [],
+            "three_pose_correctives": [],
+            "bone_pose_transforms": {
+                "FaceJaw": {
+                    "JawDrop": {
+                        "position": (1.0, 2.0, 3.0),
+                        "rotation": (0.0, 0.0, 10.0),
+                    }
+                }
+            },
+        }
+
+        apply_facs_properties_to_armature(
+            armature,
+            payload=payload,
+            persist_state=False,
+            apply_token=("frame", 10.0),
+        )
+        self.assertEqual(jaw_bone.location, (1.0, 2.0, 3.0))
+
+        jaw_bone.location = (0.0, 0.0, 0.0)
+        jaw_bone.rotation_euler = (0.0, 0.0, 0.0)
+
+        apply_facs_properties_to_armature(
+            armature,
+            payload=payload,
+            persist_state=False,
+            apply_token=("frame", 11.0),
+        )
+
+        self.assertEqual(jaw_bone.location, (1.0, 2.0, 3.0))
+        self.assertAlmostEqual(jaw_bone.rotation_euler[2], 0.17453292519943295)
+
+    def test_depsgraph_face_controls_handler_applies_driver_updates(self):
+        scene = mock.Mock()
+        scene.frame_current_final = 12.0
+        armature = mock.Mock()
+
+        previous_sequence = ui_properties._FACE_CONTROL_DEPSGRAPH_SEQUENCE
+        previous_guard = ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING
+        ui_properties._FACE_CONTROL_DEPSGRAPH_SEQUENCE = 0
+        ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING = False
+        try:
+            with mock.patch.object(ui_properties, "iter_active_facs_armatures", return_value=[armature]):
+                with mock.patch.object(ui_properties, "apply_facs_properties_to_armature") as apply_mock:
+                    ui_properties._depsgraph_face_controls_handler(scene, mock.Mock())
+
+            apply_mock.assert_called_once()
+            _, kwargs = apply_mock.call_args
+            self.assertFalse(kwargs["persist_state"])
+            self.assertEqual(kwargs["apply_token"][0], "depsgraph")
+            self.assertEqual(kwargs["apply_token"][2], ("frame", 12.0))
+        finally:
+            ui_properties._FACE_CONTROL_DEPSGRAPH_SEQUENCE = previous_sequence
+            ui_properties._FACE_CONTROL_DEPSGRAPH_APPLYING = previous_guard
 
     def test_parse_gzipped_filemesh(self):
         parsed = parse_filemesh(gzip.compress(_make_v4_mesh()))

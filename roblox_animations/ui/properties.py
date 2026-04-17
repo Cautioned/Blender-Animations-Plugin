@@ -23,6 +23,10 @@ from ..core.utils import armature_items, get_object_by_name
 from ..core.constants import DEFAULT_SERVER_PORT
 
 
+_FACE_CONTROL_DEPSGRAPH_SEQUENCE = 0
+_FACE_CONTROL_DEPSGRAPH_APPLYING = False
+
+
 def _on_gravity_update(self, context):
     """Callback when gravity is changed - re-analyze physics if enabled."""
     try:
@@ -79,10 +83,50 @@ def _on_face_control_update(self, context):
     _apply_face_controls_from_properties(getattr(self, "id_data", None))
 
 
+def _face_control_frame_apply_token(scene):
+    if scene is None:
+        return None
+    try:
+        return ("frame", float(scene.frame_current_final))
+    except Exception:
+        pass
+    try:
+        return ("frame", int(scene.frame_current), float(getattr(scene, "frame_subframe", 0.0)))
+    except Exception:
+        return None
+
+
+def _face_control_depsgraph_apply_token(scene):
+    global _FACE_CONTROL_DEPSGRAPH_SEQUENCE
+    _FACE_CONTROL_DEPSGRAPH_SEQUENCE += 1
+    return ("depsgraph", _FACE_CONTROL_DEPSGRAPH_SEQUENCE, _face_control_frame_apply_token(scene))
+
+
 @persistent
 def _frame_change_face_controls_handler(scene):
+    apply_token = _face_control_frame_apply_token(scene)
     for obj in iter_active_facs_armatures():
-        apply_facs_properties_to_armature(obj, persist_state=False)
+        apply_facs_properties_to_armature(obj, persist_state=False, apply_token=apply_token)
+
+
+@persistent
+def _depsgraph_face_controls_handler(scene, depsgraph):
+    global _FACE_CONTROL_DEPSGRAPH_APPLYING
+
+    if _FACE_CONTROL_DEPSGRAPH_APPLYING:
+        return
+
+    active_armatures = list(iter_active_facs_armatures())
+    if not active_armatures:
+        return
+
+    apply_token = _face_control_depsgraph_apply_token(scene)
+    _FACE_CONTROL_DEPSGRAPH_APPLYING = True
+    try:
+        for obj in active_armatures:
+            apply_facs_properties_to_armature(obj, persist_state=False, apply_token=apply_token)
+    finally:
+        _FACE_CONTROL_DEPSGRAPH_APPLYING = False
 
 
 class RobloxFaceControlState(PropertyGroup):
@@ -220,11 +264,15 @@ def register_properties():
     )
     if _frame_change_face_controls_handler not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(_frame_change_face_controls_handler)
+    if _depsgraph_face_controls_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_depsgraph_face_controls_handler)
 
 
 def unregister_properties():
     if _frame_change_face_controls_handler in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(_frame_change_face_controls_handler)
+    if _depsgraph_face_controls_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_depsgraph_face_controls_handler)
     if hasattr(bpy.types.Object, "rbx_face_controls"):
         del bpy.types.Object.rbx_face_controls
     if hasattr(bpy.types.Scene, "rbx_anim_settings"):
