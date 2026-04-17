@@ -342,7 +342,7 @@ function Rig:buildBoneHierarchy(allBones)
 			local parentInstance = bone.Parent
 			local parentPart = nil
 			if parentInstance then
-				parentPart = self:FindRigPartByInstance(parentInstance) or self:FindRigPart(parentInstance.Name)
+				parentPart = self:FindRigPartByInstance(parentInstance)
 			end
 
 			if parentPart then
@@ -392,7 +392,7 @@ function Rig:GetRigParts()
         if not visited[current] then
             visited[current] = true
 		
-            for _, child in pairs(current.children) do
+			for _, child in ipairs(current.children) do
 			parts[#parts + 1] = child
                 stack[#stack + 1] = child
             end
@@ -613,7 +613,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 						if parentPart then
 							-- Remove from current parent's children
 							if bonePart.parent then
-								for i, child in pairs(bonePart.parent.children) do
+								for i, child in ipairs(bonePart.parent.children) do
 									if child == bonePart then
 										table.remove(bonePart.parent.children, i)
 										break

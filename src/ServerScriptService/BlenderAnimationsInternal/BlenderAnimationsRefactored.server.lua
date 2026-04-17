@@ -53,7 +53,6 @@ local Fusion = require(Packages.Fusion)
 
 local New = Fusion.New
 local Children = Fusion.Children
-local OnChange = Fusion.OnChange
 local OnEvent = Fusion.OnEvent
 local Value = Fusion.Value
 local Computed = Fusion.Computed
@@ -133,10 +132,6 @@ local function cleanupAll()
 
 	-- 2. Disconnect UI-related connections
 	cameraManager:cleanup()
-	if State.selectionConnection then
-		State.selectionConnection:Disconnect()
-		State.selectionConnection = nil
-	end
 
 	-- 4. Reset state variables
 	State.loadingEnabled:set(false)
@@ -149,6 +144,8 @@ local function cleanupAll()
 	State.keyframeStats:set({ count = 0, totalDuration = 0 })
 	State.playhead:set(0)
 	State.keyframeNames:set({})
+	State.savedAnimations:set({})
+	State.selectedSavedAnim:set(nil)
 	State.activeRigModel = nil
 	State.activeAnimator = nil
 	State.activeRig = nil
@@ -166,7 +163,7 @@ end
 local function cleanupRigSelection()
 	-- This function is a subset of cleanupAll, intended for when a rig is deselected.
 	-- It resets rig-specific state without killing the Blender connection.
-	playbackService:stopAnimationAndDisconnect( { background = true } )
+	playbackService:stopAnimationAndDisconnect( { background = false } )
 
 	-- Reset state variables related to the rig
 	State.loadingEnabled:set(false)
@@ -179,6 +176,8 @@ local function cleanupRigSelection()
 	State.keyframeStats:set({ count = 0, totalDuration = 0 })
 	State.playhead:set(0)
 	State.keyframeNames:set({})
+	State.savedAnimations:set({})
+	State.selectedSavedAnim:set(nil)
 	State.activeRigModel = nil
 	State.activeAnimator = nil
 	State.activeRig = nil
@@ -370,16 +369,7 @@ do -- Creates the plugin
 					enableButton:SetActive(isEnabled)
 				end
 				if isEnabled then
-					if not State.selectionConnection or not State.selectionConnection.Connected then
-						State.selectionConnection = Selection.SelectionChanged:Connect(updateActiveRigFromSelection)
-					end
 					updateActiveRigFromSelection()
-				else
-					if State.selectionConnection then
-						State.selectionConnection:Disconnect()
-						State.selectionConnection = nil
-					end
-					cleanupAll()
 				end
 				return nil
 			end) :: any
@@ -681,6 +671,24 @@ do -- Creates the plugin
 		_MoreTab = makeTabFrame("More", tabContent.More),
 	}
 
+	local function handleMainWidgetEnabledChanged(isEnabled: boolean)
+		if not isEnabled then
+			cleanupAll()
+		end
+		if State.widgetsEnabled:get() ~= isEnabled then
+			(State.widgetsEnabled :: any):set(isEnabled)
+		end
+		if isEnabled then
+			updateActiveRigFromSelection()
+		end
+	end
+
+	local function handleHelpWidgetEnabledChanged(isEnabled: boolean)
+		if State.helpWidgetEnabled:get() ~= isEnabled then
+			(State.helpWidgetEnabled :: any):set(isEnabled)
+		end
+	end
+
 	-- Create the main widget
 	local function pluginWidget()
 		return Widget({
@@ -693,10 +701,6 @@ do -- Creates the plugin
 			FloatingSize = Vector2.new(250, 600),
 			MinimumSize = Vector2.new(250, 600),
 			Enabled = State.widgetsEnabled,
-			[OnChange("Enabled")] = function(isEnabled)
-				(State.widgetsEnabled :: any):set(isEnabled)
-				updateActiveRigFromSelection()
-			end,
 			[Children] = New("Frame")({
 				Size = UDim2.fromScale(1, 1),
 				BackgroundTransparency = 1,
@@ -734,10 +738,16 @@ do -- Creates the plugin
 	end
 
 	-- Create the main widget with tab content
-		pluginWidget()
+	local mainWidget = pluginWidget()
+	table.insert(State.connections, mainWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		handleMainWidgetEnabledChanged(mainWidget.Enabled)
+	end))
+	mainWidget:BindToClose(function()
+		handleMainWidgetEnabledChanged(false)
+	end)
 	
 	-- Create the help widget
-	local _helpWidget = Widget({
+	local helpWidget = Widget({
 		Plugin = Plugin,
 		Id = "BlenderAnimationsHelp",
 		Name = "IMPORTANT READ ME!!!",
@@ -747,9 +757,6 @@ do -- Creates the plugin
 		FloatingSize = Vector2.new(400, 500),
 		MinimumSize = Vector2.new(400, 500),
 		Enabled = State.helpWidgetEnabled,
-		[OnChange("Enabled")] = function(isEnabled)
-			(State.helpWidgetEnabled :: any):set(isEnabled)
-		end,
 		[Children] = {
 			New("UIPadding")({
 				PaddingLeft = UDim.new(0, 10),
@@ -801,10 +808,17 @@ do -- Creates the plugin
 			}),
 		},
 	})
+	table.insert(State.connections, helpWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
+		handleHelpWidgetEnabledChanged(helpWidget.Enabled)
+	end))
+	helpWidget:BindToClose(function()
+		handleHelpWidgetEnabledChanged(false)
+	end)
 end
 
--- Always listen for selection changes
-table.insert(State.connections, Selection.SelectionChanged:Connect(updateActiveRigFromSelection))
+if not State.selectionConnection or not State.selectionConnection.Connected then
+	State.selectionConnection = Selection.SelectionChanged:Connect(updateActiveRigFromSelection)
+end
 
 -- Tab hotkey (Tab / Shift+Tab) to cycle tabs
 table.insert(

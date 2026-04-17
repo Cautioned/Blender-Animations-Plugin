@@ -36,6 +36,37 @@ local function meshPartHasSkinning(meshPart: MeshPart): boolean
 	return ok and hasSkinnedMesh == true
 end
 
+local function instanceHasAccessoryAncestor(inst: Instance?): boolean
+	local current = inst
+	while current do
+		if current:IsA("Accessory") or current:IsA("Accoutrement") then
+			return true
+		end
+		current = current.Parent
+	end
+	return false
+end
+
+local function modelHasSkinnedAccessories(root: Instance?): boolean
+	if not root then
+		return false
+	end
+
+	for _, desc in ipairs(root:GetDescendants()) do
+		if desc:IsA("MeshPart") and meshPartHasSkinning(desc) and instanceHasAccessoryAncestor(desc) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function waitBeforeExportSelectionIfNeeded(root: Instance?)
+	if modelHasSkinnedAccessories(root) then
+		task.wait(1.5)
+	end
+end
+
 local function cfComponents(cf: CFrame): { number }
 	return { cf:GetComponents() }
 end
@@ -149,6 +180,40 @@ local function getWrapTargetData(meshPart: MeshPart): any?
 	return data
 end
 
+local function getAccessoryAncestor(inst: Instance?): Instance?
+	local current = inst
+	while current do
+		if current:IsA("Accessory") or current:IsA("Accoutrement") then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+local function sanitizeHandleExportName(name: string): string
+	local sanitized = string.gsub(name, "[^%w]", "")
+	if sanitized ~= "" then
+		return sanitized
+	end
+	return name
+end
+
+local function getExportPartName(part: BasePart, sourceInst: BasePart?): string
+	local sourcePart = sourceInst or part
+	if sourcePart.Name == "Handle" then
+		local accessoryAncestor = getAccessoryAncestor(sourcePart)
+		if accessoryAncestor then
+			return sanitizeHandleExportName(accessoryAncestor.Name)
+		end
+	end
+	return sourcePart.Name
+end
+
+function ExportManager:getExportPartName(part: BasePart, sourceInst: BasePart?): string
+	return getExportPartName(part, sourceInst)
+end
+
 function ExportManager:reencodeJointMetadata(
 	rigNode: any,
 	partEncodeMap: { [Instance]: string },
@@ -182,6 +247,15 @@ function ExportManager:reencodeJointMetadata(
 	local originalJname = rigNode.jname
 	local jointType = rigNode.jointType
 	local isWeld = jointType == "Weld" or jointType == "WeldConstraint"
+
+	-- When a weld joint is named "Handle" (or "Handle"), use the canonical
+	-- exported part name instead so Blender gets a meaningful bone name.
+	if originalJname and isWeld and originalJname:lower():sub(1, 6) == "handle" then
+		local canonicalName = partEncodeMap[rigNode.inst]
+		if canonicalName and canonicalName:lower():sub(1, 6) ~= "handle" then
+			originalJname = sanitizeHandleExportName(canonicalName)
+		end
+	end
 
 	if originalJname and isWeld then
 		local uniqueJname = originalJname
@@ -230,6 +304,7 @@ function ExportManager:generateMetadata(rigModelToExport: Types.RigModelType, or
 			local originalInst = originalMap[desc]
 			local sourceInst = (originalInst or desc) :: BasePart
 			local originalSize = sourceInst.Size
+			desc.Name = getExportPartName(desc, sourceInst)
 
 			-- Verify (Optional, but good for debugging if ever needed)
 			-- if originalInst and originalInst.Name ~= desc.Name then warn("Mismatch mapping?") end
@@ -341,6 +416,7 @@ function ExportManager:generateMetadataLegacy(
 			local originalInst = originalMap[desc]
 			local sourceInst = (originalInst or desc) :: BasePart
 			local originalSize = sourceInst.Size
+			desc.Name = getExportPartName(desc, sourceInst)
 
 			-- IMPORTANT: Uniquify names even for Legacy export to prevent collision ambiguities
 			-- The user can rename them back in Blender if they really want duplicates, but for matching we need unique keys.
@@ -507,6 +583,7 @@ function ExportManager:exportRig()
 	task.wait()
 	
 	game.Selection:Set(State.metaParts)
+	waitBeforeExportSelectionIfNeeded(rigModelToExport)
 	PluginManager():ExportSelection() -- deprecated
 end
 
@@ -958,7 +1035,10 @@ function ExportManager:exportWeapon()
 
 		-- get original name from the original part
 		local origPart = cloneToOriginal[part]
-		local origName = if origPart then origPart.Name else part.Name
+		local sourceOrigPart = if origPart and origPart:IsA("BasePart") then (origPart :: BasePart) else nil
+		local exportName = getExportPartName(part, sourceOrigPart)
+		part.Name = exportName
+		local origName = exportName
 		originalNameMap[part] = origName
 
 		-- uniquify (clone may have duplicates)
@@ -1157,6 +1237,7 @@ function ExportManager:exportWeapon()
 	local attachmentCount = if gripData.weaponAttachments then #gripData.weaponAttachments else 0
 	print(("[ExportManager] Exporting weapon '%s' (%d parts, %s Motor6Ds, %d attachment roots)")
 		:format(gripData.weaponName, partCount, hasMotor6Ds and "with" or "no", attachmentCount))
+	waitBeforeExportSelectionIfNeeded(weaponClone)
 	PluginManager():ExportSelection()
 end
 
@@ -1247,6 +1328,7 @@ function ExportManager:exportRigLegacy()
 	task.wait()
 	
 	game.Selection:Set(State.metaParts)
+	waitBeforeExportSelectionIfNeeded(rigModelToExport)
 	PluginManager():ExportSelection() -- deprecated
 end
 

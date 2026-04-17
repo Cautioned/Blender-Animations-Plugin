@@ -569,7 +569,7 @@ function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean, 
 	local ok, result = pcall(self.loadAnim, self, text, isBinary, progressContext:child(0, 0.95))
 	if ok then
 		local success, rigResult = pcall(self.loadRig, self, nil, progressContext:child(0.95, 1))
-		if success then
+		if success and rigResult ~= false then
 			progressContext:set(
 				1,
 				"Animation loaded",
@@ -662,11 +662,58 @@ local function applyBoneWeights(sequence: KeyframeSequence, rig: any)
 	end
 end
 
+local function syncRigAnimationFromKeyframeSequence(animationSerializerService, rig: any, sequence: KeyframeSequence)
+	local animData = animationSerializerService:serialize(sequence, rig)
+	if not animData then
+		error("Failed to serialize KeyframeSequence for rig sync.")
+	end
+
+	rig:LoadAnimation(animData)
+end
+
+local function ensureActiveRigReady(progressContext: LoadingProgressContext?): boolean
+	if State.activeRig then
+		return true
+	end
+
+	local rigModel = State.activeRigModel or State.lastKnownRigModel
+	if not rigModel then
+		warn("No rig model available to rebuild active rig.")
+		return false
+	end
+
+	local rigManager = State.rigManager
+	if not rigManager or type(rigManager.setRig) ~= "function" then
+		warn("RigManager unavailable; cannot rebuild active rig.")
+		return false
+	end
+
+	if progressContext then
+		progressContext:set(0.05, "Preparing rig preview", "rebuilding selected rig", false)
+	end
+
+	local ok, err = pcall(function()
+		rigManager:setRig(rigModel)
+	end)
+	if not ok then
+		warn("Failed to rebuild active rig:", err)
+		return false
+	end
+
+	if not State.activeRig then
+		warn("Active rig is still unavailable after rebuild.")
+		return false
+	end
+
+	return true
+end
+
 function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressContext: LoadingProgressContext?)
 	self.playbackService:stopAnimationAndDisconnect()
 
-	if not State.activeRig then
-		error("No active rig available")
+	if not ensureActiveRigReady(progressContext) then
+		warn("No active rig available")
+		return false
 	end
 
 	local kfs: KeyframeSequence
@@ -708,7 +755,7 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressCo
 
 	-- Ensure the rig holds the loaded animation data so saving back to rig works (even for CurveAnimation-derived clips)
 	pcall(function()
-		State.activeRig:LoadAnimation(kfs)
+		syncRigAnimationFromKeyframeSequence(self.animationSerializerService, State.activeRig, kfs)
 	end)
 
 	-- Detect torso animation data on R6 rigs
@@ -1121,7 +1168,9 @@ function AnimationManager:playSavedAnimation(animation)
 		return
 	end
 
-	self:loadRig(keyframeSequence)
+	if self:loadRig(keyframeSequence) == false then
+		warn("Failed to play saved animation because the active rig is not ready yet.")
+	end
 end
 
 function AnimationManager:importAnimationsBulk()

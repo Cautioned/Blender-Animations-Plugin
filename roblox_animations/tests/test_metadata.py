@@ -3,9 +3,13 @@ import unittest
 import mathutils
 import importlib
 from ..core import utils
+from ..operators import import_ops
+from ..server import requests
 
 # Reload utils to ensure we test the latest version
 importlib.reload(utils)
+importlib.reload(import_ops)
+importlib.reload(requests)
 
 class TestBoneMetadata(unittest.TestCase):
     def setUp(self):
@@ -137,4 +141,104 @@ class TestBoneMetadata(unittest.TestCase):
             del self.pose_bone.bone["is_transformable"]
         val_missing = self.pose_bone.bone.get("is_transformable", False)
         self.assertFalse(bool(val_missing))
+
+    def test_annotate_weapon_original_parents_prefers_real_motor_parent(self):
+        right_hand_world = [
+            1.5, 0.0, -2.2750000953674316,
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ]
+        joints_tree = {
+            "jname": "Grip",
+            "transform": [
+                1.4680471420288086, -0.19142484664916992, -1.9057445526123047,
+                5.4569682106375694e-12, 1.6370904631912708e-11, -1.0,
+                -1.0235978731287787e-12, -1.0, 1.6370904631912708e-11,
+                -1.0, -1.0235978731287787e-12, 5.4569682106375694e-12,
+            ],
+            "jointtransform0": [
+                -0.031952857971191406, -0.24796056747436523, -0.19142484664916992,
+                5.4569682106375694e-12, 1.6370904631912708e-11, -1.0,
+                1.0, 1.0235978731287787e-12, -5.4569682106375694e-12,
+                -1.0235978731287787e-12, -1.0, 1.6370904631912708e-11,
+            ],
+            "jointtransform1": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            "children": [
+                {
+                    "jname": "Base",
+                    "transform": [
+                        1.4604473114013672, -0.07422494888305664, -0.7596445679664612,
+                        5.4569682106375694e-12, 1.6370904631912708e-11, -1.0,
+                        -1.0235978731287787e-12, -1.0, 1.6370904631912708e-11,
+                        -1.0, -1.0235978731287787e-12, 5.4569682106375694e-12,
+                    ],
+                    "jointtransform0": [
+                        -1.1461000442504883, -0.11719989776611328, 0.007599830627441406,
+                        1.0, 0.0, 0.0,
+                        0.0, 1.0, 0.0,
+                        0.0, 0.0, 1.0,
+                    ],
+                    "jointtransform1": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    "children": [
+                        {
+                            "jname": "Bullets",
+                            "transform": [
+                                1.4574470520019531, -0.6325249671936035, -0.9844445586204529,
+                                5.4569682106375694e-12, 1.6370904631912708e-11, -1.0,
+                                -1.0235978731287787e-12, -1.0, 1.6370904631912708e-11,
+                                -1.0, -1.0235978731287787e-12, 5.4569682106375694e-12,
+                            ],
+                            "jointtransform0": [
+                                0.2247999906539917, 0.5583000183105469, 0.0030002593994140625,
+                                1.0, 0.0, 0.0,
+                                0.0, 1.0, 0.0,
+                                0.0, 0.0, 1.0,
+                            ],
+                            "jointtransform1": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                            "children": [],
+                        }
+                    ],
+                }
+            ],
+        }
+
+        assignments = import_ops._annotate_weapon_original_parents(
+            joints_tree,
+            "RightHand",
+            utils.to_matrix(right_hand_world),
+        )
+
+        self.assertEqual(assignments["Grip"], "RightHand")
+        self.assertEqual(assignments["Base"], "RightHand")
+        self.assertEqual(assignments["Bullets"], "RightHand")
+        self.assertEqual(joints_tree["children"][0]["originalParentBone"], "RightHand")
+        self.assertEqual(joints_tree["children"][0]["children"][0]["originalParentBone"], "RightHand")
+
+    def test_get_reported_bone_parent_name_prefers_preserved_motor_parent(self):
+        class DummyBone(dict):
+            def __init__(self, name, parent=None, **props):
+                super().__init__(props)
+                self.name = name
+                self.parent = parent
+
+        class DummyPoseBone:
+            def __init__(self, bone, parent=None):
+                self.bone = bone
+                self.parent = parent
+
+        right_hand = DummyBone("RightHand")
+        grip = DummyBone("Grip", parent=right_hand)
+        handguard = DummyBone("Handguard", parent=grip, rbx_original_parent="RightHand")
+
+        self.assertEqual(requests._get_reported_bone_parent_name(handguard), "RightHand")
+        self.assertEqual(
+            requests._get_reported_bone_parent_name(DummyPoseBone(handguard, parent=DummyPoseBone(grip))),
+            "RightHand",
+        )
+        self.assertEqual(requests._get_reported_bone_parent_name(grip), "RightHand")
+
+    def test_real_data_bone_can_store_preserved_motor_parent(self):
+        self.pose_bone.bone["rbx_original_parent"] = "RightHand"
+        self.assertEqual(requests._get_reported_bone_parent_name(self.pose_bone), "RightHand")
 

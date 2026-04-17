@@ -132,6 +132,36 @@ return function()
 			expect(foundHead).to.equal(true)
 		end)
 
+		it("should not attach a bone to the wrong same-named disconnected part", function()
+			local body = Instance.new("MeshPart")
+			body.Name = "Body"
+			body.Parent = mock_rig
+
+			local bodyMotor = Instance.new("Motor6D")
+			bodyMotor.Name = "BodyMotor"
+			bodyMotor.Part0 = mock_rig.PrimaryPart
+			bodyMotor.Part1 = body
+			bodyMotor.Parent = mock_rig.PrimaryPart
+
+			local disconnectedContainer = Instance.new("Folder")
+			disconnectedContainer.Name = "Detached"
+			disconnectedContainer.Parent = mock_rig
+
+			local disconnectedBody = Instance.new("MeshPart")
+			disconnectedBody.Name = "Body"
+			disconnectedBody.Parent = disconnectedContainer
+
+			local detachedBone = Instance.new("Bone")
+			detachedBone.Name = "DetachedBone"
+			detachedBone.Parent = disconnectedBody
+
+			local rig = rig_module.new(mock_rig)
+
+			expect(rig:FindRigPartByInstance(detachedBone)).to.never.be.ok()
+			expect(rig:FindRigPart("DetachedBone")).to.never.be.ok()
+			expect(rig:FindRigPartByInstance(body)).to.be.ok()
+		end)
+
 		it("should prefer animated torso and head parts over welded visual duplicates", function()
 			local torso = mock_rig:FindFirstChild("Torso")
 			local head = mock_rig:FindFirstChild("Head")

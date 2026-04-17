@@ -2,7 +2,14 @@
 --!strict
 
 -- Type definitions for the new type solver
-export type Connection = RBXScriptConnection
+export type Connection = {
+	Disconnect: (self: Connection) -> (),
+	Connected: boolean?,
+}
+
+export type SignalLike = {
+	Connect: (self: SignalLike, callback: (...any) -> ()) -> Connection,
+}
 
 export type AnimationTrackType = {
 	TimePosition: number,
@@ -13,7 +20,7 @@ export type AnimationTrackType = {
 	Stop: (self: AnimationTrackType, fadeTime: number?) -> (),
 	Destroy: (self: AnimationTrackType) -> (),
 	Play: (self: AnimationTrackType) -> (),
-	Stopped: RBXScriptSignal,
+	Stopped: SignalLike,
 	Name: string?,
 }
 

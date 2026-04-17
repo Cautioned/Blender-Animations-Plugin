@@ -44,6 +44,7 @@ return function()
 			playback = PlaybackService.new(State, Types)
 			mockRig, _ = buildRigWithJoints()
 			State.activeRigModel = mockRig
+			State.lastKnownRigModel = mockRig
 			State.heartbeat = { conn = nil }
 			State.currentAnimTrack = nil
 			State.activeAnimator = nil
@@ -54,9 +55,16 @@ return function()
 				mockRig:Destroy()
 			end
 			State.activeRigModel = nil
+			State.lastKnownRigModel = nil
 			State.currentAnimTrack = nil
 			State.activeAnimator = nil
 			State.heartbeat = { conn = nil }
+			State.isPlaying:set(false)
+			State.isFinished:set(false)
+			State.isReversed:set(false)
+			State.isPlaying:set(false)
+			State.isFinished:set(false)
+			State.isReversed:set(false)
 		end)
 
 		describe("stopAnimationAndDisconnect", function()
@@ -154,6 +162,47 @@ return function()
 				rig:Destroy()
 			end)
 
+			it("should reset AnimationConstraint transforms to identity synchronously", function()
+				local rig = Instance.new("Model")
+				rig.Name = "ConstraintRig"
+				rig.Parent = workspace
+
+				local torso = Instance.new("Part")
+				torso.Name = "Torso"
+				torso.Parent = rig
+				rig.PrimaryPart = torso
+
+				local arm = Instance.new("Part")
+				arm.Name = "Arm"
+				arm.Parent = rig
+
+				local attachment0 = Instance.new("Attachment")
+				attachment0.Name = "Shoulder0"
+				attachment0.Parent = torso
+
+				local attachment1 = Instance.new("Attachment")
+				attachment1.Name = "Shoulder1"
+				attachment1.Parent = arm
+
+				local joint = Instance.new("AnimationConstraint")
+				joint.Name = "Shoulder"
+				joint.Attachment0 = attachment0
+				joint.Attachment1 = attachment1
+				joint.Transform = CFrame.new(6, 6, 6) * CFrame.Angles(0.2, 0.3, 0.4)
+				joint.Parent = torso
+
+				State.activeRigModel = rig
+
+				playback:stopAnimationAndDisconnect()
+
+				local pos = joint.Transform.Position
+				expect(pos.X).to.be.near(0, 0.001)
+				expect(pos.Y).to.be.near(0, 0.001)
+				expect(pos.Z).to.be.near(0, 0.001)
+
+				rig:Destroy()
+			end)
+
 			it("should reset joints even when background = true", function()
 				local _, motors = buildRigWithJoints()
 				local rig = motors[1].Parent.Parent :: Model
@@ -180,6 +229,134 @@ return function()
 				-- just verify state is cleaned up
 				playback:stopAnimationAndDisconnect()
 				expect(State.currentAnimTrack).to.never.be.ok()
+			end)
+
+			it("should stop the live track synchronously before clearing state", function()
+				local stopCalled = false
+				local speedAdjusted = false
+				State.currentAnimTrack = {
+					AdjustSpeed = function(_, speed)
+						speedAdjusted = (speed == 0)
+					end,
+					Stop = function(_, fadeTime)
+						stopCalled = (fadeTime == 0)
+					end,
+				}
+
+				playback:stopAnimationAndDisconnect({ background = true })
+
+				expect(speedAdjusted).to.equal(true)
+				expect(stopCalled).to.equal(true)
+				expect(State.currentAnimTrack).to.never.be.ok()
+			end)
+
+			it("should stop animator tracks even when currentAnimTrack is missing", function()
+				local track1Stopped = false
+				local track2Stopped = false
+				local track1 = {
+					AdjustSpeed = function() end,
+					Stop = function(_, fadeTime)
+						track1Stopped = (fadeTime == 0)
+					end,
+				}
+				local track2 = {
+					AdjustSpeed = function() end,
+					Stop = function(_, fadeTime)
+						track2Stopped = (fadeTime == 0)
+					end,
+				}
+				State.currentAnimTrack = nil
+				State.activeAnimator = {
+					IsA = function(_, className)
+						return className == "Humanoid"
+					end,
+					FindFirstChildOfClass = function(_, className)
+						if className == "Animator" then
+							return {
+								GetPlayingAnimationTracks = function()
+									return { track1, track2 }
+								end,
+							}
+						end
+						return nil
+					end,
+				}
+
+				playback:stopAnimationAndDisconnect({ background = true })
+
+				expect(track1Stopped).to.equal(true)
+				expect(track2Stopped).to.equal(true)
+			end)
+
+			it("should disconnect heartbeat immediately even when background = true", function()
+				local disconnected = false
+				State.heartbeat = {
+					conn = {
+						Connected = true,
+						Disconnect = function()
+							disconnected = true
+						end,
+					},
+				}
+
+				playback:stopAnimationAndDisconnect({ background = true })
+
+				expect(disconnected).to.equal(true)
+				expect(State.heartbeat.conn).to.never.be.ok()
+			end)
+
+			it("should clear finished state when stopping animation", function()
+				State.isFinished:set(true)
+
+				playback:stopAnimationAndDisconnect({ background = true })
+
+				expect(State.isFinished:get()).to.equal(false)
+				expect(State.isPlaying:get()).to.equal(false)
+			end)
+
+			it("should reset the last known rig when activeRigModel is already nil", function()
+				local _, motors = buildRigWithJoints()
+				local rig = motors[1].Parent.Parent :: Model
+				State.activeRigModel = nil
+				State.lastKnownRigModel = rig
+
+				for _, motor in motors do
+					motor.Transform = CFrame.new(8, 8, 8)
+				end
+
+				playback:stopAnimationAndDisconnect()
+
+				for _, motor in motors do
+					expect(motor.Transform.Position.X).to.be.near(0, 0.001)
+				end
+
+				rig:Destroy()
+			end)
+
+			it("should flush the animator pose after resetting transforms", function()
+				local steppedDelta = nil
+				State.activeAnimator = {
+					IsA = function(_, className)
+						return className == "Humanoid"
+					end,
+					FindFirstChildOfClass = function(_, className)
+						if className == "Animator" then
+							return {
+								GetPlayingAnimationTracks = function()
+									return {}
+								end,
+								StepAnimations = function(_, delta)
+									steppedDelta = delta
+								end,
+							}
+						end
+						return nil
+					end,
+				}
+
+				playback:stopAnimationAndDisconnect()
+
+				expect(steppedDelta).to.equal(0)
 			end)
 
 			it("should not error when no rig or animator exists", function()
@@ -330,6 +507,74 @@ return function()
 				expect(function()
 					playback:disconnectHeartbeat()
 				end).to.never.throw()
+			end)
+		end)
+
+		describe("delayed replay", function()
+			it("should replay an unlooped animation after 1 second", function()
+				local playCalls = 0
+				local adjustSpeeds = {}
+				local mockTrack = {
+					Length = 1,
+					TimePosition = 1,
+					Play = function(self)
+						playCalls += 1
+						self.TimePosition = 0
+					end,
+					AdjustSpeed = function(_, speed)
+						table.insert(adjustSpeeds, speed)
+					end,
+				}
+
+				State.currentAnimTrack = mockTrack :: any
+				State.animationLength:set(1)
+				State.loopAnimation:set(false)
+				State.isPlaying:set(true)
+				State.heartbeat = { conn = nil }
+
+				playback._playbackToken = 123
+
+				playback:_scheduleDelayedReplay(123, function()
+					if State.currentAnimTrack ~= mockTrack then
+						return
+					end
+					mockTrack.TimePosition = 0
+					mockTrack:Play()
+					mockTrack:AdjustSpeed(1)
+					State.isPlaying:set(true)
+					State.isReversed:set(false)
+					State.isFinished:set(false)
+				end)
+
+				task.wait(1.1)
+
+				expect(playCalls).to.equal(1)
+				expect(adjustSpeeds[#adjustSpeeds]).to.equal(1)
+				expect(State.isPlaying:get()).to.equal(true)
+				expect(State.isFinished:get()).to.equal(false)
+			end)
+
+			it("should cancel a delayed replay when cleanup runs", function()
+				local playCalls = 0
+				local mockTrack = {
+					AdjustSpeed = function() end,
+					Stop = function() end,
+					Play = function()
+						playCalls += 1
+					end,
+				}
+
+				State.currentAnimTrack = mockTrack :: any
+				playback._playbackToken = 456
+
+				playback:_scheduleDelayedReplay(456, function()
+					mockTrack:Play()
+				end)
+
+				playback:stopAnimationAndDisconnect()
+				task.wait(1.1)
+
+				expect(playCalls).to.equal(0)
 			end)
 		end)
 	end)

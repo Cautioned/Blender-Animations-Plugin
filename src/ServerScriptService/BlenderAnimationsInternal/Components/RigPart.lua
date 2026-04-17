@@ -69,6 +69,56 @@ local function getRigPartPriority(bone: Bone?, joint: Instance?): number
 	return 0
 end
 
+type TraversalJointInfo = {
+	joint: CacheableJoint,
+	otherPart: BasePart?,
+	priority: number,
+	otherPartName: string,
+	className: string,
+	jointName: string,
+}
+
+local function getOtherConnectedPart(part: Instance, joint: CacheableJoint): BasePart?
+	local part0, part1 = getJointParts(joint)
+	if part0 == part then
+		return part1
+	end
+	if part1 == part then
+		return part0
+	end
+	return nil
+end
+
+local function getSortedTraversalJoints(part: Instance, joints: { CacheableJoint }?): { TraversalJointInfo }
+	local infos: { TraversalJointInfo } = {}
+	for _, joint in ipairs(joints or {}) do
+		local otherPart = getOtherConnectedPart(part, joint)
+		table.insert(infos, {
+			joint = joint,
+			otherPart = otherPart,
+			priority = getRigPartPriority(nil, joint),
+			otherPartName = if otherPart then otherPart:GetFullName() else "",
+			className = joint.ClassName,
+			jointName = joint.Name,
+		})
+	end
+
+	table.sort(infos, function(left, right)
+		if left.priority ~= right.priority then
+			return left.priority > right.priority
+		end
+		if left.otherPartName ~= right.otherPartName then
+			return left.otherPartName < right.otherPartName
+		end
+		if left.className ~= right.className then
+			return left.className < right.className
+		end
+		return left.jointName < right.jointName
+	end)
+
+	return infos
+end
+
 local function isAccessoryPart(inst: Instance): boolean
 	local current: Instance? = inst
 	while current do
@@ -185,12 +235,12 @@ function RigPart.new(
 			-- Traditional joint (Motor6D/Weld/WeldConstraint/AnimationConstraint)
 			local joint: CacheableJoint? = connectingJoint :: CacheableJoint?
 			if not joint and rig._jointCache and rig._jointCache[part] then
-				for _, candidate in ipairs(rig._jointCache[part]) do
+				for _, candidateInfo in ipairs(getSortedTraversalJoints(part, rig._jointCache[part])) do
+					local candidate = candidateInfo.joint
 					local candidatePart0, candidatePart1 = getJointParts(candidate)
-					if candidatePart0 == parent.part and candidatePart1 == part then
-						joint = candidate
-						break
-					elseif candidatePart1 == parent.part and candidatePart0 == part then
+					local matchesParentChild = (candidatePart0 == parent.part and candidatePart1 == part)
+						or (candidatePart1 == parent.part and candidatePart0 == part)
+					if matchesParentChild then
 						joint = candidate
 						break
 					end
@@ -232,20 +282,12 @@ function RigPart.new(
 	end
 
 	-- Always look for joint-connected children (Motor6D/Weld/WeldConstraint)
-	for _, joint in pairs(rig._jointCache[part] or {}) do
-		local part0, part1 = getJointParts(joint)
-		if part0 and part1 then
-			local subpart
-			if part0 == part then
-				subpart = part1
-			elseif part1 == part then
-				subpart = part0
-			end
-			if subpart and (not parent or subpart ~= parent.part) then
-				local child = RigPart.new(rig, subpart, self, isDeformRig, joint, state)
-				if child then
-					table.insert(self.children, child)
-				end
+	for _, jointInfo in ipairs(getSortedTraversalJoints(part, rig._jointCache[part])) do
+		local subpart = jointInfo.otherPart
+		if subpart and (not parent or subpart ~= parent.part) then
+			local child = RigPart.new(rig, subpart, self, isDeformRig, jointInfo.joint, state)
+			if child then
+				table.insert(self.children, child)
 			end
 		end
 	end
@@ -282,7 +324,7 @@ function RigPart:PoseToRobloxAnimation(t)
 	local enabled = self.enabled
 
 	local childrenPoses = {}
-	for _, child in pairs(children) do
+	for _, child in ipairs(children) do
 		local subpose = (child :: any):PoseToRobloxAnimation(t)
 		if subpose then
 			table.insert(childrenPoses, subpose)
@@ -423,7 +465,7 @@ function RigPart:ApplyPose(t)
 
 	-- Always process children, even if this part has no pose
 	local children = self.children
-	for _, child in pairs(children) do
+	for _, child in ipairs(children) do
 		(child :: any):ApplyPose(t)
 	end
 end
@@ -449,7 +491,7 @@ function RigPart:FindAuxPartsLegacy()
 	end
 
 	local instSet = {}
-	for i, joint in pairs(jointSet) do
+	for i, joint in ipairs(jointSet) do
 		local asJoint = joint :: any
 		instSet[i] = asJoint.Part0 == part and asJoint.Part1 or asJoint.Part0
 	end
@@ -535,9 +577,23 @@ function RigPart:Encode(handledParts, opts)
 					elem.jointtransform1 = { (jointInstance :: any).C0:GetComponents() }
 				end
 			elseif jointInstance:IsA("AnimationConstraint") then
-				-- For AnimationConstraint, the Transform property acts like C0, C1 is identity
-				elem.jointtransform0 = { (jointInstance :: any).Transform:GetComponents() }
-				elem.jointtransform1 = { CFrame.new():GetComponents() }
+				-- AnimationConstraint rest offsets live on Attachment0/Attachment1.
+				-- Serialize them using the same parent/child-relative convention as Motor6D C0/C1.
+				local attachment0 = (jointInstance :: AnimationConstraint).Attachment0
+				local attachment1 = (jointInstance :: AnimationConstraint).Attachment1
+				if attachment0 and attachment1 then
+					if self.jointParentIsPart0 then
+						elem.jointtransform0 = { attachment0.CFrame:GetComponents() }
+						elem.jointtransform1 = { attachment1.CFrame:GetComponents() }
+					else
+						elem.jointtransform0 = { attachment1.CFrame:GetComponents() }
+						elem.jointtransform1 = { attachment0.CFrame:GetComponents() }
+					end
+				else
+					-- Fallback for malformed constraints: preserve the animated delta only.
+					elem.jointtransform0 = { (jointInstance :: any).Transform:GetComponents() }
+					elem.jointtransform1 = { CFrame.new():GetComponents() }
+				end
 			elseif jointInstance:IsA("WeldConstraint") then
 				-- WeldConstraint doesn't have C0/C1, use relative transform
 				local parentToChild = (jointInstance :: any).Part0.CFrame:ToObjectSpace((jointInstance :: any).Part1.CFrame)
@@ -550,7 +606,7 @@ function RigPart:Encode(handledParts, opts)
 
 	local children = self.children
 	local childCount = 0
-	for _, subrigpart in pairs(children) do
+	for _, subrigpart in ipairs(children) do
 		childCount = childCount + 1
 		if childCount % 50 == 0 then
 			task.wait()
