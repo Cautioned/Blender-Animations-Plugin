@@ -202,13 +202,19 @@ def _apply_runtime_solution(
     runtime_entry: dict,
     state_signature: tuple[float, ...],
     persist_state: bool = True,
+    apply_token=None,
 ) -> dict:
-    if runtime_entry.get("last_signature") == state_signature:
+    if (
+        runtime_entry.get("last_signature") == state_signature
+        and runtime_entry.get("last_apply_token") == apply_token
+    ):
         return runtime_entry.get("last_solved") or {}
 
     runtime = runtime_entry["compiled"]
-    pose_weights = _compute_runtime_state_weights(runtime, state_signature)
-    solved = _solve_runtime_facs_bone_transforms(runtime, pose_weights)
+    solved = runtime_entry.get("last_solved") or {}
+    if runtime_entry.get("last_signature") != state_signature:
+        pose_weights = _compute_runtime_state_weights(runtime, state_signature)
+        solved = _solve_runtime_facs_bone_transforms(runtime, pose_weights)
     pose = getattr(armature_obj, "pose", None)
     pose_bones = getattr(pose, "bones", None)
     if pose_bones is not None:
@@ -232,6 +238,7 @@ def _apply_runtime_solution(
             runtime_entry["last_state_json"] = state_json
     runtime_entry["last_signature"] = state_signature
     runtime_entry["last_solved"] = solved
+    runtime_entry["last_apply_token"] = apply_token
     return solved
 
 
@@ -353,6 +360,7 @@ def _get_armature_facs_runtime(armature_obj, payload=None) -> Optional[dict]:
         "payload": payload,
         "compiled": _build_facs_runtime(payload),
         "last_signature": None,
+        "last_apply_token": None,
         "last_state_json": None,
         "last_solved": None,
     }
@@ -627,7 +635,7 @@ def sync_facs_property_group_from_armature(armature_obj, payload=None, control_s
     return True
 
 
-def apply_facs_snapshot_to_armature(armature_obj, control_state=None, payload=None) -> dict:
+def apply_facs_snapshot_to_armature(armature_obj, control_state=None, payload=None, apply_token=None) -> dict:
     runtime_entry = _get_armature_facs_runtime(armature_obj, payload=payload)
     if not runtime_entry:
         return {}
@@ -640,10 +648,22 @@ def apply_facs_snapshot_to_armature(armature_obj, control_state=None, payload=No
         control_state if control_state is not None else load_facs_control_state_from_armature(armature_obj, payload),
     )
     state_signature = tuple(normalized_state.get(control_name, 0.0) for control_name in (runtime.get("control_names") or ()))
-    return _apply_runtime_solution(armature_obj, payload, runtime_entry, state_signature, persist_state=True)
+    return _apply_runtime_solution(
+        armature_obj,
+        payload,
+        runtime_entry,
+        state_signature,
+        persist_state=True,
+        apply_token=apply_token,
+    )
 
 
-def apply_facs_properties_to_armature(armature_obj, payload=None, persist_state: bool = False) -> dict:
+def apply_facs_properties_to_armature(
+    armature_obj,
+    payload=None,
+    persist_state: bool = False,
+    apply_token=None,
+) -> dict:
     runtime_entry = _get_armature_facs_runtime(armature_obj, payload=payload)
     if not runtime_entry:
         return {}
@@ -660,6 +680,7 @@ def apply_facs_properties_to_armature(armature_obj, payload=None, persist_state:
         runtime_entry,
         state_signature,
         persist_state=persist_state,
+        apply_token=apply_token,
     )
 
 

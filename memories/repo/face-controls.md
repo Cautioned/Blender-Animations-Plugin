@@ -1,0 +1,1 @@
+- facs playback cannot skip reapplying solved transforms on held frames; blender reevaluates pose bones each frame, so cache checks must include a frame/apply token instead of only the control signature.

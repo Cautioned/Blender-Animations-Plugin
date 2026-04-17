@@ -67,6 +67,19 @@ local function waitBeforeExportSelectionIfNeeded(root: Instance?)
 	end
 end
 
+local function focusCurrentCameraOnRigPrimaryPart()
+	local activeRigModel = State.activeRigModel
+	if not activeRigModel then
+		return
+	end
+
+	local primaryPart = activeRigModel.PrimaryPart :: BasePart?
+	local currentCamera = workspace.CurrentCamera
+	if primaryPart ~= nil and currentCamera ~= nil then
+		currentCamera.Focus = primaryPart.CFrame
+	end
+end
+
 local function cfComponents(cf: CFrame): { number }
 	return { cf:GetComponents() }
 end
@@ -556,7 +569,7 @@ function ExportManager:exportRig()
 	rigModelToExport.Parent = State.activeRigModel.Parent
 	rigModelToExport.Archivable = false
 
-	game.Workspace.Camera.Focus = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
+	focusCurrentCameraOnRigPrimaryPart()
 
 	State.metaParts = { rigModelToExport }
 
@@ -1301,7 +1314,7 @@ function ExportManager:exportRigLegacy()
 	rigModelToExport.Parent = State.activeRigModel.Parent
 	rigModelToExport.Archivable = false
 
-	game.Workspace.Camera.Focus = (State.activeRigModel.PrimaryPart :: BasePart).CFrame
+	focusCurrentCameraOnRigPrimaryPart()
 
 	State.metaParts = { rigModelToExport }
 

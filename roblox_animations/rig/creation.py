@@ -2892,6 +2892,15 @@ def autoname_parts(partnames, basename, objects_to_rename):
                 print(f"Error renaming part {object.name}: {str(e)}")
 
 
+def _articulated_chain_children(rigsubdef):
+    children = rigsubdef.get("children") or []
+    return [
+        child
+        for child in children
+        if (child.get("jointType") or "Motor6D") not in {"Weld", "WeldConstraint"}
+    ]
+
+
 def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, match_ctx):
     """Load a single rig bone with its children"""
     amt = ao.data
@@ -2953,9 +2962,10 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
         # This preserves the exact bone structure from the original rig data
         if rigging_type != "RAW":
             # For other rigging types, apply "nice" transforms for better visualization/IK
-            if len(rigsubdef["children"]) == 1:
-                nextmat = cf_to_mat(rigsubdef["children"][0]["transform"])
-                nextmat1 = cf_to_mat(rigsubdef["children"][0]["jointtransform1"])
+            chain_children = _articulated_chain_children(rigsubdef)
+            if len(chain_children) == 1:
+                nextmat = cf_to_mat(chain_children[0]["transform"])
+                nextmat1 = cf_to_mat(chain_children[0]["jointtransform1"])
                 next_joint_pos = (t2b @ (nextmat @ nextmat1)).to_translation()
 
                 if rigging_type == "CONNECT":  # Instantly connect

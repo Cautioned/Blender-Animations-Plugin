@@ -45,6 +45,7 @@ from ..operators.import_ops import (
     _rename_parts_by_fingerprint,
 )
 from ..rig.creation import (
+    _articulated_chain_children,
     _find_matching_part,
     _build_match_context,
     _refresh_match_context,
@@ -1056,6 +1057,34 @@ class TestWeaponMetadataHelpers(unittest.TestCase):
 
         self.assertEqual(renamed, 0)
         self.assertEqual(payload["rig"]["children"][0]["jname"], "Handle")
+
+    def test_articulated_chain_children_ignores_weld_branches(self):
+        rig_node = {
+            "jname": "UpperArm",
+            "jointType": "Motor6D",
+            "children": [
+                {
+                    "jname": "LowerArm",
+                    "jointType": "Motor6D",
+                    "children": [],
+                },
+                {
+                    "jname": "ShoulderPad",
+                    "jointType": "Weld",
+                    "children": [],
+                },
+                {
+                    "jname": "CapePin",
+                    "jointType": "WeldConstraint",
+                    "children": [],
+                },
+            ],
+        }
+
+        self.assertEqual(
+            [child["jname"] for child in _articulated_chain_children(rig_node)],
+            ["LowerArm"],
+        )
 
     def test_resolve_imported_obj_name_strips_obj_added_suffix_when_target_known(self):
         known = {"accessorydw3", "sword", "oof"}
