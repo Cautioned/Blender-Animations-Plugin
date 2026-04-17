@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import gzip
+import importlib
 import json
+from pathlib import Path
 import re
 import struct
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,6 +28,10 @@ _THREE_POSE_CORRECTIVE_STRUCT = struct.Struct("<HHH")
 _FACE_STRUCT = struct.Struct("<III")
 _SKINNING_STRUCT = struct.Struct("<4B4B")
 _FACS_TRANSFORM_CHANNELS = ("px", "py", "pz", "rx", "ry", "rz")
+_GLTF_COMPONENT_TYPE_UINT32 = 5125
+_GLTF_COMPONENT_TYPE_FLOAT32 = 5126
+_DRACO_DLL_UNINITIALIZED = object()
+_DRACO_DLL = _DRACO_DLL_UNINITIALIZED
 
 _FILEMESH_FACS_CONTROL_MAP = {
     "c_COR": "Corrugator",
@@ -564,8 +572,6 @@ def _describe_auth_mode(headers: Optional[Dict[str, str]]) -> str:
         return "none"
     if headers.get("Authorization"):
         return "oauth-bearer"
-    if headers.get("x-api-key"):
-        return "api-key"
     return "other"
 
 
@@ -901,6 +907,7 @@ def _parse_v2_or_v3(data: bytes, version: str, offset: int) -> dict:
         header_size, vertex_size, face_size, num_verts, num_faces = struct.unpack_from("<HBBII", data, offset)
         offset += header_size
         num_lod_offsets = 0
+        lod_offsets = []
     else:
         header_size, vertex_size, face_size, _lod_size, num_lod_offsets, num_verts, num_faces = struct.unpack_from(
             "<HBBHHII", data, offset
@@ -913,6 +920,8 @@ def _parse_v2_or_v3(data: bytes, version: str, offset: int) -> dict:
         faces, offset = _read_faces(data, offset, num_faces)
     else:
         offset += num_faces * face_size
+    if num_lod_offsets > 0:
+        lod_offsets = list(struct.unpack_from(f"<{num_lod_offsets}I", data, offset))
     offset += num_lod_offsets * 4
 
     return {
@@ -925,6 +934,9 @@ def _parse_v2_or_v3(data: bytes, version: str, offset: int) -> dict:
         "vertex_weights": [{} for _ in range(num_verts)],
         "bone_names": [],
         "has_skinning": False,
+        "lod_type": None,
+        "num_high_quality_lods": 0,
+        "lod_offsets": lod_offsets,
         **_empty_facs_metadata(),
     }
 
@@ -944,10 +956,10 @@ def _infer_v4_vertex_size(total_len: int, offset: int, num_verts: int, num_faces
 def _parse_v4_or_v5(data: bytes, version: str, offset: int) -> dict:
     if version.startswith("version 5"):
         header = struct.unpack_from("<HHIIHHIHBBII", data, offset)
-        header_size, _lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, _hq_lods, _unused, _facs_format, facs_size = header
+        header_size, lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, hq_lods, _unused, _facs_format, facs_size = header
     else:
         header = struct.unpack_from("<HHIIHHIHBB", data, offset)
-        header_size, _lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, _hq_lods, _unused = header
+        header_size, lod_type, num_verts, num_faces, num_lod_offsets, num_bones, bone_names_size, num_subsets, hq_lods, _unused = header
         facs_size = 0
 
     offset += header_size
@@ -969,6 +981,7 @@ def _parse_v4_or_v5(data: bytes, version: str, offset: int) -> dict:
         skinning, offset = _parse_skinning_arrays(data, offset, num_verts)
 
     faces, offset = _read_faces(data, offset, num_faces)
+    lod_offsets = list(struct.unpack_from(f"<{num_lod_offsets}I", data, offset)) if num_lod_offsets > 0 else []
     offset += num_lod_offsets * 4
     bones, offset = _parse_bones(data, offset, num_bones)
     name_table = data[offset : offset + bone_names_size]
@@ -990,6 +1003,9 @@ def _parse_v4_or_v5(data: bytes, version: str, offset: int) -> dict:
         "bone_names": bone_names,
         "bones": bones,
         "has_skinning": bool(num_bones and skinning),
+        "lod_type": int(lod_type),
+        "num_high_quality_lods": int(hq_lods),
+        "lod_offsets": lod_offsets,
         **facs_metadata,
     }
 
@@ -1020,6 +1036,183 @@ def _parse_coremesh_v1(chunk: bytes) -> Tuple[List[dict], List[Tuple[int, int, i
     return vertices, faces, num_verts
 
 
+def _get_blender_draco_dll_path() -> Optional[Path]:
+    try:
+        draco_module = importlib.import_module("io_scene_gltf2.io.com.draco")
+        candidate = draco_module.dll_path()
+        if candidate and Path(candidate).exists():
+            return Path(candidate)
+    except Exception:
+        pass
+
+    executable = Path(sys.executable).resolve() if sys.executable else None
+    if executable:
+        version_dir = executable.parent.parent.name
+        for addons_dir in ("addons_core", "addons"):
+            candidate = executable.parent.parent / version_dir / "scripts" / addons_dir / "io_scene_gltf2"
+            if sys.platform == "win32":
+                candidate = candidate / "extern_draco.dll"
+            elif sys.platform == "linux":
+                candidate = candidate / "libextern_draco.so"
+            elif sys.platform == "darwin":
+                candidate = candidate / "libextern_draco.dylib"
+            else:
+                candidate = None
+
+            if candidate and candidate.exists():
+                return candidate
+
+    return None
+
+
+def _load_blender_draco_dll():
+    global _DRACO_DLL
+    if _DRACO_DLL is not _DRACO_DLL_UNINITIALIZED:
+        return _DRACO_DLL
+
+    dll_path = _get_blender_draco_dll_path()
+    if dll_path is None:
+        _DRACO_DLL = None
+        return None
+
+    try:
+        dll = ctypes.cdll.LoadLibrary(str(dll_path.resolve()))
+        dll.decoderCreate.restype = ctypes.c_void_p
+        dll.decoderCreate.argtypes = []
+        dll.decoderRelease.restype = None
+        dll.decoderRelease.argtypes = [ctypes.c_void_p]
+        dll.decoderDecode.restype = ctypes.c_bool
+        dll.decoderDecode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+        dll.decoderReadAttribute.restype = ctypes.c_bool
+        dll.decoderReadAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_char_p]
+        dll.decoderGetVertexCount.restype = ctypes.c_uint32
+        dll.decoderGetVertexCount.argtypes = [ctypes.c_void_p]
+        dll.decoderGetIndexCount.restype = ctypes.c_uint32
+        dll.decoderGetIndexCount.argtypes = [ctypes.c_void_p]
+        dll.decoderGetAttributeByteLength.restype = ctypes.c_size_t
+        dll.decoderGetAttributeByteLength.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        dll.decoderCopyAttribute.restype = None
+        dll.decoderCopyAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+        dll.decoderReadIndices.restype = ctypes.c_bool
+        dll.decoderReadIndices.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        dll.decoderGetIndicesByteLength.restype = ctypes.c_size_t
+        dll.decoderGetIndicesByteLength.argtypes = [ctypes.c_void_p]
+        dll.decoderCopyIndices.restype = None
+        dll.decoderCopyIndices.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    except Exception:
+        _DRACO_DLL = None
+        return None
+
+    _DRACO_DLL = dll
+    return dll
+
+
+def _decode_draco_attribute_buffer(
+    dll,
+    decoder,
+    attr_id: int,
+    component_type: int,
+    attr_type: bytes,
+    components: int,
+    vertex_count: int,
+):
+    if not dll.decoderReadAttribute(decoder, attr_id, component_type, attr_type):
+        return None
+
+    byte_length = int(dll.decoderGetAttributeByteLength(decoder, attr_id))
+    if byte_length <= 0:
+        return None
+
+    buffer = ctypes.create_string_buffer(byte_length)
+    dll.decoderCopyAttribute(decoder, attr_id, buffer)
+    values = struct.unpack_from(f"<{vertex_count * components}f", buffer.raw, 0)
+    return [tuple(values[index : index + components]) for index in range(0, len(values), components)]
+
+
+def _decode_draco_coremesh_v2(chunk: bytes) -> Optional[Tuple[List[dict], List[Tuple[int, int, int]], int]]:
+    if len(chunk) < 4:
+        raise ValueError("truncated v7 draco coremesh header")
+
+    draco_bitstream_size = struct.unpack_from("<I", chunk, 0)[0]
+    if 4 + draco_bitstream_size > len(chunk):
+        raise ValueError("truncated v7 draco coremesh payload")
+
+    dll = _load_blender_draco_dll()
+    if dll is None:
+        return None
+
+    bitstream = chunk[4 : 4 + draco_bitstream_size]
+    bitstream_buffer = ctypes.create_string_buffer(bitstream, len(bitstream))
+    decoder = dll.decoderCreate()
+    if not decoder:
+        return None
+
+    try:
+        if not dll.decoderDecode(decoder, bitstream_buffer, len(bitstream)):
+            return None
+
+        vertex_count = int(dll.decoderGetVertexCount(decoder))
+        index_count = int(dll.decoderGetIndexCount(decoder))
+        if vertex_count <= 0:
+            return [], [], 0
+
+        positions = _decode_draco_attribute_buffer(
+            dll,
+            decoder,
+            0,
+            _GLTF_COMPONENT_TYPE_FLOAT32,
+            b"VEC3",
+            3,
+            vertex_count,
+        )
+        normals = _decode_draco_attribute_buffer(
+            dll,
+            decoder,
+            1,
+            _GLTF_COMPONENT_TYPE_FLOAT32,
+            b"VEC3",
+            3,
+            vertex_count,
+        )
+        uvs = _decode_draco_attribute_buffer(
+            dll,
+            decoder,
+            2,
+            _GLTF_COMPONENT_TYPE_FLOAT32,
+            b"VEC2",
+            2,
+            vertex_count,
+        )
+
+        if positions is None:
+            return None
+
+        faces: List[Tuple[int, int, int]] = []
+        if index_count > 0 and dll.decoderReadIndices(decoder, _GLTF_COMPONENT_TYPE_UINT32):
+            byte_length = int(dll.decoderGetIndicesByteLength(decoder))
+            if byte_length > 0:
+                index_buffer = ctypes.create_string_buffer(byte_length)
+                dll.decoderCopyIndices(decoder, index_buffer)
+                flat_indices = struct.unpack_from(f"<{index_count}I", index_buffer.raw, 0)
+                faces = [
+                    (flat_indices[index], flat_indices[index + 1], flat_indices[index + 2])
+                    for index in range(0, len(flat_indices) - 2, 3)
+                ]
+
+        vertices = []
+        for index, position in enumerate(positions):
+            vertices.append(
+                {
+                    "position": position,
+                    "normal": normals[index] if normals and index < len(normals) else None,
+                    "uv": uvs[index] if uvs and index < len(uvs) else None,
+                }
+            )
+        return vertices, faces, vertex_count
+    finally:
+        dll.decoderRelease(decoder)
+
+
 def _parse_skinning_chunk(chunk: bytes) -> dict:
     offset = 0
     num_skinnings = struct.unpack_from("<I", chunk, offset)[0]
@@ -1048,6 +1241,26 @@ def _parse_skinning_chunk(chunk: bytes) -> dict:
     }
 
 
+def _parse_lods_chunk(chunk: bytes) -> dict:
+    offset = 0
+    if len(chunk) < 7:
+        raise ValueError("truncated lods chunk")
+
+    lod_type, num_high_quality_lods = struct.unpack_from("<HB", chunk, offset)
+    offset += 3
+    num_lod_offsets = struct.unpack_from("<I", chunk, offset)[0]
+    offset += 4
+    if offset + (num_lod_offsets * 4) > len(chunk):
+        raise ValueError("truncated lod offsets")
+
+    lod_offsets = list(struct.unpack_from(f"<{num_lod_offsets}I", chunk, offset)) if num_lod_offsets > 0 else []
+    return {
+        "lod_type": int(lod_type),
+        "num_high_quality_lods": int(num_high_quality_lods),
+        "lod_offsets": lod_offsets,
+    }
+
+
 def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
     vertices = None
     faces: List[Tuple[int, int, int]] = []
@@ -1057,6 +1270,11 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
     bones: List[dict] = []
     has_skinning = False
     facs_metadata = _empty_facs_metadata()
+    lod_metadata = {
+        "lod_type": None,
+        "num_high_quality_lods": 0,
+        "lod_offsets": [],
+    }
 
     while offset + 16 <= len(data):
         chunk_type_raw = data[offset : offset + 8]
@@ -1068,9 +1286,9 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
         if chunk_type == "COREMESH" and chunk_version == 1:
             vertices, faces, num_vertices = _parse_coremesh_v1(chunk_data)
         elif chunk_type == "COREMESH" and chunk_version == 2:
-            # Draco-compressed. We still parse skinning and can fall back to index-based binding.
-            if len(chunk_data) >= 4:
-                _draco_size = struct.unpack_from("<I", chunk_data, 0)[0]
+            decoded = _decode_draco_coremesh_v2(chunk_data)
+            if decoded is not None:
+                vertices, faces, num_vertices = decoded
         elif chunk_type == "SKINNING" and chunk_version == 1:
             skinning_data = _parse_skinning_chunk(chunk_data)
             num_vertices = max(num_vertices, skinning_data["num_vertices"])
@@ -1078,6 +1296,8 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
             bone_names = skinning_data["bone_names"]
             bones = skinning_data.get("bones") or []
             has_skinning = skinning_data["has_skinning"]
+        elif chunk_type == "LODS" and chunk_version == 1:
+            lod_metadata = _parse_lods_chunk(chunk_data)
         elif chunk_type == "FACS" and chunk_version == 1:
             facs_metadata = _parse_facs_chunk(chunk_data)
 
@@ -1095,6 +1315,7 @@ def _parse_v6_or_v7(data: bytes, version: str, offset: int) -> dict:
         "bone_names": bone_names,
         "bones": bones,
         "has_skinning": has_skinning,
+        **lod_metadata,
         **facs_metadata,
     }
 

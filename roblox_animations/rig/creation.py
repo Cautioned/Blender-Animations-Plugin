@@ -927,40 +927,53 @@ def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, en
     return mesh_obj
 
 
-def _synthesize_missing_part_meshes(meta_loaded, parts_collection):
-    created = []
+def _replace_object_with_synthesized_filemesh(parts_collection, mesh_obj, mesh_data, entry):
+    if mesh_obj is None:
+        return None
+
+    object_name = mesh_obj.name
+    _remove_object_and_data(mesh_obj)
+    replacement = _create_mesh_object_from_filemesh(parts_collection, object_name, mesh_data, entry)
+    if replacement is not None:
+        print(f"[RigCreate] Replaced imported mesh '{object_name}' with synthesized FileMesh geometry")
+    return replacement
+
+
+def _binding_quality_score(binding):
+    if not binding:
+        return 0.0
+
+    mode = binding.get("mode")
+    if mode == "uv-map":
+        return float(binding.get("uv_link_coverage", 0.0) or 0.0)
+    if mode == "vertex-map":
+        return float(binding.get("vertex_link_coverage", 0.0) or 0.0)
+    if mode == "index":
+        return 1.0
+    return 0.0
+
+
+def _collect_intentionally_missing_wrap_target_parts(meta_loaded, parts_collection):
+    missing = set()
 
     for entry in _iter_part_aux_entries(meta_loaded):
         if not isinstance(entry, dict):
             continue
 
-        part_name = entry.get("name")
-        mesh_id = entry.get("mesh_id")
-        mesh_class = entry.get("mesh_class")
-        if not part_name or not mesh_id:
+        part_name = _strip_suffix(entry.get("name") or "")
+        if not part_name:
             continue
-        if mesh_class not in (None, "", "MeshPart"):
+        if not _get_wrap_target_metadata(entry):
             continue
         if _find_parts_object(parts_collection, part_name) is not None:
             continue
 
-        try:
-            mesh_data = fetch_and_parse_filemesh(mesh_id)
-        except Exception as exc:
-            print(f"[RigCreate] Missing part synth failed for '{part_name}': {exc}")
-            continue
+        missing.add(part_name.lower())
 
-        mesh_obj = _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, entry)
-        if mesh_obj is None:
-            print(f"[RigCreate] Missing part synth skipped for '{part_name}': no geometry")
-            continue
+    if missing:
+        print(f"[RigCreate] Wrap target body parts intentionally absent from import: {sorted(missing)}")
 
-        created.append(mesh_obj.name)
-
-    if created:
-        print(f"[RigCreate] Synthesized missing mesh parts: {created}")
-
-    return created
+    return missing
 
 
 def _build_wrap_target_snapshot(meta_loaded, parts_collection):
@@ -987,7 +1000,8 @@ def _build_wrap_target_snapshot(meta_loaded, parts_collection):
         try:
             cage_mesh_data = fetch_and_parse_filemesh(cage_mesh_id)
         except Exception as exc:
-            print(f"[RigCreate] Wrap target cage fetch failed for '{mesh_obj.name}': {exc}")
+            source_name = mesh_obj.name if mesh_obj is not None else (entry.get("name") or "unknown")
+            print(f"[RigCreate] Wrap target cage fetch failed for '{source_name}': {exc}")
             continue
 
         cage_local_matrix = _compose_wrap_geometry_matrix(
@@ -1208,7 +1222,115 @@ def _estimate_index_alignment(mesh_obj, filemesh_world_positions):
     }
 
 
-def _build_direct_skin_binding(binding):
+def _mesh_face_count(mesh_obj):
+    return len(_build_mesh_object_faces(mesh_obj)) if mesh_obj is not None else 0
+
+
+def _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj):
+    if not isinstance(mesh_data, dict):
+        return mesh_data
+
+    lod_offsets = mesh_data.get("lod_offsets") or []
+    all_faces = mesh_data.get("faces") or []
+    if len(lod_offsets) <= 1 or not all_faces:
+        return mesh_data
+
+    target_face_count = _mesh_face_count(mesh_obj)
+    if target_face_count <= 0:
+        return mesh_data
+
+    candidates = []
+    for index, start in enumerate(lod_offsets):
+        end = lod_offsets[index + 1] if index + 1 < len(lod_offsets) else len(all_faces)
+        start = max(0, min(int(start), len(all_faces)))
+        end = max(start, min(int(end), len(all_faces)))
+        face_count = end - start
+        if face_count <= 0:
+            continue
+        candidates.append(
+            {
+                "index": index,
+                "start": start,
+                "end": end,
+                "face_count": face_count,
+                "high_quality": index < int(mesh_data.get("num_high_quality_lods") or 0),
+            }
+        )
+
+    if not candidates:
+        return mesh_data
+
+    best = min(
+        candidates,
+        key=lambda item: (
+            abs(item["face_count"] - target_face_count),
+            abs(item["face_count"] - target_face_count) / max(target_face_count, 1),
+            item["index"],
+        ),
+    )
+
+    selected_faces = list(all_faces[best["start"] : best["end"]])
+    used_vertex_indices = sorted(
+        {
+            int(vertex_index)
+            for face in selected_faces
+            for vertex_index in face[:3]
+            if vertex_index is not None
+        }
+    )
+    if used_vertex_indices:
+        remap = {source_index: remapped_index for remapped_index, source_index in enumerate(used_vertex_indices)}
+        remapped_faces = [
+            tuple(remap[int(vertex_index)] for vertex_index in face[:3])
+            for face in selected_faces
+        ]
+
+        def _select_vertex_array(values, default=None):
+            if not isinstance(values, list):
+                return values if values is not None else default
+            return [values[index] if 0 <= index < len(values) else default for index in used_vertex_indices]
+
+        selected_mesh_data = dict(mesh_data)
+        selected_mesh_data["positions"] = _select_vertex_array(mesh_data.get("positions"), default=None)
+        selected_mesh_data["normals"] = _select_vertex_array(mesh_data.get("normals"), default=None)
+        selected_mesh_data["uvs"] = _select_vertex_array(mesh_data.get("uvs"), default=None)
+        selected_mesh_data["vertex_weights"] = _select_vertex_array(mesh_data.get("vertex_weights"), default={})
+        selected_mesh_data["faces"] = remapped_faces
+    else:
+        selected_mesh_data = dict(mesh_data)
+        selected_mesh_data["faces"] = selected_faces
+
+    selected_mesh_data["lod_selection"] = {
+        "index": best["index"],
+        "start": best["start"],
+        "end": best["end"],
+        "face_count": best["face_count"],
+        "target_face_count": target_face_count,
+        "high_quality": best["high_quality"],
+        "vertex_count": len(selected_mesh_data.get("positions") or []),
+    }
+    return selected_mesh_data
+
+
+def _log_lod_bind_selection(mesh_obj, raw_mesh_data, binding_mesh_data):
+    lod_offsets = raw_mesh_data.get("lod_offsets") or []
+    if not lod_offsets:
+        return
+
+    selection = binding_mesh_data.get("lod_selection") or {}
+    print(
+        f"[RigCreate] LOD bind selection for '{mesh_obj.name}': "
+        f"lod_type={raw_mesh_data.get('lod_type')}, "
+        f"hq_lods={raw_mesh_data.get('num_high_quality_lods', 0)}, "
+        f"lod_offsets={lod_offsets}, "
+        f"selected={selection.get('index', 0)}, "
+        f"faces={selection.get('face_count', len(binding_mesh_data.get('faces') or []))}, "
+        f"target_faces={selection.get('target_face_count', _mesh_face_count(mesh_obj))}, "
+        f"vertices={selection.get('vertex_count', len(binding_mesh_data.get('positions') or []))}"
+    )
+
+
+def _build_direct_skin_binding(binding, prefer_source_uv=False):
     mesh_obj = binding["object"]
     mesh_data = binding["mesh_data"]
     vertex_weights = mesh_data.get("vertex_weights") or []
@@ -1230,10 +1352,6 @@ def _build_direct_skin_binding(binding):
         return direct_binding, source_uv_message
 
     source_topology_binding, source_topology_message = _build_source_topology_binding(binding, target_faces=target_faces)
-    if not source_topology_binding and source_uv_binding:
-        # topology rejected (distance/coverage) — fall back to partial uv-map
-        direct_binding.update(source_uv_binding)
-        return direct_binding, source_uv_message
     if source_topology_binding:
         direct_binding.update(source_topology_binding)
         return direct_binding, source_topology_message
@@ -1269,6 +1387,10 @@ def _build_direct_skin_binding(binding):
         direct_binding["mode"] = "position"
         direct_binding["position_samples"] = position_samples
         return direct_binding, "position"
+
+    if source_uv_binding:
+        direct_binding.update(source_uv_binding)
+        return direct_binding, source_uv_message
 
     return None, None
 
@@ -1337,6 +1459,15 @@ def _build_source_topology_binding(binding, target_faces=None):
     max_dimension = max(max(mesh_obj.dimensions), 1.0)
     max_distance_limit = max_dimension * 0.0625
     avg_distance_limit = max_dimension * 0.025
+    topology_pair_budget = 2_000_000
+
+    if len(source_vertices) * len(target_vertices) > topology_pair_budget:
+        print(
+            f"[RigCreate] Triangulated vertex map skipped for '{mesh_obj.name}' "
+            f"(source_verts={len(source_vertices)}, target_verts={len(target_vertices)}, "
+            f"pair_budget={topology_pair_budget})"
+        )
+        return None, None
 
     # Build a position → [original_index, ...] map so we can resolve each
     # collapsed vertex back to the best individual original vertex (by normal
@@ -1489,17 +1620,56 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
                 continue
             print(f"[RigCreate] Wrap layer '{mesh_obj.name}' has no deterministic FileMesh bind: {exc}")
         else:
-            binding["mesh_data"] = mesh_data
-            vertex_weights = mesh_data.get("vertex_weights") or []
+            binding_mesh_data = _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj)
+            binding["mesh_data"] = binding_mesh_data
+            vertex_weights = binding_mesh_data.get("vertex_weights") or []
             bone_overlap = _mesh_bones_overlap_rig(
-                mesh_data.get("bone_names") or [],
+                binding_mesh_data.get("bone_names") or [],
                 rig_names,
                 part_to_bone_map,
             )
             has_weights = _has_meaningful_vertex_weights(vertex_weights)
+            if wrap_layer_metadata:
+                _log_lod_bind_selection(mesh_obj, mesh_data, binding_mesh_data)
             _log_binding_inspect(mesh_obj, binding, has_weights, bone_overlap)
             if has_weights and bone_overlap:
-                direct_binding, direct_mode_message = _build_direct_skin_binding(binding)
+                direct_binding, direct_mode_message = _build_direct_skin_binding(
+                    binding,
+                    prefer_source_uv=bool(wrap_layer_metadata),
+                )
+
+                # Imported OBJ meshes for wrap layers can carry the right part name
+                # while still being the wrong render mesh. If the deterministic direct
+                # bind quality is extremely low, replace that mesh with the exact
+                # synthesized FileMesh and rebuild the binding on the replacement.
+                if (
+                    wrap_layer_metadata
+                    and direct_binding
+                    and not bool(mesh_obj.get("RBXSynthesizedPart"))
+                    and direct_binding.get("mode") == "uv-map"
+                    and _binding_quality_score(direct_binding) < 0.95
+                ):
+                    print(
+                        f"[RigCreate] Low-quality wrap direct bind for '{mesh_obj.name}': "
+                        f"{direct_mode_message or direct_binding.get('mode')}; synthesizing selected FileMesh geometry"
+                    )
+                    replacement = _replace_object_with_synthesized_filemesh(
+                        parts_collection,
+                        mesh_obj,
+                        binding["mesh_data"],
+                        entry,
+                    )
+                    if replacement is not None:
+                        mesh_obj = replacement
+                        binding["object"] = mesh_obj
+                        binding["mesh_data"] = _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj)
+                        if wrap_layer_metadata:
+                            _log_lod_bind_selection(mesh_obj, mesh_data, binding["mesh_data"])
+                        _log_binding_inspect(mesh_obj, binding, has_weights, bone_overlap)
+                        direct_binding, direct_mode_message = _build_direct_skin_binding(
+                            binding,
+                            prefer_source_uv=True,
+                        )
 
         if wrap_layer_metadata:
             if auto_skin == "disabled" and direct_binding:
@@ -2481,6 +2651,7 @@ def _refresh_match_context(match_ctx):
 
     for key in (
         "fingerprint_object_map",
+        "intentionally_missing_parts",
         "skinned_mesh_bindings",
         "pending_constraints",
     ):
@@ -2504,6 +2675,11 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
     used = match_ctx["used"]
     t2b = match_ctx["t2b"]
     mesh_centers = match_ctx.get("mesh_centers", {})
+    base_name = _strip_suffix(aux_name or "").lower()
+    intentionally_missing_parts = match_ctx.get("intentionally_missing_parts", set())
+
+    if base_name in intentionally_missing_parts:
+        return None
     
     # Pre-compute expected position if we have transform data
     expected_pos = None
@@ -2578,7 +2754,6 @@ def _find_matching_part(aux_name, aux_cf, match_ctx):
     # WITH SIDE CHECK + POSITION TIEBREAKING for multiple candidates
     name_index = match_ctx["name_index"]
     candidates = []
-    base_name = _strip_suffix(aux_name or "").lower()
     if base_name and base_name in name_index:
         for obj in name_index[base_name]:
             if obj not in used:
@@ -2722,6 +2897,7 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     amt = ao.data
     bone = amt.edit_bones.new(rigsubdef["jname"])
     joint_type = rigsubdef.get("jointType") or "Motor6D"
+    original_parent_bone = rigsubdef.get("originalParentBone")
 
     mat = cf_to_mat(rigsubdef["transform"])
     bone["transform"] = _matrix_to_idprop(mat)
@@ -2733,6 +2909,8 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     if joint_type:
         # Preserve joint type for downstream serialization/diagnostics (Motor6D/Weld/WeldConstraint/Bone)
         bone["rbx_joint_type"] = joint_type
+    if original_parent_bone:
+        bone["rbx_original_parent"] = original_parent_bone
     if is_deform_bone:
         # Mark as a deform bone for proper animation import handling
         bone["rbx_is_deform_bone"] = True
@@ -2969,10 +3147,13 @@ def create_rig(rigging_type, rig_meta_obj_name):
         return
 
     meta_loaded = json.loads(rig_meta_obj["RigMeta"])
-    _synthesize_missing_part_meshes(meta_loaded, parts_collection)
 
     # Build a matching context so we can resolve meshes even if Roblox renames them.
     match_ctx = _build_match_context(parts_collection)
+    match_ctx["intentionally_missing_parts"] = _collect_intentionally_missing_wrap_target_parts(
+        meta_loaded,
+        parts_collection,
+    )
 
     # --- Deletion of old Armature ---
     # Find and delete any existing armature within this rig's master collection
@@ -3009,7 +3190,7 @@ def create_rig(rigging_type, rig_meta_obj_name):
             print(f"[RigCreate] Failed to load fingerprint map: {e}")
     else:
         print("[RigCreate] WARNING: No _FingerprintMap found on meta object!")
-    
+
     match_ctx["fingerprint_object_map"] = fp_map
     
     # Try to restore correct part names using fingerprinting before building constraints.
@@ -3025,6 +3206,7 @@ def create_rig(rigging_type, rig_meta_obj_name):
 
     skinned_mesh_bindings = _prepare_skinned_mesh_bindings(meta_loaded, parts_collection)
     match_ctx["skinned_mesh_bindings"] = skinned_mesh_bindings
+    match_ctx = _refresh_match_context(match_ctx)
 
     bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
     ao = bpy.context.object

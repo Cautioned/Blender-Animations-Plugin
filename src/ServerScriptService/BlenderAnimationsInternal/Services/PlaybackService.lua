@@ -7,71 +7,187 @@ local RunService = game:GetService("RunService")
 local AnimationClipProvider = game:GetService("AnimationClipProvider")
 local Utils = require(script.Parent.Parent:WaitForChild("Utils"))
 
-type HeartbeatType = { conn: RBXScriptConnection? }
-type StopOptions = { background: boolean?, animatorOverride: Instance? }
+type ConnectionLike = {
+	Disconnect: (self: ConnectionLike) -> (),
+	Connected: boolean?,
+}
+
+type WaitableSignalLike = {
+	Connect: (self: WaitableSignalLike, callback: () -> ()) -> ConnectionLike,
+	Wait: ((self: WaitableSignalLike) -> ())?,
+}
+
+type TrackLike = {
+	AdjustSpeed: (self: TrackLike, speed: number) -> (),
+	Stop: (self: TrackLike, fadeTime: number?) -> (),
+	Destroy: ((self: TrackLike) -> ())?,
+	IsPlaying: boolean?,
+	Stopped: WaitableSignalLike?,
+}
+
+type AnimatorLike = {
+	GetPlayingAnimationTracks: (self: AnimatorLike) -> { TrackLike },
+	StepAnimations: ((self: AnimatorLike, delta: number) -> ())?,
+}
+
+type AnimatorOwnerLike = {
+	IsA: (self: AnimatorOwnerLike, className: string) -> boolean,
+	FindFirstChildOfClass: ((self: AnimatorOwnerLike, className: string) -> AnimatorLike?)?,
+}
+
+type AnimatorInstanceLike = AnimatorOwnerLike & AnimatorLike
+type TrackSet = { [TrackLike]: boolean }
+type HeartbeatType = { conn: ConnectionLike? }
+type StopOptions = { background: boolean?, animatorOverride: AnimatorOwnerLike? }
+type KeyframeNameLike = { name: string, time: number, value: string?, type: string? }
 
 function PlaybackService.new(State, Types)
 	local self = setmetatable({}, PlaybackService)
 	self.State = State
 	self.Types = Types
+	self._playbackToken = 0
+	self._delayedReplayToken = 0
+	self._delayedReplayPending = false
 	return self
+end
+
+function PlaybackService:_cancelDelayedReplay()
+	self._delayedReplayToken = (self._delayedReplayToken :: number) + 1
+	self._delayedReplayPending = false
+end
+
+function PlaybackService:_scheduleDelayedReplay(playbackToken: number, callback: () -> ())
+	if self._delayedReplayPending then
+		return
+	end
+
+	self._delayedReplayPending = true
+	self._delayedReplayToken = (self._delayedReplayToken :: number) + 1
+	local delayedReplayToken = self._delayedReplayToken :: number
+
+	task.delay(1, function()
+		if self._delayedReplayToken ~= delayedReplayToken then
+			return
+		end
+		self._delayedReplayPending = false
+		if self._playbackToken ~= playbackToken then
+			return
+		end
+		callback()
+	end)
 end
 
 function PlaybackService:disconnectHeartbeat()
 	local heartbeat = self.State.heartbeat :: HeartbeatType
-	if heartbeat.conn then
-		heartbeat.conn:Disconnect()
-		heartbeat.conn = nil
+	self:_disconnectConnection(heartbeat.conn)
+	heartbeat.conn = nil
+end
+
+function PlaybackService:_disconnectConnection(connection: ConnectionLike?)
+	if connection and connection.Connected ~= false then
+		connection:Disconnect()
 	end
 end
 
-function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect, rigModel)
+function PlaybackService:_resetRigPose(rigModel)
+	if not rigModel then
+		return
+	end
+
+	for _, desc in ipairs(rigModel:GetDescendants()) do
+		if desc:IsA("Motor6D") then
+			desc.Transform = CFrame.identity
+		elseif desc:IsA("Bone") then
+			desc.Transform = CFrame.identity
+		elseif desc:IsA("AnimationConstraint") then
+			desc.Transform = CFrame.identity
+		end
+	end
+end
+
+function PlaybackService:_getAnimatorInstance(animatorOwner: AnimatorOwnerLike?): AnimatorInstanceLike?
+	if not animatorOwner then
+		return nil
+	end
+
+	if animatorOwner:IsA("Animator") then
+		return animatorOwner :: AnimatorInstanceLike
+	end
+
+	local findFirstChildOfClass = animatorOwner.FindFirstChildOfClass
+	if (animatorOwner:IsA("Humanoid") or animatorOwner:IsA("AnimationController")) and findFirstChildOfClass then
+		local animator = findFirstChildOfClass(animatorOwner, "Animator")
+		if animator then
+			return animator :: AnimatorInstanceLike
+		end
+	end
+
+	return nil
+end
+
+function PlaybackService:_flushAnimatorPose(animatorOwner: AnimatorOwnerLike?)
+	local animator = self:_getAnimatorInstance(animatorOwner)
+	if not animator then
+		return
+	end
+
+	local stepAnimations = animator.StepAnimations
+	if not stepAnimations then
+		return
+	end
+
+	pcall(function()
+		stepAnimations(animator, 0)
+	end)
+end
+
+function PlaybackService:_cleanupAnimation(
+	animatorToStop: AnimatorOwnerLike?,
+	heartbeatToDisconnect: ConnectionLike?,
+	rigModel,
+	alreadyStoppedTracks: TrackSet?
+)
 	local success, err = pcall(function()
-		if
-			animatorToStop
-			and typeof(animatorToStop) == "Instance"
-			and ((animatorToStop :: any):IsA("Humanoid") or (animatorToStop :: any):IsA("AnimationController"))
-		then
-			local animator = (animatorToStop :: any):FindFirstChildOfClass("Animator")
-			if animator then
-				local tracks = (animator :: any):GetPlayingAnimationTracks() :: { any }
+		local animator = self:_getAnimatorInstance(animatorToStop)
+		if animator then
+			local tracks = animator:GetPlayingAnimationTracks()
 				if #tracks > 0 then
 					for _, track in ipairs(tracks) do
-						local stopped = false
-						local stopConn = track.Stopped:Connect(function()
-							stopped = true
-						end)
-						track:Stop(0.05)
-						if track.IsPlaying then
-							track.Stopped:Wait()
-						elseif not stopped then
-							task.wait(0.1)
+						if alreadyStoppedTracks and alreadyStoppedTracks[track] then
+							continue
 						end
-						stopConn:Disconnect()
+						local stoppedSignal = track.Stopped
+						if stoppedSignal then
+							local stopped = false
+							local stopConn = stoppedSignal:Connect(function()
+								stopped = true
+							end)
+							track:Stop(0.05)
+							local waitForStopped = stoppedSignal.Wait
+							if track.IsPlaying and waitForStopped then
+								waitForStopped(stoppedSignal)
+							elseif not stopped then
+								task.wait(0.1)
+							end
+							stopConn:Disconnect()
+						else
+							track:Stop(0.05)
+						end
 					end
 					for _, track in ipairs(tracks) do
-						track:Destroy()
-					end
-				end
-
-				-- Reset all joint transforms to identity so the rig returns to rest pose
-				if rigModel then
-					for _, desc in ipairs(rigModel:GetDescendants()) do
-						if desc:IsA("Motor6D") then
-							desc.Transform = CFrame.identity
-						elseif desc:IsA("Bone") then
-							desc.Transform = CFrame.identity
+						local destroyTrack = track.Destroy
+						if destroyTrack then
+							destroyTrack(track)
 						end
 					end
 				end
-			end
 		end
+		self:_resetRigPose(rigModel)
+		self:_flushAnimatorPose(animatorToStop)
 		task.wait()
 	end)
 
-	if heartbeatToDisconnect and (heartbeatToDisconnect :: any).Connected then
-		(heartbeatToDisconnect :: any):Disconnect()
-	end
+	self:_disconnectConnection(heartbeatToDisconnect)
 
 	if not success then
 		warn("Error during animation cleanup:", err)
@@ -79,38 +195,66 @@ function PlaybackService:_cleanupAnimation(animatorToStop, heartbeatToDisconnect
 end
 
 function PlaybackService:stopAnimationAndDisconnect(options: StopOptions?)
+	self:_cancelDelayedReplay()
+
 	local doInBackground = false
 	if options and options.background then
 		doInBackground = true
 	end
 
 	local animatorToStop = if options and options.animatorOverride then options.animatorOverride else self.State.activeAnimator
+	local currentTrack = self.State.currentAnimTrack :: TrackLike?
 	local heartbeatToDisconnect = self.State.heartbeat.conn
-	local rigModel = self.State.activeRigModel
+	local rigModel = self.State.activeRigModel or self.State.lastKnownRigModel
+	self._playbackToken = (self._playbackToken :: number) + 1
 
-	-- Immediately clear the state for the new animation, but leave the animator.
-	self.State.currentAnimTrack = nil
-	self.State.heartbeat.conn = nil
-
-	-- Always reset joints synchronously FIRST, before any yielding track cleanup.
-	-- This prevents the race where background track-stopping yields (track.Stopped:Wait())
-	-- and the joint reset never executes bc the thread gets interrupted or the rig changes.
-	if rigModel then
-		for _, desc in ipairs(rigModel:GetDescendants()) do
-			if desc:IsA("Motor6D") then
-				desc.Transform = CFrame.identity
-			elseif desc:IsA("Bone") then
-				desc.Transform = CFrame.identity
+	local immediateTracks: { TrackLike } = {}
+	local immediateTrackSet: TrackSet = {}
+	if currentTrack then
+		table.insert(immediateTracks, currentTrack)
+		immediateTrackSet[currentTrack] = true
+	end
+	local animator = self:_getAnimatorInstance(animatorToStop)
+	if animator then
+		local ok, tracks = pcall(function(): { TrackLike }
+			return animator:GetPlayingAnimationTracks()
+		end)
+		if ok and tracks then
+			for _, track in ipairs(tracks) do
+				if track ~= currentTrack then
+					table.insert(immediateTracks, track)
+					immediateTrackSet[track] = true
+				end
 			end
 		end
 	end
+
+	for _, track in ipairs(immediateTracks) do
+		pcall(function()
+			track:AdjustSpeed(0)
+		end)
+		pcall(function()
+			track:Stop(0)
+		end)
+	end
+
+	-- Immediately clear the state and cancel any pending playback callbacks.
+	self.State.currentAnimTrack = nil
+	self.State.heartbeat.conn = nil
+	self.State.isPlaying:set(false)
+	self.State.isFinished:set(false)
+
+	self:_disconnectConnection(heartbeatToDisconnect)
+
+	self:_resetRigPose(rigModel)
+	self:_flushAnimatorPose(animatorToStop)
 
 	if not animatorToStop and not heartbeatToDisconnect then
 		return
 	end
 
 	local function cleanupTask()
-		self:_cleanupAnimation(animatorToStop, heartbeatToDisconnect, rigModel)
+		self:_cleanupAnimation(animatorToStop, heartbeatToDisconnect, rigModel, immediateTrackSet)
 	end
 
 	if doInBackground then
@@ -243,7 +387,7 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 
 	-- Sync keyframe names/markers before creating animation (when not using override)
 	if not kfsOverride then
-		self.State.activeRig.keyframeNames = self.State.keyframeNames:get() :: { any }?
+		self.State.activeRig.keyframeNames = self.State.keyframeNames:get() :: { KeyframeNameLike }?
 	end
 
 	local kfs = kfsOverride or self.State.activeRig:ToRobloxAnimation()
@@ -278,24 +422,32 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 		warn("Failed to load animation track.")
 	end
 
-    local function playAnimation()
+	local function playAnimation()
         if self.State.currentAnimTrack then
             local animTrack = self.State.currentAnimTrack :: AnimationTrack
+			self:_cancelDelayedReplay()
             animTrack.TimePosition = 0
             animTrack:Play()
+			animTrack:AdjustSpeed(1)
             -- ensure ui reflects the current state
             self.State.isPlaying:set(true)
             self.State.isReversed:set(false)
+			self.State.isFinished:set(false)
             self:updateUI()
         end
     end
 
 	playAnimation()
+	local playbackToken = self._playbackToken :: number
 
 	local lastStepTime = tick()
 
 	self:disconnectHeartbeat()
 	self.State.heartbeat.conn = RunService.Heartbeat:Connect(function(step)
+		if self._playbackToken ~= playbackToken then
+			return
+		end
+
 		local currentTime = tick()
 		local delta = currentTime - lastStepTime
 		lastStepTime = currentTime
@@ -316,16 +468,15 @@ function PlaybackService:playCurrentAnimation(activeAnimator, kfsOverride)
 						playAnimation()
 					else
 						if self.State.isPlaying:get() then
+							animTrack:AdjustSpeed(0)
 							self.State.isPlaying:set(false)
 							self.State.isFinished:set(true)
 							self:updateUI()
-							task.spawn(function()
-								task.wait(self.State.stopSpeed:get())
-								if self.State.isFinished:get() and self.State.currentAnimTrack then
-									self.State.isFinished:set(false)
-									playAnimation()
-									self:updateUI()
+							self:_scheduleDelayedReplay(playbackToken, function()
+								if self.State.currentAnimTrack ~= animTrack then
+									return
 								end
+								playAnimation()
 							end)
 						end
 					end

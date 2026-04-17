@@ -30,6 +30,16 @@ transform_to_blender = bpy_extras.io_utils.axis_conversion(
 ).to_4x4()  # transformation matrix from Y-up to Z-up
 
 
+def _get_reported_bone_parent_name(bone):
+    bone_data = getattr(bone, "bone", bone)
+    original_parent = bone_data.get("rbx_original_parent", "") if bone_data else ""
+    if isinstance(original_parent, str) and original_parent:
+        return original_parent
+
+    parent = getattr(bone, "parent", None)
+    return parent.name if parent else None
+
+
 def process_pending_requests():
     """Process any pending animation requests"""
     try:
@@ -94,9 +104,7 @@ def execute_list_armatures(task_id):
                 # build bone hierarchy map: { bone_name: parent_bone_name or None }
                 bone_hierarchy = {}
                 for bone in obj.data.bones:
-                    bone_hierarchy[bone.name] = (
-                        bone.parent.name if bone.parent else None
-                    )
+                    bone_hierarchy[bone.name] = _get_reported_bone_parent_name(bone)
 
                 armature_info = {
                     "name": obj.name,
@@ -678,25 +686,29 @@ def execute_get_bone_rest(task_id, armature_name):
         sorted_bones = sorted(ao.pose.bones, key=lambda b: len(b.parent_recursive))
 
         for pose_bone in sorted_bones:
-            has_nicetransform = "nicetransform" in pose_bone.bone
+            has_motor6d_props = (
+                "transform" in pose_bone.bone
+                and "transform1" in pose_bone.bone
+                and "nicetransform" in pose_bone.bone
+            )
 
-            if has_nicetransform:
-                # Traditional bone with nicetransform - use tail position logic
-                extr_inv = Matrix(pose_bone.bone["nicetransform"]).inverted()
-                # Use the tail position instead of head by translating matrix_local by the bone vector.
-                tail_local_matrix = pose_bone.bone.matrix_local @ Matrix.Translation(
-                    pose_bone.bone.vector
-                )
-                rest_obj_transform = world_transform @ (tail_local_matrix @ extr_inv)
+            if has_motor6d_props:
+                # Keep sync-bones aligned with the Motor6D serializer by rebuilding
+                # the rest joint frame from the stored Roblox-space transforms.
+                orig_mat = Matrix(pose_bone.bone["transform"])
+                orig_mat_tr1 = Matrix(pose_bone.bone["transform1"])
+                rest_obj_transform = back_trans @ (orig_mat @ orig_mat_tr1)
             else:
-                # New bone without nicetransform - use head position (matrix_local)
+                # New/deform bones don't have stored Motor6D metadata, so derive the
+                # rest frame from the actual Blender rest pose in object space.
                 rest_obj_transform = world_transform @ pose_bone.bone.matrix_local
 
             rest_transform_cache[pose_bone.name] = rest_obj_transform
 
             # Calculate the bone's rest transform relative to its parent.
-            if pose_bone.parent:
-                parent_rest_transform = rest_transform_cache.get(pose_bone.parent.name)
+            reported_parent_name = _get_reported_bone_parent_name(pose_bone)
+            if reported_parent_name:
+                parent_rest_transform = rest_transform_cache.get(reported_parent_name)
                 if parent_rest_transform:
                     try:
                         # The relative transform is the transformation from the parent's space to the child's space.
@@ -753,7 +765,7 @@ def execute_get_bone_rest(task_id, armature_name):
             bone_poses[pose_bone.name] = {
                 "world": world_components,
                 "relative": relative_components,
-                "parent": pose_bone.parent.name if pose_bone.parent else None,
+                "parent": reported_parent_name,
                 "is_synthetic_helper": is_synthetic,
             }
 

@@ -1,6 +1,7 @@
 import gzip
 import struct
 import unittest
+from unittest import mock
 
 from ..animation.face_controls import (
     compute_facs_bone_transforms,
@@ -9,6 +10,7 @@ from ..animation.face_controls import (
     facs_payload_from_mesh_data,
     grouped_face_controls,
 )
+from ..rig import filemesh
 from ..rig.filemesh import extract_asset_id, parse_filemesh
 
 
@@ -269,6 +271,48 @@ def _make_v6_mesh():
     return b"version 6.00\n" + chunks
 
 
+def _make_lods_chunk(lod_type=1, num_high_quality_lods=1, lod_offsets=(0,)):
+    body = struct.pack("<HB", lod_type, num_high_quality_lods)
+    body += struct.pack("<I", len(lod_offsets))
+    if lod_offsets:
+        body += struct.pack(f"<{len(lod_offsets)}I", *lod_offsets)
+    return b"LODS\0\0\0\0" + struct.pack("<II", 1, len(body)) + body
+
+
+def _make_v6_mesh_with_lods():
+    name_table = _make_name_table()
+    coremesh = b"".join(
+        [
+            struct.pack("<I", 2),
+            _make_vertex(0.0, 0.0, 0.0),
+            _make_vertex(1.0, 0.0, 0.0),
+            struct.pack("<I", 1),
+            _make_faces_block(),
+        ]
+    )
+    skinning = b"".join(
+        [
+            struct.pack("<I", 2),
+            _make_skinning_block(),
+            struct.pack("<I", 2),
+            _make_bone(0),
+            _make_bone(5),
+            struct.pack("<I", len(name_table)),
+            name_table,
+            struct.pack("<I", 1),
+            _make_subset(),
+        ]
+    )
+    chunks = b"".join(
+        [
+            b"COREMESH" + struct.pack("<II", 1, len(coremesh)) + coremesh,
+            _make_lods_chunk(lod_type=2, num_high_quality_lods=1, lod_offsets=(0, 24)),
+            b"SKINNING" + struct.pack("<II", 1, len(skinning)) + skinning,
+        ]
+    )
+    return b"version 6.00\n" + chunks
+
+
 def _make_v6_mesh_with_facs():
     name_table = _make_name_table()
     facs_block = _make_v5_facs_block()
@@ -330,6 +374,32 @@ def _make_v7_mesh():
     return b"version 7.00\n" + chunks
 
 
+def _make_v7_mesh_with_lods():
+    name_table = _make_name_table()
+    coremesh = struct.pack("<I", 4) + b"DRCO"
+    skinning = b"".join(
+        [
+            struct.pack("<I", 2),
+            _make_skinning_block(),
+            struct.pack("<I", 2),
+            _make_bone(0),
+            _make_bone(5),
+            struct.pack("<I", len(name_table)),
+            name_table,
+            struct.pack("<I", 1),
+            _make_subset(),
+        ]
+    )
+    chunks = b"".join(
+        [
+            b"COREMESH" + struct.pack("<II", 2, len(coremesh)) + coremesh,
+            _make_lods_chunk(lod_type=3, num_high_quality_lods=2, lod_offsets=(0, 12, 24)),
+            b"SKINNING" + struct.pack("<II", 1, len(skinning)) + skinning,
+        ]
+    )
+    return b"version 7.00\n" + chunks
+
+
 class TestFileMeshParsing(unittest.TestCase):
     def test_extract_asset_id(self):
         self.assertEqual(extract_asset_id("rbxassetid://12345"), 12345)
@@ -357,6 +427,13 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
         self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
 
+    def test_parse_v6_reads_lods_chunk_metadata(self):
+        parsed = parse_filemesh(_make_v6_mesh_with_lods())
+
+        self.assertEqual(parsed["lod_type"], 2)
+        self.assertEqual(parsed["num_high_quality_lods"], 1)
+        self.assertEqual(parsed["lod_offsets"], [0, 24])
+
     def test_parse_v7_skinning_without_positions(self):
         parsed = parse_filemesh(_make_v7_mesh())
         self.assertEqual(parsed["version"], "version 7.00")
@@ -365,6 +442,32 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(parsed["num_vertices"], 2)
         self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
         self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
+
+    def test_parse_v7_reads_lods_chunk_metadata(self):
+        parsed = parse_filemesh(_make_v7_mesh_with_lods())
+
+        self.assertEqual(parsed["lod_type"], 3)
+        self.assertEqual(parsed["num_high_quality_lods"], 2)
+        self.assertEqual(parsed["lod_offsets"], [0, 12, 24])
+
+    def test_parse_v7_uses_draco_geometry_when_decoder_available(self):
+        decoded_vertices = [
+            {"position": (0.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (0.0, 0.0)},
+            {"position": (1.0, 0.0, 0.0), "normal": (0.0, 1.0, 0.0), "uv": (1.0, 0.0)},
+        ]
+
+        with mock.patch.object(
+            filemesh,
+            "_decode_draco_coremesh_v2",
+            return_value=(decoded_vertices, [(0, 1, 1)], 2),
+        ):
+            parsed = parse_filemesh(_make_v7_mesh())
+
+        self.assertEqual(parsed["version"], "version 7.00")
+        self.assertEqual(parsed["positions"], [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)])
+        self.assertEqual(parsed["normals"][0], (0.0, 1.0, 0.0))
+        self.assertEqual(parsed["uvs"][1], (1.0, 0.0))
+        self.assertEqual(parsed["faces"], [(0, 1, 1)])
 
     def test_parse_v5_facs_metadata(self):
         parsed = parse_filemesh(_make_v5_mesh())

@@ -38,6 +38,31 @@ def _strip_suffix(name: str) -> str:
     return re.sub(r"\.\d+$", "", name or "")
 
 
+def _resolve_imported_obj_name(name: str, known_names=None) -> str:
+    """Resolve Blender OBJ-import numeric suffixes against known target names.
+
+    Blender's OBJ importer often appends a trailing digit when duplicate object
+    names collide, e.g. "Sword" -> "Sword1" or "AccessoryDW3" ->
+    "Accessorydw31". Only collapse that suffix when doing so matches a known
+    metadata target name.
+    """
+    base_name = _strip_suffix(name).lower()
+    if not known_names or base_name in known_names:
+        return base_name
+
+    match = re.match(r"^(.*?)(\d+)$", base_name)
+    if not match:
+        return base_name
+
+    prefix, digits = match.groups()
+    for trim_count in range(1, len(digits) + 1):
+        candidate = prefix + digits[:-trim_count]
+        if candidate in known_names:
+            return candidate
+
+    return base_name
+
+
 def _dict_get_any(data, keys):
     """Get first present non-empty value for any key (case/underscore-insensitive)."""
     if not isinstance(data, dict):
@@ -83,6 +108,87 @@ def _coerce_cf12(value):
     return [value[i] for i in range(12)]
 
 
+def _joint_transform_key(node, *keys):
+    return _coerce_cf12(_dict_get_any(node, keys))
+
+
+def _get_joint_part_world_matrix(node):
+    transform = _joint_transform_key(node, "transform")
+    if not transform:
+        return None
+    return cf_to_mat(transform)
+
+
+def _get_joint_anchor_world_matrix(node):
+    part_world = _get_joint_part_world_matrix(node)
+    if part_world is None:
+        return None
+
+    child_offset = _joint_transform_key(node, "jointtransform1", "jointTransform1")
+    if child_offset:
+        return part_world @ cf_to_mat(child_offset)
+    return part_world
+
+
+def _matrix_difference_score(left, right):
+    if left is None or right is None:
+        return float("inf")
+
+    translation_error = (left.to_translation() - right.to_translation()).length
+    rotation_error = 0.0
+    for row in range(3):
+        for col in range(3):
+            rotation_error += abs(left[row][col] - right[row][col])
+
+    return translation_error + rotation_error
+
+
+def _annotate_weapon_original_parents(joints_tree, attachment_parent_name, attachment_parent_transform):
+    """Recover the original Motor6D parent for imported weapon bones."""
+    assignments = {}
+
+    if not isinstance(joints_tree, dict) or not attachment_parent_name or attachment_parent_transform is None:
+        return assignments
+
+    def recurse(node, candidates):
+        if not isinstance(node, dict):
+            return
+
+        joint_name = node.get("jname")
+        node["originalParentBone"] = attachment_parent_name
+        if joint_name:
+            assignments[joint_name] = attachment_parent_name
+
+        child_anchor_world = _get_joint_anchor_world_matrix(node)
+        parent_offset = _joint_transform_key(node, "jointtransform0", "jointTransform0")
+        if child_anchor_world is not None and parent_offset and candidates:
+            parent_offset_mat = cf_to_mat(parent_offset)
+            best_parent_name = attachment_parent_name
+            best_score = float("inf")
+
+            for candidate_name, candidate_part_world in candidates:
+                predicted_child_anchor = candidate_part_world @ parent_offset_mat
+                score = _matrix_difference_score(predicted_child_anchor, child_anchor_world)
+                if score < best_score:
+                    best_score = score
+                    best_parent_name = candidate_name
+
+            node["originalParentBone"] = best_parent_name
+            if joint_name:
+                assignments[joint_name] = best_parent_name
+
+        next_candidates = list(candidates)
+        node_part_world = _get_joint_part_world_matrix(node)
+        if joint_name and node_part_world is not None:
+            next_candidates.append((joint_name, node_part_world))
+
+        for child in node.get("children", []) or []:
+            recurse(child, next_candidates)
+
+    recurse(joints_tree, [(attachment_parent_name, attachment_parent_transform)])
+    return assignments
+
+
 def _norm_name(value):
     if not isinstance(value, str):
         return ""
@@ -113,12 +219,82 @@ def _iter_part_aux_entries(meta_loaded):
     return list(part_aux)
 
 
+def _normalize_accessory_handle_jnames(meta_loaded):
+    """Rewrite stale accessory Handle joint names to their exported part names.
+
+    Older Studio exports often encode accessory weld nodes with joint names like
+    Handle/Handle1 while the actual exported part name lives in pname. That leaks
+    into Blender bone creation and fallback matching. Normalize those nodes early
+    so the importer consistently uses the exported accessory part name.
+    """
+    if not isinstance(meta_loaded, dict):
+        return 0
+
+    renamed = 0
+
+    def recurse(node):
+        nonlocal renamed
+
+        if not isinstance(node, dict):
+            return
+
+        joint_type = str(node.get("jointType") or "")
+        jname = node.get("jname")
+        pname = node.get("pname")
+        if (
+            joint_type in {"Weld", "WeldConstraint"}
+            and isinstance(jname, str)
+            and isinstance(pname, str)
+            and jname.lower().startswith("handle")
+            and not pname.lower().startswith("handle")
+            and pname.strip()
+        ):
+            node["jname"] = pname
+            renamed += 1
+
+        for child in node.get("children") or []:
+            recurse(child)
+
+    recurse(meta_loaded.get("rig"))
+    recurse(meta_loaded.get("joints"))
+    for attachment in meta_loaded.get("weaponAttachments") or []:
+        if isinstance(attachment, dict):
+            recurse(attachment.get("joints"))
+
+    return renamed
+
+
 def _meta_has_skinned_meshes(meta_loaded):
     """Return True when metadata explicitly marks any skinned mesh part entries."""
     for entry in _iter_part_aux_entries(meta_loaded):
         if isinstance(entry, dict) and entry.get("has_skinning") and entry.get("mesh_id"):
             return True
     return False
+
+
+def _meta_is_majority_skinned(meta_loaded):
+    """Return True when most body-part MeshParts have explicit skinning data.
+
+    Distinguishes proper skinned rigs (most limbs skinned -> CONNECT) from
+    hybrid rigs (only a few parts skinned, e.g. head -> LOCAL_YAXIS_EXTEND).
+    """
+    total = 0
+    skinned = 0
+    for entry in _iter_part_aux_entries(meta_loaded):
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("mesh_id"):
+            continue
+        mesh_class = entry.get("mesh_class")
+        if mesh_class not in (None, "", "MeshPart"):
+            continue
+        # skip accessories (wrap layers) — only count body parts
+        if entry.get("wrap_layer"):
+            continue
+        total += 1
+        if entry.get("has_skinning"):
+            skinned += 1
+    return total > 0 and skinned > total / 2
 
 
 def _meta_has_filemesh_candidates(meta_loaded):
@@ -520,6 +696,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
                 "ratios": ratios,
                 "sig": sum(sorted_dims),
                 "is_vol": False,
+                "is_wrap_layer": bool(item.get("wrap_layer")),
             })
         elif "vol_fp" in item:
             vol = float(item["vol_fp"])
@@ -530,10 +707,13 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
                 "ratios": (1.0, 1.0),
                 "sig": vol,
                 "is_vol": True,
+                "is_wrap_layer": bool(item.get("wrap_layer")),
             })
 
     if not fp_targets:
         return 0
+
+    known_target_names = {item["target"].lower(): item.get("family") or "body" for item in fp_targets}
 
     mesh_objects = [o for o in parts_collection.objects if o.type == "MESH"]
     mesh_centers = {obj: _get_mesh_world_center(obj) for obj in mesh_objects}
@@ -542,8 +722,11 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
     all_candidates = []
     
     for obj in mesh_objects:
-        base_name = _strip_suffix(obj.name).lower()
-        candidate_family = "accessory" if base_name.startswith("handle") else "body"
+        base_name = _resolve_imported_obj_name(obj.name, known_target_names)
+        candidate_family = known_target_names.get(
+            base_name,
+            "accessory" if base_name.startswith("handle") else "body",
+        )
         d = obj.dimensions
         sorted_dims = tuple(sorted([d.x, d.y, d.z]))
         sig = sum(sorted_dims)
@@ -555,6 +738,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
             "dims": sorted_dims,
             "ratios": ratios,
             "sig": sig,
+            "resolved_name": base_name,
         }
         all_candidates.append(cand)
     
@@ -618,11 +802,13 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         target_sig = target["sig"]
         target_ratios = target["ratios"]
         is_vol = target.get("is_vol", False)
+        is_wrap_layer = bool(target.get("is_wrap_layer"))
         expected_locs = expected_loc_by_name.get(target_lower)
         
         for ci, cand in enumerate(all_candidates):
             obj = cand["obj"]
             mesh_center = mesh_centers[obj]
+            name_confirmed_wrap = is_wrap_layer and cand.get("resolved_name") == target_lower
 
             if cand.get("family") != target_family:
                 continue
@@ -680,14 +866,19 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
                         best_dist = d
                         best_scaled = es
                 pos_dist = best_dist
-                pos_norm = min(pos_dist / max(MAX_POS_DIST, 1e-6), 3.0)
+                if name_confirmed_wrap:
+                    pos_norm = 0.0
+                else:
+                    pos_norm = min(pos_dist / max(MAX_POS_DIST, 1e-6), 3.0)
                 
                 # side mismatch: penalize when mesh and expected position
                 # disagree on which side of the rig they're on (x-sign).
                 expected_x = best_scaled.x
                 mesh_x = mesh_center.x
                 tolerance = max(0.02, 0.05 * estimated_rig_scale)
-                if abs(expected_x) >= tolerance and abs(mesh_x) >= tolerance:
+                if (not name_confirmed_wrap
+                        and abs(expected_x) >= tolerance
+                        and abs(mesh_x) >= tolerance):
                     if (expected_x > 0) != (mesh_x > 0):
                         side_penalty = SIDE_MISMATCH_PENALTY
             
@@ -742,6 +933,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         obj = cand["obj"]
         target_name = target["target"]
         scale = scale_matrix[ti, ci]
+        wrap_name_confirmed = bool(target.get("is_wrap_layer")) and cand.get("resolved_name") == target_name.lower()
         
         current_name = _strip_suffix(obj.name)
         if not target.get("is_vol", False) and scale > 0:
@@ -761,7 +953,7 @@ def _rename_parts_by_size_fingerprint(meta_loaded, parts_collection):
         else:
             pos_info = "no_pos_data"
         
-        pos_confirmed = pos_dist < FP_LOCK_POS_THRESHOLD
+        pos_confirmed = wrap_name_confirmed or pos_dist < FP_LOCK_POS_THRESHOLD
         lock_tag = "LOCK" if pos_confirmed else "TENTATIVE"
         
         if current_name == target_name:
@@ -972,9 +1164,19 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         print(f"[RigImport] {len(fp_matched_objs)} parts locked from fingerprint pass")
     
     # Build name index for direct name matching (case-insensitive)
+    known_target_names = set(all_rig_names)
+    part_aux_raw = meta_loaded.get("partAux") if meta_loaded else None
+    if part_aux_raw:
+        pa_list = list(part_aux_raw.values()) if isinstance(part_aux_raw, dict) else part_aux_raw
+        for item in (pa_list or []):
+            if isinstance(item, dict):
+                name = item.get("name")
+                if name:
+                    known_target_names.add(str(name).lower())
+
     name_index = {}
     for obj in mesh_objects:
-        base_name = _strip_suffix(obj.name).lower()
+        base_name = _resolve_imported_obj_name(obj.name, known_target_names)
         name_index.setdefault(base_name, []).append(obj)
     
     # Precompute geometric centers and build spatial hash
@@ -1024,7 +1226,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     # This replaces the per-query O(n) scan with an O(1) lookup.
     _obj_rig_name = {}  # obj -> lowered rig name it matches (if any)
     for obj in mesh_objects:
-        base = _strip_suffix(obj.name).lower()
+        base = _resolve_imported_obj_name(obj.name, known_target_names)
         if base in all_rig_names:
             _obj_rig_name[obj] = base
 
@@ -1041,7 +1243,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         available = [o for o in candidates if o not in used]
         return available[0] if available else None
     
-    def match_by_position(cf, target_name, allow_reserved_override=False):
+    def match_by_position(cf, target_name, allow_reserved_override=False, max_distance_override=None):
         """Match by spatial-hash nearest-neighbor lookup with size-aware tolerance.
         
         Tolerance scales with the expected part size — tiny parts need to be
@@ -1076,7 +1278,8 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         else:
             pos_tolerance = max(0.5, 0.5 * scale_factor) if scale_factor else 0.5
         
-        best, dist = spatial.query_nearest(expected_loc, exclude, max_distance=pos_tolerance)
+        query_max_distance = max_distance_override if max_distance_override is not None else pos_tolerance
+        best, dist = spatial.query_nearest(expected_loc, exclude, max_distance=query_max_distance)
         if best:
             # Size gate: reject if mesh dims are wildly incompatible with expected
             if exp_dims:
@@ -1090,11 +1293,26 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
                             print(f"[RigImport]   '{target_name}' REJECTED '{best.name}' (size ratio={ratio:.2f}, dist={dist:.4f})")
                             return None
             
-            print(f"[RigImport]   '{target_name}' MATCHED (dist={dist:.4f}, tol={pos_tolerance:.3f}) -> '{best.name}'")
+            print(f"[RigImport]   '{target_name}' MATCHED (dist={dist:.4f}, tol={query_max_distance:.3f}) -> '{best.name}'")
             return best
 
-        print(f"[RigImport]   '{target_name}' NO POSITION MATCH at ({expected_loc.x:.4f}, {expected_loc.y:.4f}, {expected_loc.z:.4f}) tol={pos_tolerance:.3f}")
+        print(f"[RigImport]   '{target_name}' NO POSITION MATCH at ({expected_loc.x:.4f}, {expected_loc.y:.4f}, {expected_loc.z:.4f}) tol={query_max_distance:.3f}")
         return None
+
+    def match_wrap_target_by_strong_position(cf, target_name):
+        target_lower = target_name.lower()
+        exp_dims = expected_dims_by_name.get(target_lower)
+        if exp_dims:
+            exp_size = max(exp_dims) * (scale_factor if scale_factor else 1.0)
+            strong_tolerance = max(0.03, min(0.16, exp_size * 0.12))
+        else:
+            strong_tolerance = 0.08
+        return match_by_position(
+            cf,
+            target_name,
+            allow_reserved_override=False,
+            max_distance_override=strong_tolerance,
+        )
 
     # Pre-mark fingerprint-matched objects as used so they don't get stolen
     for tname, obj in (fingerprint_object_map or {}).items():
@@ -1103,6 +1321,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     matched_count = 0
     unmatched_names = []
     pending_renames = []  # List of (obj, target_name)
+    matched_objects = []  # List of (obj, target_name)
     
     # Collect all nodes that need matching (excluding root)
     nodes_to_match = []  # List of (jname, transform, is_aux)
@@ -1133,7 +1352,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     print(f"[RigImport] Collected {len(nodes_to_match)} nodes to match")
 
     if synth_preferred_targets:
-        print(f"[RigImport] Hidden-body synthesis preferred for {len(synth_preferred_targets)} wrap targets")
+        print(f"[RigImport] Metadata-only hidden wrap targets detected for {len(synth_preferred_targets)} body parts")
     
     # Check if meshes already have names matching the rig bones
     # If so, use name-based matching. If not, use position-based matching.
@@ -1150,7 +1369,7 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         print("[RigImport] Fingerprinting successful - running NAME matching on corrected parts")
     else:
         for obj in mesh_objects:
-            base_name = _strip_suffix(obj.name).lower()
+            base_name = _resolve_imported_obj_name(obj.name, known_target_names)
             if base_name in all_rig_names:
                 meshes_with_rig_names += 1
         use_name_matching = meshes_with_rig_names > 0
@@ -1164,32 +1383,53 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
         
         obj = None
         prefix = "AUX " if is_aux else ""
-        allow_position_fallback = not (target_lower in synth_preferred_targets and not is_aux)
+        is_hidden_wrap_target = target_lower in synth_preferred_targets and not is_aux
         
         if use_name_matching:
             # Use name matching
             obj = match_by_name(target_name)
             if obj:
                 print(f"[RigImport] {prefix}'{target_name}' matched by NAME -> '{obj.name}'")
-            elif transform and allow_position_fallback:
+            elif transform and not is_hidden_wrap_target:
                 obj = match_by_position(transform, target_name, allow_reserved_override=True)
                 if obj:
                     print(f"[RigImport] {prefix}'{target_name}' matched by POSITION -> '{obj.name}'")
+            elif transform and is_hidden_wrap_target:
+                # Two-tier: try tight tolerance first, then normal tolerance.
+                # Truly absent parts (no nearby mesh) fail both tiers.
+                obj = match_wrap_target_by_strong_position(transform, target_name)
+                if obj:
+                    print(f"[RigImport] {prefix}'{target_name}' matched by STRONG POSITION -> '{obj.name}'")
+                else:
+                    obj = match_by_position(transform, target_name, allow_reserved_override=True)
+                    if obj:
+                        print(f"[RigImport] {prefix}'{target_name}' matched by POSITION (wrap target fallback) -> '{obj.name}'")
         else:
             # Use position matching
-            if transform and allow_position_fallback:
+            if transform and not is_hidden_wrap_target:
                 obj = match_by_position(transform, target_name)
                 if obj:
                     print(f"[RigImport] {prefix}'{target_name}' matched by POSITION -> '{obj.name}'")
+            elif transform and is_hidden_wrap_target:
+                obj = match_wrap_target_by_strong_position(transform, target_name)
+                if obj:
+                    print(f"[RigImport] {prefix}'{target_name}' matched by STRONG POSITION -> '{obj.name}'")
+                else:
+                    obj = match_by_position(transform, target_name)
+                    if obj:
+                        print(f"[RigImport] {prefix}'{target_name}' matched by POSITION (wrap target fallback) -> '{obj.name}'")
 
-        if obj is None and transform and not allow_position_fallback:
-            print(f"[RigImport] {prefix}'{target_name}' skipped POSITION fallback -> synthesize hidden wrap target")
+        if obj is None and transform and is_hidden_wrap_target:
+            print(f"[RigImport] {prefix}'{target_name}' no mesh nearby -> keep hidden wrap target absent")
         
         if obj:
             current_base = _strip_suffix(obj.name)
             if current_base != target_name:
                 pending_renames.append((obj, target_name))
                 matched_count += 1
+                matched_objects.append((obj, target_name))
+            else:
+                matched_objects.append((obj, current_base))
             used.add(obj)
         else:
             unmatched_names.append(target_name)
@@ -1242,7 +1482,16 @@ def _rename_parts_by_fingerprint(rig_def, parts_collection, renamed_via_fingerpr
     print("[RigImport] === END POSITION COMPARISON ===")
 
     print("[RigImport] " + "="*50)
-    
+
+    if meta_loaded is not None:
+        updated_fp_map = dict(fingerprint_object_map or {})
+        for obj, _target_name in matched_objects:
+            stale_keys = [key for key, mapped_obj in updated_fp_map.items() if mapped_obj is obj and key != obj.name]
+            for stale_key in stale_keys:
+                updated_fp_map.pop(stale_key, None)
+            updated_fp_map[obj.name] = obj
+        meta_loaded["_fingerprint_object_map"] = updated_fp_map
+
     return matched_count > 0
 
 
@@ -1345,6 +1594,18 @@ def _rename_indexed_parts(meta_loaded, parts_collection):
         return True, None
 
     return False, None
+
+
+def _parts_already_named(parts_list, parts_collection):
+    if not isinstance(parts_list, list) or not parts_list:
+        return False
+
+    mesh_names = {obj.name for obj in parts_collection.objects if obj.type == "MESH"}
+    expected_names = {name for name in parts_list if isinstance(name, str) and name}
+    if not expected_names:
+        return False
+
+    return expected_names.issubset(mesh_names)
 
 
 def _autoname_from_pattern(partnames, pattern, objects_to_rename):
@@ -1945,6 +2206,13 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 )
                 return {"CANCELLED"}
 
+            normalized_handle_count = _normalize_accessory_handle_jnames(meta_loaded)
+            if normalized_handle_count:
+                print(
+                    f"[RigImport] normalized {normalized_handle_count} accessory Handle joint name(s) to pname"
+                )
+                meta = json.dumps(meta_loaded, separators=(",", ":"))
+
             print(
                 f"[RigImport] import_ops build=2.4.6 export_version={meta_loaded.get('version', 'unknown')} "
                 f"has_skinned_mesh_metadata={_meta_has_skinned_meshes(meta_loaded)} "
@@ -2005,17 +2273,15 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 renamed_via_fp = _rename_parts_by_size_fingerprint(meta_loaded, parts_collection)
                 
                 fp_map = meta_loaded.get("_fingerprint_object_map", {})
+                rig_scale = meta_loaded.get("_rig_scale", 1.0)
+                _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection, renamed_via_fp, fp_map, rig_scale, meta_loaded=meta_loaded)
+
+                fp_map = meta_loaded.get("_fingerprint_object_map", {})
                 if fp_map:
-                    # fp_map is {obj.name: obj_ref} — store as {obj_name: obj_name}
-                    # so creation.py can reconstruct by object name lookup.
-                    # We ALSO store a reverse map (obj_name -> target_bone_name)
-                    # since multiple objects can share the same base bone name.
                     fp_map_names = {obj_name: obj_name for obj_name in fp_map.keys()}
                     ob["_FingerprintMap"] = json.dumps(fp_map_names)
                     print(f"[RigImport] Stored {len(fp_map_names)} authoritative part mappings")
-                
-                rig_scale = meta_loaded.get("_rig_scale", 1.0)
-                _rename_parts_by_fingerprint(meta_loaded.get("rig"), parts_collection, renamed_via_fp, fp_map, rig_scale, meta_loaded=meta_loaded)
+
             else:
                 print("[RigImport] Indexed rename succeeded, skipping fingerprint passes")
 
@@ -2031,8 +2297,10 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
 
             if has_deform_bones or has_filemesh_candidates:
                 try:
-                    print("[RigImport] auto-generating armature for deform/filemesh-candidate rig")
-                    create_rig("LOCAL_YAXIS_EXTEND", ob.name)
+                    majority_skinned = _meta_is_majority_skinned(meta_loaded)
+                    bone_mode = "CONNECT" if majority_skinned else "LOCAL_YAXIS_EXTEND"
+                    print(f"[RigImport] auto-generating armature for deform/filemesh-candidate rig (mode={bone_mode}, majority_skinned={majority_skinned})")
+                    create_rig(bone_mode, ob.name)
                     if has_skinned_mesh_metadata:
                         print("[RigImport] automatic skinning path completed")
                         self.report({"INFO"}, "skinned rig detected: armature generated and skinning applied")
@@ -2386,19 +2654,21 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                     coll.objects.unlink(obj)
                 parts_coll.objects.link(obj)
 
-        # ---- Rename p<N>x → original names (same as rig import) ----
+        # ---- Rename indexed exports when needed; otherwise accept direct names ----
         renamed_by_index, index_warn = _rename_indexed_parts(meta_loaded, parts_coll)
         if index_warn:
             print(f"[WeaponImport] Index rename warning: {index_warn}")
 
-        if not renamed_by_index:
+        if renamed_by_index:
+            print("[WeaponImport] Indexed rename succeeded")
+        elif _parts_already_named(meta_loaded.get("parts", {}), parts_coll):
+            print("[WeaponImport] Imported meshes already use exported part names")
+        else:
             # fallback to fingerprint matching (same as rig)
             renamed_via_fp = _rename_parts_by_size_fingerprint(meta_loaded, parts_coll)
             fp_map = meta_loaded.get("_fingerprint_object_map", {})
             # weapon has no "rig" key, so skip tree-based fingerprinting
             print(f"[WeaponImport] Indexed rename failed, fingerprint renamed {renamed_via_fp} parts")
-        else:
-            print("[WeaponImport] Indexed rename succeeded")
 
         # collect weapon meshes after rename
         weapon_meshes = [obj for obj in parts_coll.objects if obj.type == "MESH"]
@@ -2535,9 +2805,16 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
             # we use identity (weapon root lands on parent bone head).
 
             from ..rig.constraints import link_object_to_bone_rigid
+            t2b = get_transform_to_blender()
 
             root_jname = joints_tree.get("jname", weapon_name)
             weapon_children = joints_tree.get("children", [])
+            parent_transform_prop = parent_edit_bone.get("transform")
+            if parent_transform_prop:
+                parent_part_world_mat = Matrix([list(row) for row in parent_transform_prop])
+            else:
+                parent_part_world_mat = t2b.inverted() @ Matrix.Translation(parent_edit_bone.head)
+                print("[WeaponImport] WARNING: no stored transform on parent bone, using bone head")
 
             print(f"[WeaponImport] Weapon root '{root_jname}' will be parented "
                   f"to bone '{parent_bone_name}'")
@@ -2556,8 +2833,6 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
             # (which reads `transform` to compute bone head) places everything
             # in the right spot — same as if the weapon had been at that
             # position during export.
-            t2b = get_transform_to_blender()
-
             weapon_root_cf = joints_tree.get("transform")
             if weapon_root_cf:
                 # Where the weapon root CFrame IS (roblox world → blender)
@@ -2577,15 +2852,7 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                 #
                 # The parent bone stores its Roblox CFrame in the "transform"
                 # custom property (set by load_rigbone during rig import).
-                parent_transform_prop = parent_edit_bone.get("transform")
-                if parent_transform_prop:
-                    parent_cf_mat = Matrix([list(row) for row in parent_transform_prop])
-                else:
-                    # fallback: bone head
-                    parent_cf_mat = t2b.inverted() @ Matrix.Translation(
-                        parent_edit_bone.head)
-                    print("[WeaponImport] WARNING: no stored transform on "
-                          "parent bone, using bone head")
+                parent_cf_mat = parent_part_world_mat
 
                 conn_c0 = _coerce_cf12(
                     meta_loaded.get("connectionC0")
@@ -2731,6 +2998,16 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                         0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]
                     print("[WeaponImport] No connection data — identity joint")
 
+            original_parent_map = _annotate_weapon_original_parents(
+                joints_tree,
+                parent_bone_name,
+                parent_part_world_mat,
+            )
+            if original_parent_map:
+                print(
+                    f"[WeaponImport] Preserved original Motor6D parents for {len(original_parent_map)} weapon bone(s)"
+                )
+
             # ---- Build weapon bones via load_rigbone (same as rig import) ----
             rigging_type = "RAW"
             try:
@@ -2753,6 +3030,11 @@ class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
                       f"found. Bones: {[b.name for b in armature.data.bones]}")
             else:
                 print(f"[WeaponImport] Root bone '{root_jname}' created ok")
+
+            for bone_name, original_parent_name in original_parent_map.items():
+                data_bone = armature.data.bones.get(bone_name)
+                if data_bone and original_parent_name:
+                    data_bone["rbx_original_parent"] = original_parent_name
 
             # ---- Apply pending constraints (mesh → bone CHILD_OF) ----
             pending = match_ctx.get("pending_constraints", [])

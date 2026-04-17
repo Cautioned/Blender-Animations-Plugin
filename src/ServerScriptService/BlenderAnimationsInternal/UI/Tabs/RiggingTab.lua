@@ -28,22 +28,22 @@ local studioLocale = game:GetService("StudioService").StudioLocaleId or "en-us"
 local localeLang = studioLocale:sub(1, 2):lower()
 
 local UPDATE_WARNING: { [string]: string } = {
-	en = "Please update to v2.4.0+ of the Blender addon if you are having issues with exports. The new export method is more robust but requires changes in the addon.",
-	es = "Actualiza a v2.4.0+ del addon de Blender si tienes problemas con las exportaciones. El nuevo método es más robusto pero requiere cambios en el addon. (esto está traducido porque sé que no vas a hacer caso jaja)",
-	pt = "Atualize para v2.4.0+ do addon do Blender se estiver com problemas nas exportações. O novo método é mais robusto, mas requer alterações no addon. (isso está traduzido porque eu sei que você não vai ouvir kk)",
-	fr = "Veuillez mettre à jour vers la v2.4.0+ de l'addon Blender si vous rencontrez des problèmes d'exportation. La nouvelle méthode est plus robuste mais nécessite des modifications de l'addon. (c'est traduit parce que je sais que vous n'écouterez pas mdr)",
-	de = "Bitte aktualisiere auf v2.4.0+ des Blender-Addons, wenn du Probleme beim Export hast. Die neue Methode ist robuster, erfordert aber Änderungen am Addon. (das ist übersetzt, weil ich weiß, dass ihr eh nicht zuhört lol)",
-	it = "Aggiorna l'addon di Blender alla v2.4.0+ se riscontri problemi con le esportazioni. Il nuovo metodo è più robusto ma richiede modifiche all'addon. (questo è tradotto perché so che non ascolterete lol)",
-	ja = "エクスポートに問題がある場合は、Blenderアドオンをv2.4.0以上に更新してください。新しいエクスポート方法はより堅牢ですが、アドオンの変更が必要です。（どうせ読まないと思って翻訳しました笑）",
-	ko = "내보내기에 문제가 있다면 Blender 애드온을 v2.4.0 이상으로 업데이트하세요. 새로운 방법이 더 견고하지만 애드온 변경이 필요합니다. (어차피 안 들을 거 알아서 번역했어요 ㅋㅋ)",
-	ar = "يرجى التحديث إلى الإصدار v2.4.0+ من إضافة Blender إذا كنت تواجه مشاكل في التصدير. الطريقة الجديدة أكثر متانة لكنها تتطلب تغييرات في الإضافة. (هذا مترجم لأني أعرف إنك مش هتسمع الكلام هه)",
-	ru = "Обновите аддон Blender до v2.4.0+, если у вас проблемы с экспортом. Новый метод надёжнее, но требует изменений в аддоне. (это переведено, потому что я знаю, что вы всё равно не послушаете лол)",
-	id = "Perbarui addon Blender ke v2.4.0+ jika ada masalah dengan ekspor. Metode baru lebih tangguh tetapi memerlukan perubahan pada addon. (ini diterjemahkan karena saya tahu kamu nggak bakal dengerin wkwk)",
-	ms = "Sila kemas kini addon Blender ke v2.4.0+ jika anda menghadapi masalah dengan eksport. Kaedah baru lebih teguh tetapi memerlukan perubahan pada addon. (ini diterjemahkan sebab saya tahu anda tak akan dengar haha)",
-	th = "กรุณาอัปเดต addon ของ Blender เป็น v2.4.0 ขึ้นไป หากมีปัญหากับการส่งออก วิธีใหม่แข็งแกร่งกว่าแต่ต้องเปลี่ยนแปลง addon (แปลให้เพราะรู้ว่าคุณไม่ฟังหรอก 555)",
-	tr = "Dışa aktarma sorunları yaşıyorsanız Blender eklentisini v2.4.0+ sürümüne güncelleyin. Yeni yöntem daha sağlam ama eklentide değişiklik gerektirir. (dinlemeyeceğinizi bildiğim için çevirdim lol)",
-	vi = "Vui lòng cập nhật addon Blender lên v2.4.0+ nếu bạn gặp vấn đề khi xuất. Phương pháp mới bền vững hơn nhưng cần thay đổi addon. (dịch ra vì biết bạn không chịu nghe đâu :v)",
-	pl = "Zaktualizuj addon Blendera do v2.4.0+, jeśli masz problemy z eksportem. Nowa metoda jest solidniejsza, ale wymaga zmian w addonie. (przetłumaczono, bo wiem że i tak nie posłuchacie lol)",
+	en = "Skinned and deform rigs are fully supported in v2.5.0 of the Blender addon. Update to v2.5.0+ to use the full rig export pipeline.",
+	es = "Los rigs skinned y deform son totalmente compatibles en la v2.5.0 del addon de Blender. Actualiza a la v2.5.0+ para usar el flujo completo de exportación de rigs.",
+	pt = "Rigs skinned e deform são totalmente suportados na v2.5.0 do addon do Blender. Atualize para v2.5.0+ para usar o fluxo completo de exportação de rigs.",
+	fr = "Les rigs skinned et deform sont entièrement pris en charge dans la v2.5.0 de l'addon Blender. Mettez à jour vers la v2.5.0+ pour utiliser le pipeline complet d'exportation de rigs.",
+	de = "Skinned- und Deform-Rigs werden in v2.5.0 des Blender-Addons vollständig unterstützt. Aktualisiere auf v2.5.0+, um die vollständige Rig-Export-Pipeline zu nutzen.",
+	it = "I rig skinned e deform sono completamente supportati nella v2.5.0 dell'addon di Blender. Aggiorna alla v2.5.0+ per usare l'intera pipeline di esportazione dei rig.",
+	ja = "スキン済みリグとデフォームリグは、Blenderアドオン v2.5.0 で完全にサポートされています。完全なリグ書き出しパイプラインを使うには v2.5.0 以上に更新してください。",
+	ko = "스키닝 및 디폼 리그는 Blender 애드온 v2.5.0에서 완전히 지원됩니다. 전체 리그 내보내기 파이프라인을 사용하려면 v2.5.0 이상으로 업데이트하세요.",
+	ar = "أصبحت هياكل skinned و deform مدعومة بالكامل في الإصدار v2.5.0 من إضافة Blender. حدّث إلى v2.5.0+ لاستخدام مسار تصدير الهياكل بالكامل.",
+	ru = "Скинненные и deform-риги полностью поддерживаются в версии 2.5.0 аддона Blender. Обновитесь до v2.5.0+, чтобы использовать полный пайплайн экспорта ригов.",
+	id = "Rig skinned dan deform didukung penuh di addon Blender v2.5.0. Perbarui ke v2.5.0+ untuk memakai alur ekspor rig lengkap.",
+	ms = "Rig skinned dan deform disokong sepenuhnya dalam addon Blender v2.5.0. Kemas kini ke v2.5.0+ untuk menggunakan saluran eksport rig penuh.",
+	th = "rig แบบ skinned และ deform รองรับเต็มรูปแบบแล้วใน Blender addon v2.5.0 อัปเดตเป็น v2.5.0+ เพื่อใช้กระบวนการส่งออก rig แบบเต็มรูปแบบ",
+	tr = "Skinned ve deform rigler Blender eklentisinin v2.5.0 sürümünde tamamen desteklenir. Tam rig dışa aktarma hattını kullanmak için v2.5.0+ sürümüne güncelleyin.",
+	vi = "Rig skinned va deform được hỗ trợ đầy đủ trong Blender addon v2.5.0. Hãy cập nhật lên v2.5.0+ để dùng toàn bộ quy trình xuất rig.",
+	pl = "Rigi skinned i deform są w pełni obsługiwane w wersji 2.5.0 dodatku do Blendera. Zaktualizuj do v2.5.0+, aby używać pełnego pipeline'u eksportu rigów.",
 }
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
@@ -355,7 +355,7 @@ function RiggingTab.create(services: any)
 						return nil
 					end,
 					[OnEvent("MouseEnter")] = function()
-						activeHint:set("Exports the rig by deleting the humanoid. This may have issues with textures and meshes, but the rig will usually rebuild easily in Blender.")
+						activeHint:set("Exports the rig by deleting the humanoid. This may have issues with textures and meshes, but the rig will usually rebuild more easily in Blender.")
 					end,
 					[OnEvent("MouseLeave")] = function()
 						activeHint:set("")
@@ -373,7 +373,7 @@ function RiggingTab.create(services: any)
 					end,
 					[OnEvent("MouseEnter")] = function()
 						activeHint:set(
-							"Exports the rig with the legacy method while preserving skinned mesh and wrap metadata. Roblox may still randomize mesh/part names when humanoids are involved, but Blender can now reconstruct both body skinning and layered clothing from this export path too.")
+							"Exports the rig with the legacy method while preserving skinned mesh and wrap metadata. Recommended for skinned/deform rigs.")
 					end,
 					[OnEvent("MouseLeave")] = function()
 						activeHint:set("")

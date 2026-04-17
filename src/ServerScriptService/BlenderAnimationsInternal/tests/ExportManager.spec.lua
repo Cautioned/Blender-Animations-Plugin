@@ -41,6 +41,30 @@ return function()
 		end)
 
 		describe("resolveWeapon", function()
+			it("should rename accessory handle parts to the accessory name for export", function()
+				local accessory = Instance.new("Accessory")
+				accessory.Name = "CoolHat"
+				accessory.Parent = workspace
+
+				local handle = Instance.new("Part")
+				handle.Name = "Handle"
+				handle.Parent = accessory
+
+				expect(exportManager:getExportPartName(handle, handle)).to.equal("CoolHat")
+
+				accessory:Destroy()
+			end)
+
+			it("should leave non-accessory handle names unchanged for export", function()
+				local handle = Instance.new("Part")
+				handle.Name = "Handle"
+				handle.Parent = workspace
+
+				expect(exportManager:getExportPartName(handle, handle)).to.equal("Handle")
+
+				handle:Destroy()
+			end)
+
 			it("should resolve a Tool as container", function()
 				local tool = Instance.new("Tool")
 				tool.Name = "Sword"

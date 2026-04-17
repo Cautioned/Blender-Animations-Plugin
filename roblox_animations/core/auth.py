@@ -5,7 +5,7 @@ Flow (mirrors the Roblox Blender Plugin):
   1. Generate PKCE verifier + challenge (SHA-256, base64url).
   2. Generate random CSRF state.
   3. Open browser to the Roblox authorization URL.
-  4. Start a local HTTP server on localhost:8181 in a background thread.
+  4. Start a local HTTP server on localhost:31337 in a background thread.
     5. User approves in browser → Roblox redirects to either localhost or a hosted callback page.
     6. The local callback handler exchanges the auth-code + verifier for tokens using the same redirect URI that started the flow.
   7. Timer callback on the main thread stores the tokens in memory for this session.
@@ -46,11 +46,11 @@ _AUTH_URL = "https://apis.roblox.com/oauth/v1/authorize"
 _TOKEN_URL = "https://apis.roblox.com/oauth/v1/token"
 _REVOKE_URL = "https://apis.roblox.com/oauth/v1/token/revoke"
 _REDIRECT_PATH = "/oauth2/callback"
-_PORT = 8181
+_PORT = 31337  
 _HOSTED_REDIRECT_ENV = "RBX_OAUTH_REDIRECT_URI"
 # Asset delivery is documented under the legacy asset management scope even
 # though other Assets API endpoints use asset:read / asset:write.
-_SCOPES = "openid asset:read legacy-asset:manage"
+_SCOPES = "legacy-asset:manage"
 _CODE_LENGTH = 128
 _CLIENT_ID = "4633080443763556453"
 _STATE_LENGTH = 128
@@ -166,14 +166,6 @@ def get_oauth_redirect_uri() -> str:
     return configured or _get_local_redirect_uri()
 
 
-def get_api_key() -> str:
-    """Returns the session API key, or empty string if not set."""
-    window_manager = _get_window_manager()
-    if window_manager and hasattr(window_manager, "rbx_api_key_session"):
-        return window_manager.rbx_api_key_session.strip()
-    return ""
-
-
 # ---------------------------------------------------------------------------
 # Token lifecycle (main-thread only)
 # ---------------------------------------------------------------------------
@@ -229,13 +221,8 @@ def get_auth_headers() -> dict:
     """
     Returns request headers for authenticated asset access, else ``{}``.
 
-    Priority:
-      1. OAuth Bearer token (auto-refreshed if expired)
-      2. API key via ``x-api-key`` header
-
     Call only from the Blender main thread.
     """
-    # --- OAuth Bearer ---
     if _store.is_valid:
         return {"Authorization": f"Bearer {_store.access_token}"}
 
@@ -247,11 +234,6 @@ def get_auth_headers() -> dict:
                 return {"Authorization": f"Bearer {_store.access_token}"}
         except Exception as exc:
             print(f"[RbxAuth] Token refresh failed: {exc}")
-
-    # --- API key fallback ---
-    api_key = get_api_key()
-    if api_key:
-        return {"x-api-key": api_key}
 
     return {}
 
@@ -438,7 +420,7 @@ def start_login_async() -> None:
     if not client_id:
         raise ValueError("Roblox OAuth client ID is missing (this should not happen).")
 
-    # Cancel any stale login thread so port 8181 is freed before we rebind
+    # Cancel any stale login thread so port 31337 is freed before we rebind
     if _login_thread is not None and _login_thread.is_alive():
         _login_cancel.set()
         _login_thread.join(timeout=3.0)

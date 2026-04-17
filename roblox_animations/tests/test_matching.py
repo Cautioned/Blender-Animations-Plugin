@@ -33,10 +33,12 @@ importlib.reload(constants)
 
 from ..operators.import_ops import (
     _strip_suffix,
+    _resolve_imported_obj_name,
     _dict_get_any,
     _coerce_cf12,
     _extract_motor6d_connection,
     _collect_weapon_suggested_bones,
+    _normalize_accessory_handle_jnames,
     _dims_to_ratios,
     _hungarian_assign,
     _rename_parts_by_size_fingerprint,
@@ -48,9 +50,10 @@ from ..rig.creation import (
     _refresh_match_context,
     _apply_fingerprint_renames,
     _build_direct_skin_binding,
+    _select_bind_mesh_data_for_target_mesh,
+    _build_wrap_target_snapshot,
+    _collect_intentionally_missing_wrap_target_parts,
     _compose_wrap_geometry_matrix,
-    _ensure_armature_modifier,
-    _synthesize_missing_part_meshes,
 )
 from ..rig.constraints import (
     auto_constraint_parts,
@@ -323,7 +326,99 @@ class TestSkinnedMeshBindings(unittest.TestCase):
         direct_bind.assert_called_once()
         wrap_solver.assert_not_called()
 
-    def test_synthesize_missing_part_meshes_recreates_hidden_body_part(self):
+    def test_prepare_skinned_mesh_bindings_replaces_low_quality_wrap_layer_mesh_with_synthesized_filemesh(self):
+        parts = _make_parts_collection()
+        imported_obj = _make_mesh_obj("AccessoryDW3", dims=(2, 2, 2), collection=parts)
+
+        rig_def = _make_rig_node(
+            "Root",
+            (0, 0, 0),
+            pname="HumanoidRootPart",
+            children=[
+                _make_rig_node("Head", (0, 0, 0), pname="Head"),
+            ],
+        )
+        meta = _make_meta(
+            "TestRig",
+            rig_def,
+            [
+                {
+                    "name": "AccessoryDW3",
+                    "mesh_id": "rbxassetid://1",
+                    "mesh_class": "MeshPart",
+                    "part_cf": _make_cframe_components(0.0, 0.0, 0.0),
+                    "part_size": [2.0, 2.0, 2.0],
+                    "mesh_size": [2.0, 2.0, 2.0],
+                    "wrap_layer": {
+                        "reference_mesh_id": "rbxassetid://2",
+                        "cage_mesh_id": "rbxassetid://3",
+                        "auto_skin": "Disabled",
+                    },
+                }
+            ],
+        )
+
+        mesh_data = {
+            "positions": [
+                (-1.0, -1.0, 0.0),
+                (1.0, -1.0, 0.0),
+                (1.0, 1.0, 0.0),
+                (-1.0, 1.0, 0.0),
+            ],
+            "vertex_weights": [{"Head": 1.0} for _ in range(4)],
+            "bone_names": ["Head"],
+            "faces": [(0, 1, 2), (0, 2, 3)],
+            "normals": [(0.0, 0.0, 1.0) for _ in range(4)],
+            "uvs": [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        }
+
+        def fake_direct(binding, prefer_source_uv=False):
+            if not bool(binding["object"].get("RBXSynthesizedPart")):
+                return ({"mode": "uv-map", "vertex_links": [(0, 0)], "uv_link_coverage": 0.001}, "source uv (links=1, coverage=0.001)")
+            return ({"mode": "uv-map", "vertex_links": [(0, 0), (1, 1), (2, 2), (3, 3)], "uv_link_coverage": 1.0}, "source uv (links=4, coverage=1.000)")
+
+        selected_mesh_data = dict(mesh_data)
+        selected_mesh_data["faces"] = [(0, 1, 2)]
+        selected_mesh_data["lod_selection"] = {
+            "index": 1,
+            "face_count": 1,
+            "target_face_count": 1,
+            "vertex_count": 4,
+        }
+
+        with mock.patch.object(creation, "fetch_and_parse_filemesh", return_value=mesh_data), mock.patch.object(
+            creation,
+            "_select_bind_mesh_data_for_target_mesh",
+            return_value=selected_mesh_data,
+        ), mock.patch.object(
+            creation,
+            "_build_direct_skin_binding",
+            side_effect=fake_direct,
+        ) as direct_bind, mock.patch.object(
+            creation,
+            "_build_wrap_solver_binding",
+            return_value=({"mode": "position"}, "mock wrap"),
+        ) as wrap_solver, mock.patch.object(
+            creation,
+            "_replace_object_with_synthesized_filemesh",
+            wraps=creation._replace_object_with_synthesized_filemesh,
+        ) as replace_mesh:
+            bindings = creation._prepare_skinned_mesh_bindings(meta, parts)
+
+        self.assertEqual(replace_mesh.call_count, 1)
+        self.assertIs(replace_mesh.call_args.args[2], selected_mesh_data)
+
+        self.assertNotIn(imported_obj, bindings)
+        replacement = parts.objects.get("AccessoryDW3")
+        self.assertIsNotNone(replacement)
+        self.assertTrue(bool(replacement.get("RBXSynthesizedPart")))
+        self.assertIn(replacement, bindings)
+        self.assertEqual(bindings[replacement]["mode"], "uv-map")
+        self.assertEqual(bindings[replacement].get("uv_link_coverage"), 1.0)
+        self.assertEqual(direct_bind.call_count, 2)
+        wrap_solver.assert_not_called()
+
+    def test_build_wrap_target_snapshot_uses_metadata_without_helper_mesh(self):
         parts = _make_parts_collection()
         visible_obj = _make_mesh_obj("UpperTorso", dims=(2, 2, 2), collection=parts)
 
@@ -370,26 +465,63 @@ class TestSkinnedMeshBindings(unittest.TestCase):
         }
 
         with mock.patch.object(creation, "fetch_and_parse_filemesh", return_value=mesh_data):
-            created = _synthesize_missing_part_meshes(meta, parts)
+            snapshot = _build_wrap_target_snapshot(meta, parts)
 
         self.assertEqual(visible_obj.name, "UpperTorso")
-        self.assertIn("LowerTorso", created)
-        lower_torso = parts.objects.get("LowerTorso")
-        self.assertIsNotNone(lower_torso)
-        self.assertEqual(lower_torso.type, "MESH")
-        self.assertTrue(bool(lower_torso.get("RBXSynthesizedPart")))
-        self.assertTrue(bool(lower_torso.get("RBXSynthesizedCustomNormals")))
-        self.assertTrue(bool(lower_torso.get("RBXDisplayHelper")))
-        self.assertTrue(lower_torso.hide_render)
-        if hasattr(lower_torso, "display_type"):
-            self.assertEqual(lower_torso.display_type, "WIRE")
-        self.assertEqual(len(lower_torso.data.vertices), 4)
+        self.assertEqual(len(snapshot["vertices"]), 4)
+        self.assertEqual(len(snapshot["faces"]), 2)
+        self.assertIsNone(parts.objects.get("LowerTorso"))
 
-        armature = _make_armature_with_bones([
-            ("LowerTorso", (0.0, 0.0, 0.0), (0.0, 0.1, 0.0)),
-        ])
-        _ensure_armature_modifier(lower_torso, armature)
-        self.assertIsNotNone(lower_torso.modifiers.get("RBXSynthDisplayWeld"))
+    def test_collect_intentionally_missing_wrap_target_parts_marks_hidden_body_parts(self):
+        parts = _make_parts_collection()
+
+        meta = _make_meta(
+            "TestRig",
+            _make_rig_node("Root", (0, 0, 0), pname="HumanoidRootPart"),
+            [
+                {
+                    "name": "UpperTorso",
+                    "mesh_id": "rbxassetid://1",
+                    "mesh_class": "MeshPart",
+                    "part_cf": _make_cframe_components(0.0, 0.0, 0.0),
+                    "part_size": [2.0, 2.0, 2.0],
+                    "mesh_size": [2.0, 2.0, 2.0],
+                    "wrap_target": {
+                        "cage_mesh_id": "rbxassetid://20",
+                    },
+                },
+            ],
+        )
+
+        missing = _collect_intentionally_missing_wrap_target_parts(meta, parts)
+        self.assertEqual(missing, {"uppertorso"})
+
+        match_ctx = _build_match_context(parts)
+        match_ctx["intentionally_missing_parts"] = missing
+        self.assertIsNone(_find_matching_part("UpperTorso", None, match_ctx))
+
+    def test_collect_intentionally_missing_wrap_target_parts_skips_non_wrap_targets(self):
+        parts = _make_parts_collection()
+
+        meta = _make_meta(
+            "TestRig",
+            _make_rig_node("Root", (0, 0, 0), pname="HumanoidRootPart"),
+            [
+                {
+                    "name": "UpperTorso",
+                    "mesh_id": "rbxassetid://1",
+                    "mesh_class": "MeshPart",
+                    "part_cf": _make_cframe_components(0.0, 0.0, 0.0),
+                    "part_size": [2.0, 2.0, 2.0],
+                    "mesh_size": [2.0, 2.0, 2.0],
+                },
+            ],
+        )
+
+        missing = _collect_intentionally_missing_wrap_target_parts(meta, parts)
+
+        self.assertEqual(missing, set())
+        self.assertIsNone(parts.objects.get("UpperTorso"))
 
     def test_build_direct_skin_binding_uses_triangulated_vertex_map(self):
         parts = _make_parts_collection()
@@ -512,6 +644,169 @@ class TestSkinnedMeshBindings(unittest.TestCase):
         self.assertEqual(len(binding["vertex_links"]), 4)
         self.assertEqual(len(binding["binding_vertex_weights"]), 4)
         self.assertIn("triangulated vertex map", message)
+
+    def test_build_direct_skin_binding_falls_through_to_topology_when_wrap_uv_is_weak(self):
+        parts = _make_parts_collection()
+        mesh_obj = _make_mesh_obj("WrapLayer", dims=(2, 2, 2), collection=parts)
+
+        binding = {
+            "object": mesh_obj,
+            "entry": {
+                "wrap_layer": {
+                    "reference_mesh_id": "rbxassetid://2",
+                    "cage_mesh_id": "rbxassetid://3",
+                    "auto_skin": "Disabled",
+                },
+            },
+            "mesh_data": {
+                "positions": [tuple(float(component) for component in vertex.co) for vertex in mesh_obj.data.vertices],
+                "vertex_weights": [{"Head": 1.0} for _ in mesh_obj.data.vertices],
+                "bone_names": ["Head"],
+                "faces": [(0, 1, 2)],
+                "normals": [(0.0, 0.0, 1.0) for _ in mesh_obj.data.vertices],
+                "uvs": [(0.0, 0.0) for _ in mesh_obj.data.vertices],
+            },
+        }
+
+        with mock.patch.object(
+            creation,
+            "_build_source_uv_binding",
+            return_value=({"mode": "uv-map", "vertex_links": [(0, 0)], "uv_link_coverage": 0.4}, "source uv (links=1, coverage=0.400)"),
+        ) as uv_bind, mock.patch.object(
+            creation,
+            "_build_source_topology_binding",
+            return_value=({"mode": "vertex-map", "vertex_links": [(0, 0)]}, "triangulated vertex map"),
+        ) as topo_bind:
+            result, message = creation._build_direct_skin_binding(binding, prefer_source_uv=True)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["mode"], "vertex-map")
+        self.assertIn("triangulated vertex map", message)
+        uv_bind.assert_called_once()
+        topo_bind.assert_called_once()
+
+    def test_build_direct_skin_binding_uses_index_before_weak_uv_fallback(self):
+        parts = _make_parts_collection()
+        mesh_obj = _make_mesh_obj("WrapLayerFallback", dims=(2, 2, 2), collection=parts)
+
+        binding = {
+            "object": mesh_obj,
+            "entry": {
+                "wrap_layer": {
+                    "reference_mesh_id": "rbxassetid://2",
+                    "cage_mesh_id": "rbxassetid://3",
+                    "auto_skin": "Disabled",
+                },
+            },
+            "mesh_data": {
+                "positions": [tuple(float(component) for component in vertex.co) for vertex in mesh_obj.data.vertices],
+                "vertex_weights": [{"Head": 1.0} for _ in mesh_obj.data.vertices],
+                "bone_names": ["Head"],
+                "faces": [(0, 1, 2)],
+                "normals": [(0.0, 0.0, 1.0) for _ in mesh_obj.data.vertices],
+                "uvs": [(0.0, 0.0) for _ in mesh_obj.data.vertices],
+            },
+        }
+
+        with mock.patch.object(
+            creation,
+            "_build_source_uv_binding",
+            return_value=({"mode": "uv-map", "vertex_links": [(0, 0)], "uv_link_coverage": 0.4}, "source uv (links=1, coverage=0.400)"),
+        ) as uv_bind, mock.patch.object(
+            creation,
+            "_build_source_topology_binding",
+            return_value=(None, None),
+        ) as topo_bind, mock.patch.object(
+            creation,
+            "_estimate_index_alignment",
+            return_value={"avg": 0.0, "max": 0.0, "count": len(mesh_obj.data.vertices)},
+        ) as index_align:
+            result, message = creation._build_direct_skin_binding(binding, prefer_source_uv=True)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["mode"], "index")
+        self.assertIn("index", message)
+        uv_bind.assert_called_once()
+        topo_bind.assert_called_once()
+        index_align.assert_called_once()
+
+    def test_build_source_topology_binding_skips_oversized_pair_budget(self):
+        parts = _make_parts_collection()
+        mesh_obj = _make_mesh_obj("LargeProxy", dims=(2, 2, 2), collection=parts)
+
+        binding = {
+            "object": mesh_obj,
+            "entry": {
+                "part_cf": _make_cframe_components(0.0, 0.0, 0.0),
+                "part_size": [2.0, 2.0, 2.0],
+                "mesh_size": [2.0, 2.0, 2.0],
+            },
+            "mesh_data": {
+                "positions": [(float(index), 0.0, 0.0) for index in range(2000)],
+                "vertex_weights": [{"Head": 1.0} for _ in range(2000)],
+                "bone_names": ["Head"],
+                "faces": [(index, index + 1, index + 2) for index in range(0, 1997, 3)],
+                "normals": [(0.0, 0.0, 1.0) for _ in range(2000)],
+                "uvs": [(0.0, 0.0) for _ in range(2000)],
+            },
+        }
+
+        with mock.patch.object(
+            creation,
+            "_build_transformed_filemesh_vertices",
+            return_value=[{"position": (float(index), 0.0, 0.0), "normal": (0.0, 0.0, 1.0), "uv": (0.0, 0.0)} for index in range(2000)],
+        ), mock.patch.object(
+            creation,
+            "_build_mesh_object_vertices",
+            return_value=[{"position": (float(index), 0.0, 0.0), "normal": (0.0, 0.0, 1.0), "uv": (0.0, 0.0)} for index in range(2000)],
+        ), mock.patch.object(
+            creation,
+            "link_targets_to_sources_by_position",
+        ) as link_by_pos:
+            result, message = creation._build_source_topology_binding(binding, target_faces=[(0, 1, 2)])
+
+        self.assertIsNone(result)
+        self.assertIsNone(message)
+        link_by_pos.assert_not_called()
+
+    def test_select_bind_mesh_data_for_target_mesh_prefers_closest_lod_face_count(self):
+        parts = _make_parts_collection()
+        mesh_obj = _make_mesh_obj("ProxyWrap", dims=(2, 2, 2), collection=parts)
+
+        mesh_data = {
+            "positions": [
+                (-1.0, -1.0, 0.0),
+                (1.0, -1.0, 0.0),
+                (1.0, 1.0, 0.0),
+                (-1.0, 1.0, 0.0),
+                (0.0, 2.0, 0.0),
+            ],
+            "vertex_weights": [
+                {"Head": 1.0},
+                {"Head": 0.9},
+                {"Head": 0.8},
+                {"Head": 0.7},
+                {"Head": 0.6},
+            ],
+            "bone_names": ["Head"],
+            "faces": [(0, 1, 2), (0, 2, 3), (0, 3, 4)],
+            "normals": [(0.0, 0.0, 1.0) for _ in range(5)],
+            "uvs": [(float(index), 0.0) for index in range(5)],
+            "lod_type": 2,
+            "num_high_quality_lods": 1,
+            "lod_offsets": [0, 2],
+        }
+
+        with mock.patch.object(creation, "_build_mesh_object_faces", return_value=[(0, 1, 2)]):
+            selected = _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj)
+
+        self.assertEqual(selected["lod_selection"]["index"], 1)
+        self.assertEqual(selected["lod_selection"]["face_count"], 1)
+        self.assertEqual(selected["lod_selection"]["target_face_count"], 1)
+        self.assertEqual(selected["lod_selection"]["vertex_count"], 3)
+        self.assertEqual(selected["faces"], [(0, 1, 2)])
+        self.assertEqual(selected["positions"], [(-1.0, -1.0, 0.0), (-1.0, 1.0, 0.0), (0.0, 2.0, 0.0)])
+        self.assertEqual(selected["uvs"], [(0.0, 0.0), (3.0, 0.0), (4.0, 0.0)])
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +1009,67 @@ class TestWeaponMetadataHelpers(unittest.TestCase):
         self.assertEqual(result["parent_name"], "RightHand")
         self.assertEqual(result["connectionC0"], list(range(12, 24)))
         self.assertEqual(result["connectionC1"], list(range(12)))
+
+    def test_normalize_accessory_handle_jnames_prefers_pname(self):
+        payload = {
+            "rig": {
+                "jname": "UpperTorso",
+                "pname": "UpperTorso",
+                "jointType": "Motor6D",
+                "children": [
+                    {
+                        "jname": "Handle3",
+                        "pname": "PlatinumCrown-Fixed-MP",
+                        "jointType": "Weld",
+                        "children": [],
+                    }
+                ],
+            }
+        }
+
+        renamed = _normalize_accessory_handle_jnames(payload)
+
+        self.assertEqual(renamed, 1)
+        self.assertEqual(
+            payload["rig"]["children"][0]["jname"],
+            "PlatinumCrown-Fixed-MP",
+        )
+
+    def test_normalize_accessory_handle_jnames_keeps_real_handles(self):
+        payload = {
+            "rig": {
+                "jname": "UpperTorso",
+                "pname": "UpperTorso",
+                "jointType": "Motor6D",
+                "children": [
+                    {
+                        "jname": "Handle",
+                        "pname": "Handle",
+                        "jointType": "Weld",
+                        "children": [],
+                    }
+                ],
+            }
+        }
+
+        renamed = _normalize_accessory_handle_jnames(payload)
+
+        self.assertEqual(renamed, 0)
+        self.assertEqual(payload["rig"]["children"][0]["jname"], "Handle")
+
+    def test_resolve_imported_obj_name_strips_obj_added_suffix_when_target_known(self):
+        known = {"accessorydw3", "sword", "oof"}
+
+        self.assertEqual(_resolve_imported_obj_name("Accessorydw31", known), "accessorydw3")
+        self.assertEqual(_resolve_imported_obj_name("Sword1", known), "sword")
+        self.assertEqual(_resolve_imported_obj_name("Oof1", known), "oof")
+
+    def test_resolve_imported_obj_name_keeps_numeric_names_without_known_target(self):
+        known = {"accessorydw31", "r15", "face2"}
+
+        self.assertEqual(_resolve_imported_obj_name("Accessorydw31", known), "accessorydw31")
+        self.assertEqual(_resolve_imported_obj_name("R15", known), "r15")
+        self.assertEqual(_resolve_imported_obj_name("Face2", known), "face2")
 
 
 # ---------------------------------------------------------------------------
@@ -944,7 +1300,9 @@ class TestSizeFingerprintMatching(unittest.TestCase):
         self.assertEqual(_strip_suffix(handle_obj.name), "Handle")
 
     def test_wrap_targets_skip_weak_position_fallback_and_stay_missing(self):
-        _make_mesh_obj("Rig14", dims=(2.0, 2.0, 4.0), location=(0.0, -0.04, 0.44), collection=self.parts)
+        # Place mesh far beyond normal tolerance (~0.5) so both strong and normal
+        # position matching fail — wrap target stays absent.
+        _make_mesh_obj("Rig14", dims=(2.0, 2.0, 4.0), location=(0.0, 0.0, 2.0), collection=self.parts)
 
         rig_def = _make_rig_node("Root", (0, 0, 0), children=[
             _make_rig_node("UpperTorso", (0, 0, 0)),
@@ -979,6 +1337,103 @@ class TestSizeFingerprintMatching(unittest.TestCase):
         self.assertFalse(renamed)
         self.assertIn("Rig14", _names_of(self.parts))
         self.assertNotIn("UpperTorso", [_strip_suffix(obj.name) for obj in self.parts.objects if obj.type == "MESH"])
+
+    def test_wrap_targets_use_normal_position_fallback_for_displaced_body_mesh(self):
+        """Mesh beyond strong tolerance (0.16) but within normal tolerance (~0.5)
+        should still match via the two-tier fallback."""
+        _make_mesh_obj("Rig14", dims=(2.0, 2.0, 4.0), location=(0.0, 0.0, 0.35), collection=self.parts)
+
+        rig_def = _make_rig_node("Root", (0, 0, 0), children=[
+            _make_rig_node("UpperTorso", (0, 0, 0)),
+        ])
+        part_aux = [
+            {
+                "idx": 1,
+                "name": "UpperTorso",
+                "dims_fp": [2.0, 2.0, 2.0],
+                "mesh_id": "rbxassetid://1",
+                "mesh_class": "MeshPart",
+                "wrap_target": {"cage_mesh_id": "rbxassetid://2"},
+            },
+        ]
+        meta = _make_meta("Rig", rig_def, part_aux)
+
+        _rename_parts_by_size_fingerprint(meta, self.parts)
+
+        fp_map = meta.get("_fingerprint_object_map", {})
+        rig_scale = meta.get("_rig_scale", 1.0)
+
+        renamed = _rename_parts_by_fingerprint(
+            meta.get("rig"), self.parts,
+            renamed_via_fingerprint=len(fp_map),
+            fingerprint_object_map=fp_map,
+            scale_factor=rig_scale,
+            meta_loaded=meta,
+        )
+
+        self.assertTrue(renamed)
+        self.assertIsNotNone(self.parts.objects.get("UpperTorso"))
+        self.assertIsNone(self.parts.objects.get("Rig14"))
+
+    def test_wrap_targets_use_strong_position_fallback_for_close_visible_body_mesh(self):
+        _make_mesh_obj("Gothicsubmarine15", dims=(2.0, 2.0, 2.0), location=(0.0, 0.0, 0.01), collection=self.parts)
+
+        rig_def = _make_rig_node("Root", (0, 0, 0), children=[
+            _make_rig_node("UpperTorso", (0, 0, 0)),
+        ])
+        part_aux = [
+            {
+                "idx": 1,
+                "name": "UpperTorso",
+                "dims_fp": [2.0, 2.0, 2.0],
+                "mesh_id": "rbxassetid://1",
+                "mesh_class": "MeshPart",
+                "wrap_target": {"cage_mesh_id": "rbxassetid://2"},
+            },
+        ]
+        meta = _make_meta("Rig", rig_def, part_aux)
+
+        _rename_parts_by_size_fingerprint(meta, self.parts)
+
+        fp_map = meta.get("_fingerprint_object_map", {})
+        rig_scale = meta.get("_rig_scale", 1.0)
+
+        renamed = _rename_parts_by_fingerprint(
+            meta.get("rig"), self.parts,
+            renamed_via_fingerprint=len(fp_map),
+            fingerprint_object_map=fp_map,
+            scale_factor=rig_scale,
+            meta_loaded=meta,
+        )
+
+        self.assertTrue(renamed)
+        self.assertIsNotNone(self.parts.objects.get("UpperTorso"))
+        self.assertIsNone(self.parts.objects.get("Gothicsubmarine15"))
+
+    def test_wrap_layers_lock_on_resolved_name_despite_bad_centroid(self):
+        mesh = _make_mesh_obj("Accessorydw31", dims=(1.0, 2.0, 3.0), location=(1.25, 0.0, 0.0), collection=self.parts)
+
+        rig_def = _make_rig_node("Root", (0, 0, 0), children=[
+            _make_rig_node("AccessoryDW3", (0, 0, 0)),
+        ])
+        part_aux = [
+            {
+                "idx": 1,
+                "name": "AccessoryDW3",
+                "dims_fp": [1.0, 2.0, 3.0],
+                "wrap_layer": {"reference_mesh_id": "rbxassetid://123"},
+            },
+        ]
+        meta = _make_meta("Rig", rig_def, part_aux)
+
+        count = self._run_fingerprint(meta, self.parts)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(_strip_suffix(mesh.name), "AccessoryDW3")
+
+        fp_map = meta.get("_fingerprint_object_map", {})
+        self.assertIn(mesh.name, fp_map)
+        self.assertIs(fp_map[mesh.name], mesh)
 
 
 # ---------------------------------------------------------------------------
@@ -1351,6 +1806,36 @@ class TestEndToEndRenamePipeline(unittest.TestCase):
         # the same object should still be named BoneA (or BoneA.NNN)
         self.assertEqual(_strip_suffix(bone_a_obj.name), "BoneA",
             f"first pass assignment was overridden: '{bone_a_obj.name}'")
+
+    def test_second_pass_promotes_name_rescues_into_fingerprint_map(self):
+        sword = _make_mesh_obj("Sword1", dims=(1.0, 1.0, 4.0), location=(0.25, -0.6, 3.5), collection=self.parts)
+
+        rig_def = _make_rig_node("Root", (0, 0, 0), children=[
+            _make_rig_node("Sword", (0.25, -0.6, 3.5)),
+        ])
+        part_aux = [
+            {"idx": 1, "name": "Sword", "dims_fp": [10.0, 10.0, 10.0]},
+        ]
+        meta = _make_meta("Rig", rig_def, part_aux)
+
+        _rename_parts_by_size_fingerprint(meta, self.parts)
+        fp_map = meta.get("_fingerprint_object_map", {})
+        self.assertNotIn("Sword", [_strip_suffix(name) for name in fp_map.keys()])
+
+        renamed = _rename_parts_by_fingerprint(
+            meta.get("rig"), self.parts,
+            renamed_via_fingerprint=len(fp_map),
+            fingerprint_object_map=fp_map,
+            scale_factor=meta.get("_rig_scale", 1.0),
+            meta_loaded=meta,
+        )
+
+        self.assertTrue(renamed)
+        self.assertEqual(_strip_suffix(sword.name), "Sword")
+
+        updated_fp_map = meta.get("_fingerprint_object_map", {})
+        self.assertIn(sword.name, updated_fp_map)
+        self.assertIs(updated_fp_map[sword.name], sword)
 
 
 # ---------------------------------------------------------------------------

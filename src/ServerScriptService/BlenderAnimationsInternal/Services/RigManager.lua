@@ -349,7 +349,7 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 	if previousRigModel and previousRigModel ~= rigModel then
 		if previousAnimator then
 			self.playbackService:stopAnimationAndDisconnect({
-				background = true,
+				background = false,
 				animatorOverride = previousAnimator,
 			})
 		end

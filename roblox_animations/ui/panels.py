@@ -89,8 +89,6 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
 
         account_box = layout.box()
         account_box.label(text="Roblox Account", icon="USER")
-        account_box.prop(context.window_manager, "rbx_api_key_session", text="API Key")
-        account_box.label(text="Session only; never saved to disk.", icon="LOCKED")
 
         if auth.is_login_in_progress():
             account_box.label(text="Logging in…", icon="TIME")
@@ -99,7 +97,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             account_box.label(text="Authenticated", icon="CHECKMARK")
             account_box.operator("rbx.oauth_logout", text="Log Out", icon="LOCKED")
         else:
-            account_box.label(text="Not logged in (public assets only)", icon="INFO")
+            account_box.label(text="Not logged in", icon="INFO")
             account_box.operator(
                 "rbx.oauth_login",
                 text="Log In to Roblox",

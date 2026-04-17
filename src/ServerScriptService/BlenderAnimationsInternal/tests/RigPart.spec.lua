@@ -41,6 +41,19 @@ return function()
 			return rig, parts, motors
 		end
 
+		local function snapshotTree(root)
+			local nodes = {}
+			local function visit(node, prefix)
+				nodes[#nodes + 1] = prefix .. node.part.Name .. ":" .. (node.jointType or "Root")
+				for _, child in ipairs(node.children) do
+					visit(child, prefix .. node.part.Name .. "->")
+				end
+			end
+
+			visit(root, "")
+			return table.concat(nodes, "|")
+		end
+
 		describe("construction and hierarchy", function()
 			it("should build a linear chain of children", function()
 				local rig, parts = buildChain({ "Root", "Torso", "Head" })
@@ -213,6 +226,90 @@ return function()
 				child:Destroy()
 				parent2:Destroy()
 				child2:Destroy()
+			end)
+
+			it("should build the same mixed weld cycle tree regardless of joint cache order", function()
+				local a = Instance.new("Part")
+				a.Name = "A"
+				local b = Instance.new("Part")
+				b.Name = "B"
+				local c = Instance.new("Part")
+				c.Name = "C"
+
+				local ab = Instance.new("Weld")
+				ab.Name = "AB"
+				ab.Part0 = a
+				ab.Part1 = b
+				ab.Parent = a
+
+				local ac = Instance.new("WeldConstraint")
+				ac.Name = "AC"
+				ac.Part0 = a
+				ac.Part1 = c
+				ac.Parent = a
+
+				local bc = Instance.new("Weld")
+				bc.Name = "BC"
+				bc.Part0 = b
+				bc.Part1 = c
+				bc.Parent = b
+
+				local forwardRig = makeRig({
+					[a] = { ab, ac },
+					[b] = { ab, bc },
+					[c] = { ac, bc },
+				})
+				local reversedRig = makeRig({
+					[a] = { ac, ab },
+					[b] = { bc, ab },
+					[c] = { bc, ac },
+				})
+
+				local forwardTree = RigPart.new(forwardRig, a, nil, false)
+				local reversedTree = RigPart.new(reversedRig, a, nil, false)
+
+				expect(forwardTree).to.be.ok()
+				expect(reversedTree).to.be.ok()
+				expect(snapshotTree(forwardTree)).to.equal(snapshotTree(reversedTree))
+				expect(snapshotTree(forwardTree)).to.equal("A:Root|A->B:Weld|A->B->C:Weld")
+
+				a:Destroy()
+				b:Destroy()
+				c:Destroy()
+			end)
+
+			it("should prefer Motor6D over Weld when both connect the same pair", function()
+				local parent = Instance.new("Part")
+				parent.Name = "Parent"
+				local child = Instance.new("Part")
+				child.Name = "Child"
+
+				local weld = Instance.new("Weld")
+				weld.Name = "ChildWeld"
+				weld.Part0 = parent
+				weld.Part1 = child
+				weld.Parent = parent
+
+				local motor = Instance.new("Motor6D")
+				motor.Name = "ChildMotor"
+				motor.Part0 = parent
+				motor.Part1 = child
+				motor.Parent = parent
+
+				local jointCache = {
+					[parent] = { weld, motor },
+					[child] = { weld, motor },
+				}
+				local rig = makeRig(jointCache)
+				local rp = RigPart.new(rig, parent, nil, false)
+
+				expect(rp).to.be.ok()
+				expect(#rp.children).to.equal(1)
+				expect(rp.children[1].joint).to.equal(motor)
+				expect(rp.children[1].jointType).to.equal("Motor6D")
+
+				parent:Destroy()
+				child:Destroy()
 			end)
 
 			it("should register parts in rig.bones by name", function()
@@ -624,6 +721,51 @@ return function()
 				-- jointtransform1 should be child-relative (C0 since reversed)
 				expect(childEncoded.jointtransform1[1]).to.be.near(1, 0.001) -- X from C0
 
+				parent:Destroy()
+				child:Destroy()
+			end)
+
+			it("should encode AnimationConstraint attachments as parent-relative and child-relative offsets", function()
+				local parent = Instance.new("Part")
+				parent.Name = "ParentAC"
+				parent.Parent = workspace
+
+				local child = Instance.new("Part")
+				child.Name = "ChildAC"
+				child.Parent = workspace
+
+				local parentAttachment = Instance.new("Attachment")
+				parentAttachment.Name = "Joint0"
+				parentAttachment.CFrame = CFrame.new(1, 2, 3)
+				parentAttachment.Parent = parent
+
+				local childAttachment = Instance.new("Attachment")
+				childAttachment.Name = "Joint1"
+				childAttachment.CFrame = CFrame.new(4, 5, 6)
+				childAttachment.Parent = child
+
+				local joint = Instance.new("AnimationConstraint")
+				joint.Attachment0 = parentAttachment
+				joint.Attachment1 = childAttachment
+				joint.Transform = CFrame.new(99, 99, 99)
+				joint.Parent = parent
+
+				local jc = { [parent] = { joint }, [child] = { joint } }
+				local rig = makeRig(jc)
+				local rp = RigPart.new(rig, parent, nil, false)
+
+				local encoded = rp:Encode()
+				local childEncoded = encoded.children[1]
+
+				expect(childEncoded.jointType).to.equal("AnimationConstraint")
+				expect(childEncoded.jointtransform0[1]).to.be.near(1, 0.001)
+				expect(childEncoded.jointtransform0[2]).to.be.near(2, 0.001)
+				expect(childEncoded.jointtransform0[3]).to.be.near(3, 0.001)
+				expect(childEncoded.jointtransform1[1]).to.be.near(4, 0.001)
+				expect(childEncoded.jointtransform1[2]).to.be.near(5, 0.001)
+				expect(childEncoded.jointtransform1[3]).to.be.near(6, 0.001)
+
+				joint:Destroy()
 				parent:Destroy()
 				child:Destroy()
 			end)
