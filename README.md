@@ -1,4 +1,4 @@
-# Blender Animations Plugin for Roblox
+# RBXMonkey - Blender Animations Plugin for Roblox
 
 A powerful Roblox Studio plugin that enables seamless animation workflow between Blender and Roblox, featuring real-time sync, advanced rigging tools, and comprehensive animation management.
 
@@ -13,7 +13,7 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 1. Install the Blender addon in blender's preferences (download zip) [Blender Extensions](https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/) or [Releases](https://github.com/cautioned/blender-animations-plugin/releases) page
 2. Install the Roblox addon: https://create.roblox.com/store/asset/16708835782/
 2. Enable the addon in Blender's preferences
-3. The addon is found in the 3D view toolbar press 'N' then click the 'Rbx Animations' tab
+3. The addon is found in the 3D view toolbar press 'N' then click the 'RBXMonkey' tab
 4. Start the Blender server on port 31337 (default), or your port of choice. 
 5. Connect to the server using the Blender Sync tab on the Roblox Plugin.
 
