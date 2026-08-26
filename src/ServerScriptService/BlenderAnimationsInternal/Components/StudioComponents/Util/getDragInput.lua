@@ -60,6 +60,7 @@ return function(props: DragInputProperites): (vector2Value, types.Computed<Vecto
 
 	local connectionProvider = props.Instance
 	local globalConnection = nil
+	local globalEndConnection = nil
 
 	local currentValue = getState(props.Value, Vector2.new(0, 0), "Value")
 	local maxValue = getState(props.Max, Vector2.new(1, 1))
@@ -72,6 +73,17 @@ return function(props: DragInputProperites): (vector2Value, types.Computed<Vecto
 	local currentAlpha = Computed(function()
 		return (unwrap(currentValue) - unwrap(minValue)) / unwrap(range)
 	end)
+
+	local function cleanupGlobalConnection()
+		if globalConnection then
+			globalConnection:Disconnect()
+			globalConnection = nil
+		end
+		if globalEndConnection then
+			globalEndConnection:Disconnect()
+			globalEndConnection = nil
+		end
+	end
 
 	local function processInput(position)
 		local connectionProvider = unwrap(connectionProvider, false)
@@ -126,13 +138,16 @@ return function(props: DragInputProperites): (vector2Value, types.Computed<Vecto
 				end
 			end)
 		end
-	end
 
-	local function cleanupGlobalConnection()
-		if globalConnection then
-			globalConnection:Disconnect()
-			globalConnection = nil
-		end
+		-- GuiObject.InputEnded only fires while the pointer is still over the
+		-- control. Listen globally so releasing outside the slider cannot leave
+		-- it stuck in a dragging state and block subsequent drags.
+		globalEndConnection = game:GetService("UserInputService").InputEnded:Connect(function(endedInput)
+			if endedInput.UserInputType == Enum.UserInputType.MouseButton1 then
+				isDragging:set(false)
+				cleanupGlobalConnection()
+			end
+		end)
 	end
 
 	local tasks = {}

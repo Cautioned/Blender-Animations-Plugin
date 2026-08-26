@@ -216,7 +216,9 @@ def apply_ao_transform(ao):
         pose_bone_set_selected(bone, not bone.parent)
 
     for root in [bone for bone in ao.pose.bones if not bone.parent]:
-        # collect initial root matrices (if they do not exist yet, this will prevent interpolation from keyframes that are being set in the next loop)
+        # collect initial root matrices (if they do not exist yet, this will
+        # prevent interpolation from keyframes that are being set in the next
+        # loop)
         root_matrix_at = {}
         for i in range(bpy.context.scene.frame_start, bpy.context.scene.frame_end + 1):
             bpy.context.scene.frame_set(i)

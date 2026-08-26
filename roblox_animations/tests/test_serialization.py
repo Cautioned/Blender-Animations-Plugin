@@ -48,6 +48,7 @@ class TestAnimationSerialization(unittest.TestCase):
             bpy.data.actions.remove(action)
         for armature in bpy.data.armatures:
             bpy.data.armatures.remove(armature)
+
         for mesh in bpy.data.meshes:
             bpy.data.meshes.remove(mesh)
         for empty in bpy.data.objects:
@@ -81,6 +82,134 @@ class TestAnimationSerialization(unittest.TestCase):
         self.armature_obj = None
         self.ik_target = None
         self.unconstrained_bone = None
+
+    def test_deform_import_inverts_export_rotation_swizzle(self):
+        """Roblox deform deltas must round-trip without changing rotation axes."""
+        swizzle = mathutils.Matrix.Diagonal((-1.0, 1.0, -1.0, 1.0))
+        blender_delta = mathutils.Matrix.Translation((1.25, -2.0, 0.75)) @ mathutils.Euler(
+            (math.radians(25), math.radians(-35), math.radians(15)),
+            "XYZ",
+        ).to_matrix().to_4x4()
+        roblox_delta = swizzle @ blender_delta @ swizzle
+
+        imported_delta = requests._roblox_deform_delta_to_blender(roblox_delta)
+
+        for row in range(4):
+            for column in range(4):
+                self.assertAlmostEqual(
+                    imported_delta[row][column],
+                    blender_delta[row][column],
+                    places=6,
+                )
+
+    def test_deform_import_recovers_effective_auto_translation_scale(self):
+        export_info = {
+            "deform_scale_mode": "auto_calibrated",
+            "deform_scale_factor": 0.125,
+            "armature_object_scale": 4.0,
+        }
+
+        self.assertAlmostEqual(
+            requests._resolve_deform_translation_scale(export_info),
+            0.5,
+        )
+
+    def test_deform_import_prefers_explicit_translation_scale(self):
+        export_info = {
+            "deform_scale_mode": "auto",
+            "deform_scale_factor": 0.125,
+            "armature_object_scale": 4.0,
+            "deform_translation_scale_factor": 0.75,
+        }
+
+        self.assertAlmostEqual(
+            requests._resolve_deform_translation_scale(export_info),
+            0.75,
+        )
+
+    def test_deform_import_prefers_legacy_suffixed_deform_bone(self):
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        structural = armature_obj.data.edit_bones.new("Torso")
+        structural.head = (0, 0, 0)
+        structural.tail = (0, 1, 0)
+        structural.use_deform = False
+        deform = armature_obj.data.edit_bones.new("Torso")
+        deform.head = (0, 1, 0)
+        deform.tail = (0, 2, 0)
+        deform["rbx_is_deform_bone"] = True
+        deform.use_deform = True
+        bpy.ops.object.mode_set(mode="POSE")
+
+        resolved = requests._find_animation_pose_bone(
+            armature_obj,
+            "Torso",
+            True,
+        )
+
+        self.assertEqual(resolved.name, "Torso.001")
+
+    def test_deform_animation_import_preserves_combined_rotation_axes(self):
+        bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
+        armature_obj = bpy.context.object
+        armature_obj.name = "DeformRotationImportRig"
+        edit_bone = armature_obj.data.edit_bones.new("Bone")
+        edit_bone.head = (0, 0, 0)
+        edit_bone.tail = (0, 1, 0)
+        edit_bone.use_deform = True
+        edit_bone["rbx_is_deform_bone"] = True
+        bpy.ops.object.mode_set(mode="POSE")
+
+        swizzle = mathutils.Matrix.Diagonal((-1.0, 1.0, -1.0, 1.0))
+        expected = mathutils.Matrix.Translation((1.25, -2.0, 0.75)) @ mathutils.Euler(
+            (math.radians(20), math.radians(-30), math.radians(40)),
+            "XYZ",
+        ).to_matrix().to_4x4()
+        deform_scale_factor = 0.25
+        normalized = expected.copy()
+        normalized.translation = expected.to_translation() / deform_scale_factor
+        roblox_delta = swizzle @ normalized @ swizzle
+        animation_data = {
+            "t": 1 / 30,
+            "is_deform_bone_rig": True,
+            "export_info": {
+                "fps": 30,
+                "deform_scale_factor": deform_scale_factor,
+            },
+            "kfs": [
+                {
+                    "t": 0,
+                    "kf": {
+                        "Bone": {
+                            "components": utils.mat_to_cf(mathutils.Matrix.Identity(4)),
+                            "easingStyle": "Linear",
+                            "easingDirection": "Out",
+                        }
+                    },
+                },
+                {
+                    "t": 1 / 30,
+                    "kf": {
+                        "Bone": {
+                            "components": utils.mat_to_cf(roblox_delta),
+                            "easingStyle": "Linear",
+                            "easingDirection": "Out",
+                        }
+                    },
+                },
+            ],
+        }
+
+        task_id = "deform-rotation-round-trip"
+        requests.execute_import_animation(task_id, animation_data, armature_obj.name)
+        success, error = requests.pending_responses.pop(task_id)
+        self.assertTrue(success, error)
+        bpy.context.scene.frame_set(1)
+        actual = armature_obj.pose.bones["Bone"].matrix_basis
+
+        for row in range(4):
+            for column in range(4):
+                self.assertAlmostEqual(actual[row][column], expected[row][column], places=5)
 
     def clear_scene_property(self):
         """Clear the scene property that tracks the active armature."""
@@ -1205,7 +1334,11 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertTrue(result, "Serialization returned no result for easing test.")
         keyframes = result["kfs"]
 
-        self.assertEqual(len(keyframes), 2, "Expected 2 keyframes for a sparse bake.")
+        self.assertEqual(
+            len(keyframes),
+            20,
+            "Unsupported interpolation should be densely sampled for fidelity.",
+        )
 
         first_frame_kf = keyframes[0]["kf"]
 
@@ -1240,6 +1373,10 @@ class TestAnimationSerialization(unittest.TestCase):
             "Out",
             "Unsupported easing direction did not fall back to Out.",
         )
+        self.assertTrue(
+            all("UnsupportedEase" in keyframe["kf"] for keyframe in keyframes),
+            "Every dense sample must include the unsupported-easing bone.",
+        )
 
         # Check ConstantEase (CONSTANT) -> ("Constant", "Out")
         constant_data = first_frame_kf.get("ConstantEase")
@@ -1251,34 +1388,35 @@ class TestAnimationSerialization(unittest.TestCase):
             constant_data[2], "Out", "Constant easing direction did not map correctly."
         )
 
-        # Check LinearEase (LINEAR, EASE_IN) -> ("Linear", "In")
+        # Pose easing uses the opposite In/Out convention to Blender.
+        # Check LinearEase (LINEAR, EASE_IN) -> ("Linear", "Out")
         linear_data = first_frame_kf.get("LinearEase")
         self.assertIsNotNone(linear_data, "LinearEase bone missing from keyframe.")
         self.assertEqual(
             linear_data[1], "Linear", "Linear easing style did not map correctly."
         )
         self.assertEqual(
-            linear_data[2], "In", "Linear easing direction did not map correctly."
+            linear_data[2], "Out", "Linear easing direction did not map correctly."
         )
 
-        # Check BounceEase (BOUNCE, EASE_OUT) -> ("Bounce", "Out")
+        # Check BounceEase (BOUNCE, EASE_OUT) -> ("Bounce", "In")
         bounce_data = first_frame_kf.get("BounceEase")
         self.assertIsNotNone(bounce_data, "BounceEase bone missing from keyframe.")
         self.assertEqual(
             bounce_data[1], "Bounce", "Bounce easing style did not map correctly."
         )
         self.assertEqual(
-            bounce_data[2], "Out", "Bounce easing direction did not map correctly."
+            bounce_data[2], "In", "Bounce easing direction did not map correctly."
         )
 
-        # Check ElasticEase (ELASTIC, EASE_IN) -> ("Elastic", "In")
+        # Check ElasticEase (ELASTIC, EASE_IN) -> ("Elastic", "Out")
         elastic_data = first_frame_kf.get("ElasticEase")
         self.assertIsNotNone(elastic_data, "ElasticEase bone missing from keyframe.")
         self.assertEqual(
             elastic_data[1], "Elastic", "Elastic easing style did not map correctly."
         )
         self.assertEqual(
-            elastic_data[2], "In", "Elastic easing direction did not map correctly."
+            elastic_data[2], "Out", "Elastic easing direction did not map correctly."
         )
 
     def test_linear_easing_consistent_across_keyframes(self):
@@ -4342,12 +4480,12 @@ class TestAnimationSerialization(unittest.TestCase):
     def test_linear_animation_carry_forward(self):
         """
         Test that carry-forward logic doesn't break linear animations.
-        
+
         Setup:
         - Bone1 animates linearly from frame 1 to 10
         - Bone2 is held constant at identity throughout
         - No constraints (pure Motor6D rig)
-        
+
         Expected behavior:
         - Bone1 should have Linear easing at its keyframes
         - Bone2 should have Constant easing when carried forward
@@ -4410,7 +4548,7 @@ class TestAnimationSerialization(unittest.TestCase):
                 settings.rbx_full_range_bake = full_range
 
                 result = serialize(armature_obj)
-                
+
                 self._validate_linear_animation_result(result, full_range)
 
     def _validate_linear_animation_result(self, result, full_range_bake):
@@ -4445,7 +4583,7 @@ class TestAnimationSerialization(unittest.TestCase):
 
         # Check positions to ensure proper interpolation
         bone1_last_pos = bone1_last[0][:3]
-        self.assertAlmostEqual(bone1_last_pos[0], 2.0, places=3, 
+        self.assertAlmostEqual(bone1_last_pos[0], 2.0, places=3,
                                msg=f"[full_range={full_range_bake}] Bone1 should reach position 2.0 at last frame")
 
         # Collect all Bone1 keyframes and their details
@@ -4474,13 +4612,13 @@ class TestAnimationSerialization(unittest.TestCase):
         print(f"Total keyframes: {len(result['kfs'])}")
         print(f"Bone1 keyframes: {len(bone1_keyframes)}")
         print(f"Bone2 keyframes: {len(bone2_keyframes)}")
-        
+
         print("\nBone1 keyframe details:")
         for kf in bone1_keyframes:
             print(f"  KF {kf['index']}, time={kf['time']:.3f}, "
                   f"pos=({kf['position'][0]:.3f}, {kf['position'][1]:.3f}, {kf['position'][2]:.3f}), "
                   f"easing={kf['easing']}")
-        
+
         print("\nBone2 keyframe details:")
         for kf in bone2_keyframes:
             print(f"  KF {kf['index']}, time={kf['time']:.3f}, easing={kf['easing']}")
@@ -4518,7 +4656,7 @@ class TestAnimationSerialization(unittest.TestCase):
             last_pos = bone1_keyframes[-1]["position"][0]
             first_time = bone1_keyframes[0]["time"]
             last_time = bone1_keyframes[-1]["time"]
-            
+
             # Check intermediate keyframes (if any) follow linear progression
             for kf in bone1_keyframes[1:-1]:
                 expected_pos = first_pos + (last_pos - first_pos) * (kf["time"] - first_time) / (last_time - first_time)
@@ -4526,7 +4664,8 @@ class TestAnimationSerialization(unittest.TestCase):
                     kf["position"][0],
                     expected_pos,
                     places=2,
-                    msg=f"Bone1 at time {kf['time']} should be at {expected_pos:.3f} (linear), got {kf['position'][0]:.3f}"
+                    msg=f"Bone1 at time {kf['time']} should be at "
+                    f"{expected_pos:.3f} (linear), got {kf['position'][0]:.3f}"
                 )
 
         # 4. If Bone2 appears in any keyframes (carry-forward), it should use Constant easing
@@ -4536,7 +4675,6 @@ class TestAnimationSerialization(unittest.TestCase):
                 "Constant",
                 f"Bone2 in keyframe {kf['index']} should have Constant easing (it's held), got {kf['easing']}"
             )
-
 
     def test_non_inheriting_bone_baked_with_staggered_keys(self):
         """Bones with inherit_rotation=False must be emitted on every keyframe.
@@ -4642,8 +4780,8 @@ class TestAnimationSerialization(unittest.TestCase):
                 f"it needs the rest offset from Neck to position correctly in Roblox."
             )
 
-    def test_mixed_channel_same_frame_prefers_constant_easing(self):
-        """If channels disagree on a frame, export should prefer Constant easing."""
+    def test_mixed_channel_same_frame_bakes_linear_easing(self):
+        """Mixed Blender channels must not make the whole Roblox Pose constant."""
         bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
         armature_obj = bpy.context.object
         arm = armature_obj.data
@@ -4691,9 +4829,13 @@ class TestAnimationSerialization(unittest.TestCase):
         first_bone = result["kfs"][0]["kf"].get("Bone")
         self.assertIsNotNone(first_bone, "Bone missing from first keyframe.")
         self.assertEqual(
-            first_bone[1],
-            "Constant",
-            "Mixed-channel same-frame interpolation should resolve to Constant.",
+            first_bone[1], "Linear",
+            "Mixed-channel interpolation should be baked as linear poses.",
+        )
+        self.assertGreaterEqual(
+            sum(1 for keyframe in result["kfs"] if "Bone" in keyframe["kf"]),
+            10,
+            "Mixed interpolation should sample the whole segment.",
         )
 
     def test_constrained_bone_ignores_unrelated_constant_frames(self):

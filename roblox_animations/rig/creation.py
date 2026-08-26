@@ -13,7 +13,7 @@ from ..animation.face_controls import (
     store_facs_payload_on_armature,
 )
 from ..core.constants import get_transform_to_blender
-from .cage_solver import build_mesh_vertices, link_targets_to_sources_by_position, link_vertices_by_uv, solve_two_stage_cage_deformation
+from .cage_solver import build_mesh_vertices, link_targets_to_sources_by_position, link_vertices_by_uv, numpy_available, solve_two_stage_cage_deformation
 from .filemesh import fetch_and_parse_filemesh
 from ..core.utils import (
     cf_to_mat,
@@ -21,6 +21,124 @@ from ..core.utils import (
     get_object_by_name,
     find_master_collection_for_object,
     find_parts_collection_in_master,
+)
+
+# Leaf helpers moved out of this module; re-imported here so the public
+# surface of creation.py stays unchanged for other modules and tests.
+from .mesh_surface import (
+    _apply_mesh_custom_normals,
+    _apply_mesh_loop_tangents,
+    _apply_mesh_loop_uvs,
+    _apply_mesh_vertex_colors,
+    _bulk_set,
+    _configure_synthesized_mesh_display,
+    _configure_synthesized_mesh_surface,
+    _ensure_synthesized_display_modifier,
+    _iter_mesh_loop_vertex_indices,
+    _mesh_loop_color_values,
+    _mesh_loop_uv_values,
+    _new_mesh_attribute,
+    _new_mesh_color_attribute,
+    _populate_mesh_geometry,
+    _set_mesh_smooth_shading,
+    _vertex_corner_value,
+)
+from .filemesh_geometry import (
+    _build_transformed_filemesh_geometry,
+    _build_transformed_filemesh_vertices,
+    _coerce_cf_matrix,
+    _compute_filemesh_mesh_size,
+    _compute_filemesh_world_positions,
+    _compute_mesh_scale,
+    _copy_position,
+    _get_effective_mesh_size,
+    _normalize_vector,
+    _normalize_wrap_auto_skin,
+)
+from .part_matching import (
+    _apply_fingerprint_renames,
+    _build_match_context,
+    _entry_object_name,
+    _find_matching_part,
+    _find_parts_object,
+    _find_parts_object_for_entry,
+    _fingerprint_position,
+    _get_mesh_world_center,
+    _get_wrap_layer_metadata,
+    _get_wrap_target_metadata,
+    _match_stem,
+    _mesh_center_in_t2b_space,
+    _refresh_match_context,
+    _strip_class_suffix,
+    _strip_model_prefix,
+    _strip_suffix,
+    get_unique_collection_name,
+)
+from .skin_binding import (
+    _apply_direct_source_transfer_weights,
+    _apply_index_bound_weights,
+    _apply_inherited_weight_transfer,
+    _apply_position_bound_weights,
+    _apply_rigid_bone_binding,
+    _apply_skinned_mesh_bindings,
+    _apply_uv_map_bound_weights,
+    _apply_weight_data_transfer,
+    _blend_weight_dicts,
+    _build_component_centers,
+    _build_mesh_object_faces,
+    _build_mesh_object_vertices,
+    _build_position_sample_lookup,
+    _build_transfer_source_object,
+    _build_vertex_component_ids,
+    _canonical_triangle_face,
+    _clear_child_of_constraints,
+    _closest_point_on_triangle,
+    _collect_vertex_group_weights,
+    _compute_mesh_vertex_all_uvs,
+    _compute_mesh_vertex_normal,
+    _compute_mesh_vertex_uvs,
+    _determine_binding_fallback_bone,
+    _ensure_armature_modifier,
+    _ensure_vertex_groups,
+    _estimate_index_alignment,
+    _find_position_candidate_indices,
+    _format_binding_context,
+    _get_position_transfer_vertices,
+    _has_meaningful_vertex_weights,
+    _index_alignment_is_tight,
+    _index_alignment_limits,
+    _limit_weight_dict,
+    _log_binding_apply,
+    _log_binding_inspect,
+    _log_binding_mode,
+    _map_target_components_to_source_components,
+    _measure_transfer_coverage,
+    _mesh_face_count,
+    _pick_best_sample,
+    _pick_closest_sample,
+    _rebase_mesh_to_predicted_positions,
+    _remove_all_vertex_groups,
+    _remove_object_and_data,
+    _resolve_binding_bone_name,
+    _round_uv_key,
+    _round_vector_key,
+    _run_weight_transfer_sequence,
+    _sample_match_score,
+    _short_content_id,
+    _sorted_triangle_topology,
+)
+from .primitive_shapes import (
+    _BLOCK_FACE_NORMALS,
+    _block_canonical_stud_uvs,
+    _build_primitive_mesh_data,
+    _create_batched_static_primitives,
+    _create_batched_static_primitives_np,
+    _face_surface_types,
+    _generate_face_uvs,
+    _generate_primitive_loop_uvs,
+    _primitive_face_projection_axes,
+    _primitive_shape_template,
+    _static_primitive_part_arrays,
 )
 
 
@@ -31,38 +149,7 @@ def _matrix_to_idprop(value):
     return value
 
 
-def _strip_suffix(name: str) -> str:
-    """Strip .001/.002 style suffixes for stable matching."""
-    return re.sub(r"\.\d+$", "", name or "")
-
-
-def _get_mesh_world_center(obj):
-    """Vertex centroid in world space.
-
-    OBJ-imported meshes have matrix_world == Identity, so
-    matrix_world.to_translation() returns (0,0,0) for ALL of them.
-    This function computes the actual geometric center from vertex data.
-    """
-    if obj.type != "MESH" or not obj.data.vertices:
-        return obj.matrix_world.to_translation()
-    from mathutils import Vector as _Vec
-    verts = obj.data.vertices
-    n = len(verts)
-    sx = sy = sz = 0.0
-    for v in verts:
-        sx += v.co.x
-        sy += v.co.y
-        sz += v.co.z
-    return obj.matrix_world @ _Vec((sx / n, sy / n, sz / n))
-
-
-def _mesh_center_in_t2b_space(obj):
-    """Vertex centroid in world space.
-
-    The OBJ importer and t2b produce identical blender-space positions
-    (confirmed empirically). No axis correction is needed.
-    """
-    return _get_mesh_world_center(obj)
+# Name/stem helpers live in part_matching.py (imported above).
 
 
 def _safe_mode_set(mode, obj=None):
@@ -142,344 +229,14 @@ def _mesh_bones_overlap_rig(mesh_bone_names, rig_names, part_to_bone_map=None):
     return False
 
 
-def _short_content_id(value):
-    if not value:
-        return "none"
-    text = str(value)
-    match = re.search(r"id=(\d+)", text)
-    if match:
-        return match.group(1)
-    match = re.search(r"(\d+)$", text)
-    if match:
-        return match.group(1)
-    return text
+# Binding logging, wrap metadata accessors, and part lookup helpers live in
+# skin_binding.py / part_matching.py (imported above).
 
 
-def _format_binding_context(binding):
-    entry = binding.get("entry") or {}
-    mesh_data = binding.get("mesh_data") or {}
-    wrap_layer_metadata = _get_wrap_layer_metadata(entry) or {}
-    wrap_target_metadata = binding.get("wrap_target") or _get_wrap_target_metadata(entry) or {}
-    parts = [
-        f"mesh_id={_short_content_id(entry.get('mesh_id'))}",
-        f"has_skinning={bool(entry.get('has_skinning'))}",
-        f"bone_names={len(mesh_data.get('bone_names') or [])}",
-        f"weights={len(mesh_data.get('vertex_weights') or [])}",
-    ]
+# Constraint/vertex-group utilities live in skin_binding.py (imported above).
 
-    if wrap_layer_metadata:
-        parts.extend(
-            [
-                f"wrap_ref={_short_content_id(wrap_layer_metadata.get('reference_mesh_id'))}",
-                f"wrap_cage={_short_content_id(wrap_layer_metadata.get('cage_mesh_id'))}",
-                f"auto_skin={_normalize_wrap_auto_skin(wrap_layer_metadata.get('auto_skin')) or 'none'}",
-            ]
-        )
 
-    if wrap_target_metadata:
-        parts.append(f"target_cage={_short_content_id(wrap_target_metadata.get('cage_mesh_id'))}")
-
-    mode = binding.get("mode")
-    if mode:
-        parts.append(f"mode={mode}")
-
-    return ", ".join(parts)
-
-
-def _log_binding_inspect(mesh_obj, binding, has_weights, bone_overlap):
-    print(
-        f"[RigCreate] Skin bind inspect for '{mesh_obj.name}': "
-        f"{_format_binding_context(binding)}, has_weights={has_weights}, bone_overlap={bone_overlap}"
-    )
-
-
-def _log_binding_mode(mesh_obj, binding, label):
-    print(f"[RigCreate] Skin bind mode for '{mesh_obj.name}': {label}; {_format_binding_context(binding)}")
-
-
-def _log_binding_apply(mesh_obj, binding, stage):
-    print(f"[RigCreate] Applying {stage} for '{mesh_obj.name}': {_format_binding_context(binding)}")
-
-
-def _get_wrap_layer_metadata(entry):
-    wrap_layer = entry.get("wrap_layer") if isinstance(entry, dict) else None
-    return wrap_layer if isinstance(wrap_layer, dict) else None
-
-
-def _get_wrap_target_metadata(entry):
-    wrap_target = entry.get("wrap_target") if isinstance(entry, dict) else None
-    return wrap_target if isinstance(wrap_target, dict) else None
-
-
-def _find_parts_object(parts_collection, part_name):
-    if not part_name:
-        return None
-    obj = parts_collection.objects.get(part_name)
-    if obj:
-        return obj
-
-    stripped = _strip_suffix(part_name)
-    for candidate in parts_collection.objects:
-        if _strip_suffix(candidate.name) == stripped:
-            return candidate
-    return None
-
-
-def _clear_child_of_constraints(obj):
-    for constraint in [c for c in obj.constraints if c.type == "CHILD_OF"]:
-        obj.constraints.remove(constraint)
-
-
-def _ensure_armature_modifier(obj, armature_obj):
-    modifier = None
-    for existing in obj.modifiers:
-        if existing.type == "ARMATURE":
-            modifier = existing
-            break
-    if modifier is None:
-        modifier = obj.modifiers.new(name="Armature", type="ARMATURE")
-    modifier.object = armature_obj
-    _ensure_synthesized_display_modifier(obj)
-    return modifier
-
-
-def _remove_all_vertex_groups(obj):
-    while obj.vertex_groups:
-        obj.vertex_groups.remove(obj.vertex_groups[0])
-
-
-def _remove_object_and_data(obj):
-    if obj is None:
-        return
-
-    mesh = obj.data if getattr(obj, "type", None) == "MESH" else None
-    for collection in list(obj.users_collection):
-        collection.objects.unlink(obj)
-    bpy.data.objects.remove(obj, do_unlink=True)
-    if mesh and mesh.users == 0:
-        bpy.data.meshes.remove(mesh)
-
-
-def _set_mesh_smooth_shading(mesh):
-    polygons = getattr(mesh, "polygons", None)
-    if not polygons:
-        return
-    try:
-        polygons.foreach_set("use_smooth", [True] * len(polygons))
-    except Exception:
-        for polygon in polygons:
-            polygon.use_smooth = True
-
-
-def _apply_mesh_custom_normals(mesh, vertices):
-    if not hasattr(mesh, "normals_split_custom_set_from_vertices") and not hasattr(mesh, "normals_split_custom_set"):
-        return False
-    if not vertices or len(vertices) != len(mesh.vertices):
-        return False
-
-    normals = []
-    for vertex in vertices:
-        normal = vertex.get("normal") if isinstance(vertex, dict) else None
-        if normal is None:
-            return False
-        normals.append(tuple(float(component) for component in normal))
-
-    try:
-        if hasattr(mesh, "use_auto_smooth"):
-            mesh.use_auto_smooth = True
-        if hasattr(mesh, "normals_split_custom_set"):
-            loop_normals = []
-            for polygon in mesh.polygons:
-                for vertex_index in polygon.vertices:
-                    loop_normals.append(normals[int(vertex_index)])
-            mesh.normals_split_custom_set(loop_normals)
-        else:
-            mesh.normals_split_custom_set_from_vertices(normals)
-        return True
-    except Exception:
-        return False
-
-
-def _vertex_corner_value(vertices, vertex_index, key, default=None):
-    try:
-        vertex_index = int(vertex_index)
-    except Exception:
-        return default
-    if vertex_index < 0 or vertex_index >= len(vertices):
-        return default
-    vertex = vertices[vertex_index]
-    if not isinstance(vertex, dict):
-        return default
-    value = vertex.get(key)
-    return default if value is None else value
-
-
-def _iter_mesh_loop_vertex_indices(mesh):
-    for polygon in mesh.polygons:
-        for loop_index, vertex_index in zip(range(polygon.loop_start, polygon.loop_start + polygon.loop_total), polygon.vertices):
-            yield loop_index, int(vertex_index)
-
-
-def _apply_mesh_loop_uvs(mesh, vertices):
-    if not vertices or not any(vertex.get("uv") is not None for vertex in vertices if isinstance(vertex, dict)):
-        return False
-
-    try:
-        uv_layer = mesh.uv_layers.get("UVMap") or mesh.uv_layers.new(name="UVMap")
-        for loop_index, vertex_index in _iter_mesh_loop_vertex_indices(mesh):
-            uv = _vertex_corner_value(vertices, vertex_index, "uv")
-            if uv is not None:
-                uv_layer.data[loop_index].uv = (float(uv[0]), float(uv[1]))
-        return True
-    except Exception:
-        return False
-
-
-def _new_mesh_attribute(mesh, name, data_type, domain="CORNER"):
-    attributes = getattr(mesh, "attributes", None)
-    if attributes is None:
-        return None
-
-    try:
-        existing = attributes.get(name)
-        if existing is not None:
-            return existing
-        return attributes.new(name=name, type=data_type, domain=domain)
-    except Exception:
-        return None
-
-
-def _apply_mesh_loop_tangents(mesh, vertices):
-    if not vertices:
-        return False
-    if not any(
-        isinstance(vertex, dict) and (vertex.get("tangent") is not None or vertex.get("tangent_sign_byte") is not None)
-        for vertex in vertices
-    ):
-        return False
-
-    tangent_attr = _new_mesh_attribute(mesh, "RBXTangent", "FLOAT_VECTOR")
-    sign_attr = _new_mesh_attribute(mesh, "RBXTangentSign", "FLOAT")
-    sign_byte_attr = _new_mesh_attribute(mesh, "RBXTangentSignByte", "INT")
-    if tangent_attr is None and sign_attr is None and sign_byte_attr is None:
-        return False
-
-    try:
-        for loop_index, vertex_index in _iter_mesh_loop_vertex_indices(mesh):
-            tangent = _vertex_corner_value(vertices, vertex_index, "tangent")
-            sign = _vertex_corner_value(vertices, vertex_index, "tangent_sign")
-            sign_byte = _vertex_corner_value(vertices, vertex_index, "tangent_sign_byte")
-            if tangent is not None:
-                if tangent_attr is not None:
-                    tangent_attr.data[loop_index].vector = (float(tangent[0]), float(tangent[1]), float(tangent[2]))
-                if sign is None and len(tangent) >= 4:
-                    sign = tangent[3]
-            if sign is not None and sign_attr is not None:
-                sign_attr.data[loop_index].value = float(sign)
-            if sign_byte is not None and sign_byte_attr is not None:
-                sign_byte_attr.data[loop_index].value = int(sign_byte)
-        return True
-    except Exception:
-        return False
-
-
-def _new_mesh_color_attribute(mesh, name="RBXColor"):
-    color_attributes = getattr(mesh, "color_attributes", None)
-    if color_attributes is not None:
-        try:
-            existing = color_attributes.get(name)
-            if existing is not None:
-                return existing
-            return color_attributes.new(name=name, type="BYTE_COLOR", domain="CORNER")
-        except Exception:
-            pass
-
-    vertex_colors = getattr(mesh, "vertex_colors", None)
-    if vertex_colors is not None:
-        try:
-            existing = vertex_colors.get(name)
-            if existing is not None:
-                return existing
-            return vertex_colors.new(name=name)
-        except Exception:
-            pass
-
-    return None
-
-
-def _apply_mesh_vertex_colors(mesh, vertices):
-    if not vertices or not any(vertex.get("color") is not None for vertex in vertices if isinstance(vertex, dict)):
-        return False
-
-    color_layer = _new_mesh_color_attribute(mesh)
-    if color_layer is None:
-        return False
-
-    try:
-        for loop_index, vertex_index in _iter_mesh_loop_vertex_indices(mesh):
-            color = _vertex_corner_value(vertices, vertex_index, "color", default=(1.0, 1.0, 1.0, 1.0))
-            color_layer.data[loop_index].color = tuple(float(component) for component in color[:4])
-        return True
-    except Exception:
-        return False
-
-
-def _configure_synthesized_mesh_surface(mesh_obj, vertices):
-    mesh = getattr(mesh_obj, "data", None)
-    if mesh is None:
-        return
-
-    _set_mesh_smooth_shading(mesh)
-    mesh_obj["RBXSynthesizedUVs"] = bool(_apply_mesh_loop_uvs(mesh, vertices))
-    mesh_obj["RBXSynthesizedCustomNormals"] = bool(_apply_mesh_custom_normals(mesh, vertices))
-    mesh_obj["RBXSynthesizedVertexColors"] = bool(_apply_mesh_vertex_colors(mesh, vertices))
-    mesh_obj["RBXSynthesizedTangents"] = bool(_apply_mesh_loop_tangents(mesh, vertices))
-    try:
-        mesh.update()
-    except Exception:
-        pass
-
-
-def _configure_synthesized_mesh_display(mesh_obj, entry):
-    helper_display = bool(_get_wrap_target_metadata(entry) if isinstance(entry, dict) else None)
-    mesh_obj["RBXDisplayHelper"] = helper_display
-    if not helper_display:
-        return
-
-    mesh_obj.hide_render = True
-    if hasattr(mesh_obj, "display_type"):
-        mesh_obj.display_type = "WIRE"
-    elif hasattr(mesh_obj, "show_wire"):
-        mesh_obj.show_wire = True
-
-
-def _ensure_synthesized_display_modifier(mesh_obj):
-    if getattr(mesh_obj, "type", None) != "MESH":
-        return None
-    if not bool(mesh_obj.get("RBXSynthesizedPart")):
-        return None
-    if not bool(mesh_obj.get("RBXDisplayHelper")):
-        return None
-
-    modifier = None
-    for existing in mesh_obj.modifiers:
-        if existing.type == "WELD" and existing.name == "RBXSynthDisplayWeld":
-            modifier = existing
-            break
-
-    if modifier is None:
-        try:
-            modifier = mesh_obj.modifiers.new(name="RBXSynthDisplayWeld", type="WELD")
-        except Exception:
-            return None
-
-    threshold = max(max(mesh_obj.dimensions), 1.0) * 1e-6
-    if hasattr(modifier, "merge_threshold"):
-        modifier.merge_threshold = threshold
-    elif hasattr(modifier, "merge_distance"):
-        modifier.merge_distance = threshold
-    return modifier
-
+# Mesh geometry/surface helpers live in mesh_surface.py (imported above).
 
 def _iter_rig_node_names(node):
     if not isinstance(node, dict):
@@ -491,43 +248,8 @@ def _iter_rig_node_names(node):
         yield from _iter_rig_node_names(child)
 
 
-def _normalize_vector(vector):
-    if vector is None:
-        return None
-    normalized = vector.copy()
-    if normalized.length_squared > 0:
-        normalized.normalize()
-        return normalized
-    return None
-
-
-def _round_vector_key(vector, precision=5):
-    if vector is None:
-        return None
-    return tuple(round(float(component), precision) for component in vector)
-
-
-def _round_uv_key(uv, precision=5):
-    if uv is None:
-        return None
-    return tuple(round(float(component), precision) for component in uv)
-
-
-def _compute_mesh_scale(part_size, mesh_size):
-    scale = []
-    for idx in range(3):
-        mesh_component = float(mesh_size[idx]) if mesh_size and idx < len(mesh_size) else 0.0
-        part_component = float(part_size[idx]) if part_size and idx < len(part_size) else 1.0
-        scale.append(part_component / mesh_component if abs(mesh_component) > 1e-8 else 1.0)
-    return scale
-
-
-def _coerce_cf_matrix(value):
-    if value is None:
-        return None
-    if isinstance(value, Matrix):
-        return value.copy()
-    return cf_to_mat(value)
+# Vector-key helpers and filemesh scale/cf coercion live in skin_binding.py /
+# filemesh_geometry.py (imported above).
 
 
 def _compose_wrap_local_matrix(origin=None, import_origin=None, bind_offset=None):
@@ -553,91 +275,10 @@ def _compose_wrap_geometry_matrix(origin=None, import_origin=None, bind_offset=N
     return _compose_wrap_local_matrix(origin=origin)
 
 
-def _normalize_wrap_auto_skin(value):
-    if not value:
-        return None
-    text = str(value)
-    if "." in text:
-        text = text.rsplit(".", 1)[-1]
-    return text.lower()
+# Wrap AutoSkin normalization lives in filemesh_geometry.py (imported above).
 
 
-def _build_transformed_filemesh_vertices(mesh_data, part_cf=None, part_size=None, mesh_size=None, local_cf=None):
-    positions = mesh_data.get("positions") or []
-    if not positions:
-        return []
-
-    t2b = get_transform_to_blender()
-    world_matrix = Matrix.Identity(4)
-    if part_cf:
-        try:
-            world_matrix = t2b @ cf_to_mat(part_cf)
-        except Exception:
-            return []
-
-    local_matrix = Matrix.Identity(4)
-    if local_cf:
-        try:
-            local_matrix = _coerce_cf_matrix(local_cf) or Matrix.Identity(4)
-        except Exception:
-            return []
-
-    transform_matrix = world_matrix @ local_matrix
-    direction_matrix = transform_matrix.to_3x3()
-    try:
-        normal_matrix = direction_matrix.inverted_safe().transposed()
-    except Exception:
-        normal_matrix = direction_matrix
-    scale = _compute_mesh_scale(part_size, mesh_size)
-    scale_x, scale_y, scale_z = scale
-
-    normals = mesh_data.get("normals") or []
-    uvs = mesh_data.get("uvs") or []
-    tangents = mesh_data.get("tangents") or []
-    tangent_signs = mesh_data.get("tangent_signs") or []
-    tangent_sign_bytes = mesh_data.get("tangent_sign_bytes") or []
-    colors = mesh_data.get("colors") or []
-    normals_len = len(normals)
-    uvs_len = len(uvs)
-    tangents_len = len(tangents)
-    tangent_signs_len = len(tangent_signs)
-    tangent_sign_bytes_len = len(tangent_sign_bytes)
-    colors_len = len(colors)
-    transformed = []
-    transformed_append = transformed.append
-    for vertex_index, position in enumerate(positions):
-        local_vec = Vector((position[0] * scale_x, position[1] * scale_y, position[2] * scale_z))
-        world_vec = transform_matrix @ local_vec
-        normal = normals[vertex_index] if vertex_index < normals_len else None
-        uv = uvs[vertex_index] if vertex_index < uvs_len else None
-        tangent = tangents[vertex_index] if vertex_index < tangents_len else None
-        tangent_sign = tangent_signs[vertex_index] if vertex_index < tangent_signs_len else None
-        tangent_sign_byte = tangent_sign_bytes[vertex_index] if vertex_index < tangent_sign_bytes_len else None
-        color = colors[vertex_index] if vertex_index < colors_len else None
-        world_normal = None
-        if normal is not None:
-            world_normal = _normalize_vector(normal_matrix @ Vector(normal))
-        world_tangent = None
-        if tangent is not None and len(tangent) >= 4:
-            tangent_vec = _normalize_vector(direction_matrix @ Vector((tangent[0], tangent[1], tangent[2])))
-            if tangent_vec is not None:
-                if tangent_sign is None:
-                    tangent_sign = tangent[3]
-                world_tangent = (float(tangent_vec.x), float(tangent_vec.y), float(tangent_vec.z), float(tangent_sign))
-        transformed_append(
-            {
-                "index": vertex_index,
-                "position": world_vec,
-                "normal": world_normal,
-                "uv": (float(uv[0]), float(uv[1])) if uv is not None else None,
-                "tangent": world_tangent,
-                "tangent_sign": float(tangent_sign) if tangent_sign is not None else None,
-                "tangent_sign_byte": int(tangent_sign_byte) if tangent_sign_byte is not None else None,
-                "color": tuple(float(component) for component in color[:4]) if color is not None else None,
-            }
-        )
-
-    return transformed
+# Transformed-filemesh vertex building lives in filemesh_geometry.py (imported above).
 
 
 def _build_position_samples_from_vertices(vertices, vertex_weights):
@@ -663,7 +304,7 @@ def _build_position_samples_from_vertices(vertices, vertex_weights):
         samples_append(
             {
                 "index": vertex.get("index", vertex_index),
-                "position": position.copy(),
+                "position": _copy_position(position),
                 "position_key": _round_vector_key(position),
                 "normal": normal,
                 "normal_key": _round_vector_key(normal, precision=4),
@@ -675,24 +316,20 @@ def _build_position_samples_from_vertices(vertices, vertex_weights):
     return samples
 
 
-def _has_meaningful_vertex_weights(vertex_weights):
-    for weights in vertex_weights or []:
-        if not weights:
-            continue
-        for value in weights.values():
-            if float(value) > 0.0:
-                return True
-    return False
+# Vertex-weight predicate lives in skin_binding.py (imported above).
 
 
 def _build_position_samples(binding):
+    from . import avatar_scale  # noqa: PLC0415
+
     entry = binding["entry"]
     mesh_data = binding["mesh_data"]
     vertices = _build_transformed_filemesh_vertices(
         mesh_data,
         part_cf=entry.get("part_cf"),
         part_size=entry.get("part_size"),
-        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
+        mesh_size=_get_effective_mesh_size(entry, mesh_data),
+        limb_scale=avatar_scale.entry_limb_scale(entry),
     )
     if not vertices:
         return None
@@ -703,127 +340,7 @@ def _is_wrap_binding(binding):
     return bool(binding.get("wrap_solver") or _get_wrap_layer_metadata(binding.get("entry") or {}))
 
 
-def _compute_mesh_vertex_uvs(mesh_obj):
-    """Return {vertex_index: (u, v)} using the first-encountered loop UV per vertex.
-    Used by existing callers that expect a single UV per vertex."""
-    mesh = mesh_obj.data
-    if mesh is None or not mesh.uv_layers:
-        return {}
-
-    uv_layer = mesh.uv_layers.active or mesh.uv_layers[0]
-    result = {}
-    for loop in mesh.loops:
-        vertex_index = loop.vertex_index
-        if vertex_index in result:
-            continue
-        uv = uv_layer.data[loop.index].uv
-        result[vertex_index] = (float(uv.x), float(uv.y))
-
-    return result
-
-
-def _compute_mesh_vertex_all_uvs(mesh_obj):
-    """Return {vertex_index: list[(u, v)]} collecting ALL distinct loop UVs per vertex.
-    Seam vertices have multiple loops with different UV coordinates; using only the
-    first-encountered loop causes UV-match misses for those vertices."""
-    mesh = mesh_obj.data
-    if mesh is None or not mesh.uv_layers:
-        return {}
-
-    uv_layer = mesh.uv_layers.active or mesh.uv_layers[0]
-    result = {}
-    for loop in mesh.loops:
-        vertex_index = loop.vertex_index
-        uv = uv_layer.data[loop.index].uv
-        uv_tuple = (float(uv.x), float(uv.y))
-        uvs = result.get(vertex_index)
-        if uvs is None:
-            result[vertex_index] = [uv_tuple]
-        elif uv_tuple not in uvs:
-            uvs.append(uv_tuple)
-
-    return result
-
-
-def _build_mesh_object_vertices(mesh_obj, world_space=False):
-    if mesh_obj.type != "MESH" or mesh_obj.data is None:
-        return []
-
-    vertex_uvs = _compute_mesh_vertex_uvs(mesh_obj)
-    vertices = []
-    for vertex in mesh_obj.data.vertices:
-        if world_space:
-            position = mesh_obj.matrix_world @ vertex.co
-            normal = _compute_mesh_vertex_normal(mesh_obj, vertex)
-            if normal is not None:
-                normal = (float(normal.x), float(normal.y), float(normal.z))
-            position = (float(position.x), float(position.y), float(position.z))
-        else:
-            position = (float(vertex.co.x), float(vertex.co.y), float(vertex.co.z))
-            normal = (float(vertex.normal.x), float(vertex.normal.y), float(vertex.normal.z))
-        vertices.append(
-            {
-                "index": vertex.index,
-                "position": position,
-                "normal": normal,
-                "uv": vertex_uvs.get(vertex.index),
-            }
-        )
-    return vertices
-
-
-def _build_mesh_object_faces(mesh_obj):
-    if mesh_obj.type != "MESH" or mesh_obj.data is None:
-        return []
-
-    mesh = mesh_obj.data
-    try:
-        mesh.calc_loop_triangles()
-        return [tuple(int(index) for index in triangle.vertices) for triangle in mesh.loop_triangles]
-    except Exception:
-        faces = []
-        for polygon in mesh.polygons:
-            vertices = [int(index) for index in polygon.vertices]
-            if len(vertices) < 3:
-                continue
-            anchor = vertices[0]
-            for index in range(1, len(vertices) - 1):
-                faces.append((anchor, vertices[index], vertices[index + 1]))
-        return faces
-
-
-def _canonical_triangle_face(face):
-    if face is None or len(face) < 3:
-        return None
-    try:
-        indices = tuple(int(index) for index in face[:3])
-    except Exception:
-        return None
-    if min(indices) < 0:
-        return None
-    return tuple(sorted(indices))
-
-
-def _sorted_triangle_topology(faces):
-    topology = []
-    for face in faces or []:
-        canonical = _canonical_triangle_face(face)
-        if canonical is not None:
-            topology.append(canonical)
-    topology.sort()
-    return topology
-
-
-def _index_alignment_limits(mesh_obj):
-    max_dimension = max(max(mesh_obj.dimensions), 1.0)
-    return max_dimension * 0.0025, max_dimension * 0.001
-
-
-def _index_alignment_is_tight(mesh_obj, alignment):
-    if not alignment:
-        return False
-    max_distance_limit, avg_distance_limit = _index_alignment_limits(mesh_obj)
-    return alignment["max"] <= max_distance_limit and alignment["avg"] <= avg_distance_limit
+# Mesh vertex/UV analysis helpers live in skin_binding.py (imported above).
 
 
 def _build_wrap_topology_index_binding(binding, target_faces=None, index_alignment=None):
@@ -873,156 +390,11 @@ def _build_wrap_topology_index_binding(binding, target_faces=None, index_alignme
     )
 
 
-def _compute_mesh_vertex_normal(mesh_obj, vertex):
-    try:
-        normal_matrix = mesh_obj.matrix_world.to_3x3().inverted_safe().transposed()
-    except Exception:
-        normal_matrix = mesh_obj.matrix_world.to_3x3()
-    return _normalize_vector(normal_matrix @ vertex.normal)
+# Sample scoring/candidate lookup live in skin_binding.py (imported above).
 
 
-def _sample_match_score(vertex_position, vertex_normal, vertex_uv, sample):
-    position_distance = (vertex_position - sample["position"]).length
-
-    normal_penalty = 1.0
-    sample_normal = sample.get("normal")
-    if vertex_normal is not None and sample_normal is not None:
-        dot = max(-1.0, min(1.0, vertex_normal.dot(sample_normal)))
-        normal_penalty = 1.0 - dot
-
-    uv_penalty = 1.0
-    sample_uv = sample.get("uv")
-    if vertex_uv is not None and sample_uv is not None:
-        uv_penalty = abs(vertex_uv[0] - sample_uv[0]) + abs(vertex_uv[1] - sample_uv[1])
-
-    return (round(position_distance, 8), round(normal_penalty, 8), round(uv_penalty, 8), sample.get("index", -1))
-
-
-def _pick_best_sample(candidate_indices, used_indices, vertex_position, vertex_normal, vertex_uv, samples):
-    best_unused = None
-    best_used = None
-    for sample_index in candidate_indices:
-        sample = samples[sample_index]
-        score = _sample_match_score(vertex_position, vertex_normal, vertex_uv, sample)
-        if sample_index in used_indices:
-            if best_used is None or score < best_used[0]:
-                best_used = (score, sample_index)
-        else:
-            if best_unused is None or score < best_unused[0]:
-                best_unused = (score, sample_index)
-    if best_unused is not None:
-        return best_unused[1]
-    if best_used is not None:
-        return best_used[1]
-    return None
-
-
-def _pick_closest_sample(samples, used_indices, vertex_position, vertex_normal, vertex_uv, max_distance=None):
-    best_unused = None
-    best_used = None
-    best_distance_unused = None
-    best_distance_used = None
-
-    for sample_index, sample in enumerate(samples):
-        sample_distance = (vertex_position - sample["position"]).length
-        if max_distance is not None and sample_distance > max_distance:
-            continue
-
-        score = _sample_match_score(vertex_position, vertex_normal, vertex_uv, sample)
-        candidate = (score, sample_index, sample_distance)
-        if sample_index in used_indices:
-            if best_used is None or candidate[0] < best_used[0]:
-                best_used = candidate
-                best_distance_used = sample_distance
-        else:
-            if best_unused is None or candidate[0] < best_unused[0]:
-                best_unused = candidate
-                best_distance_unused = sample_distance
-
-    if best_unused is not None:
-        return best_unused[1], best_distance_unused
-    if best_used is not None:
-        return best_used[1], best_distance_used
-    return None, None
-
-
-def _build_position_sample_lookup(samples):
-    sample_lookup = {}
-    sample_signature_lookup = {}
-    coarse_lookups = {precision: {} for precision in (4, 3, 2, 1)}
-
-    for sample_index, sample in enumerate(samples):
-        position_key = sample.get("position_key")
-        sample_lookup.setdefault(position_key, []).append(sample_index)
-
-        signature_key = (position_key, sample.get("normal_key"), sample.get("uv_key"))
-        sample_signature_lookup.setdefault(signature_key, []).append(sample_index)
-
-        position = sample.get("position")
-        if position is None:
-            continue
-
-        for precision, lookup in coarse_lookups.items():
-            coarse_key = _round_vector_key(position, precision=precision)
-            lookup.setdefault(coarse_key, []).append(sample_index)
-
-    return sample_lookup, sample_signature_lookup, coarse_lookups
-
-
-def _find_position_candidate_indices(world_position, normal_key, uv_key, sample_lookup, sample_signature_lookup, coarse_lookups):
-    position_key = _round_vector_key(world_position)
-
-    candidate_indices = sample_signature_lookup.get((position_key, normal_key, uv_key))
-    if candidate_indices:
-        return candidate_indices, "exact-signature"
-
-    candidate_indices = sample_lookup.get(position_key)
-    if candidate_indices:
-        return candidate_indices, "exact-position"
-
-    for precision in (4, 3, 2, 1):
-        coarse_key = _round_vector_key(world_position, precision=precision)
-        candidate_indices = coarse_lookups[precision].get(coarse_key)
-        if candidate_indices:
-            return candidate_indices, f"coarse-p{precision}"
-
-    return None, None
-
-
-def _compute_filemesh_world_positions(binding):
-    entry = binding["entry"]
-    vertices = _build_transformed_filemesh_vertices(
-        binding["mesh_data"],
-        part_cf=entry.get("part_cf"),
-        part_size=entry.get("part_size"),
-        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
-    )
-    if not vertices:
-        return None
-    return [vertex["position"] for vertex in vertices]
-
-
-def _build_transformed_filemesh_geometry(mesh_data, part_cf=None, part_size=None, mesh_size=None, local_cf=None):
-    vertices = _build_transformed_filemesh_vertices(
-        mesh_data,
-        part_cf=part_cf,
-        part_size=part_size,
-        mesh_size=mesh_size,
-        local_cf=local_cf,
-    )
-    if not vertices:
-        return None, []
-
-    faces = []
-    for face in mesh_data.get("faces") or []:
-        if face is None or len(face) < 3:
-            continue
-        try:
-            faces.append((int(face[0]), int(face[1]), int(face[2])))
-        except Exception:
-            continue
-
-    return vertices, faces
+# Filemesh world-position/geometry builders live in filemesh_geometry.py
+# (imported above).
 
 
 def _collapse_weighted_source_geometry(vertices, vertex_weights, faces, precision=6):
@@ -1139,28 +511,385 @@ def _collapse_weighted_source_geometry(vertices, vertex_weights, faces, precisio
     return collapsed_vertices, collapsed_weights, collapsed_faces, representative_original_indices
 
 
-def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, entry, local_cf=None):
-    vertices, faces = _build_transformed_filemesh_geometry(
-        mesh_data,
-        part_cf=entry.get("part_cf"),
-        part_size=entry.get("part_size"),
-        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
-        local_cf=local_cf,
+# Primitive shape generation and UV helpers live in primitive_shapes.py
+# (imported above).
+
+def _get_filemesh_native_transform(entry, mesh_data, limb_scale=None):
+    """Return the object transform for unbaked FileMesh geometry."""
+    from . import avatar_scale  # noqa: PLC0415
+
+    limb_scale = limb_scale or avatar_scale.entry_limb_scale(entry)
+    scale = _compute_mesh_scale(
+        entry.get("part_size"), _get_effective_mesh_size(entry, mesh_data)
     )
+    scale = [scale[index] * limb_scale[index] for index in range(3)]
+    return (
+        get_transform_to_blender()
+        @ cf_to_mat(entry.get("part_cf"))
+        @ Matrix.Diagonal((scale[0], scale[1], scale[2], 1.0))
+    )
+
+
+def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, entry, local_cf=None,
+                                      lod_index=0, native_transform=False, native_object_transform=False, skip_custom_normals=False):
+    from . import avatar_scale  # noqa: PLC0415
+
+    limb_scale = avatar_scale.entry_limb_scale(entry)
+    if any(abs(component - 1.0) > 1e-4 for component in limb_scale):
+        print(
+            f"[RigCreate] HD limb scale for '{part_name}': "
+            f"({limb_scale[0]:.3f}, {limb_scale[1]:.3f}, {limb_scale[2]:.3f})"
+        )
+    # Build the render mesh from LOD0 only — FileMesh faces span every LOD
+    # concatenated, and using them all stacks LOD shells and mismatches the
+    # (LOD-sliced) skin binding data. Embedded union (CSG) meshes have no LOD
+    # table — slicing those would mangle the face buffer, so leave them be.
+    if not (isinstance(mesh_data, dict) and mesh_data.get("embedded_union")):
+        mesh_data = _slice_mesh_data_to_lod(mesh_data, lod_index)
+    native_matrix = None
+    native_surface = False
+    if native_transform:
+        positions = mesh_data.get("positions") or []
+        native_matrix = _get_filemesh_native_transform(entry, mesh_data, limb_scale)
+        vertices = positions
+        faces = mesh_data.get("faces") or []
+        native_surface = True
+    else:
+        vertices, faces = _build_transformed_filemesh_geometry(
+            mesh_data, part_cf=entry.get("part_cf"), part_size=entry.get("part_size"),
+            mesh_size=_get_effective_mesh_size(entry, mesh_data), local_cf=local_cf, limb_scale=limb_scale,
+        )
     if not vertices:
         return None
 
-    mesh = bpy.data.meshes.new(get_unique_name(f"mesh_{part_name or 'Part'}"))
-    mesh.from_pydata([tuple(vertex["position"]) for vertex in vertices], [], faces)
+    # Classic clothing keeps the mesh's native UVs; the composite texture is
+    # baked per limb group in clothing.get_limb_texture (see textures.py).
 
-    mesh.update()
+    # Blender datablock creation performs its own efficient suffixing. The
+    # old helper scanned every scene object for each mesh, even though object
+    # names cannot collide with mesh datablock names in the first place.
+    mesh = bpy.data.meshes.new(f"mesh_{part_name or 'Part'}")
+    mesh_positions = vertices if native_surface else [tuple(vertex["position"]) for vertex in vertices]
+    if not _populate_mesh_geometry(mesh, mesh_positions, faces):
+        bpy.data.meshes.remove(mesh)
+        return None
+    if native_matrix is not None and not native_object_transform:
+        mesh.transform(native_matrix)
 
-    object_name = part_name or get_unique_name("Part")
+    # Wrap-layer accessories are typically all named "Handle"; name them from
+    # their WrapLayer so the outliner stays readable. Association is NOT by
+    # name: the object is stamped with the entry's parse index (RBXPartIdx),
+    # which the bind phase uses to find it exactly.
+    wrap_layer = entry.get("wrap_layer") if isinstance(entry, dict) else None
+    if isinstance(wrap_layer, dict) and wrap_layer.get("name"):
+        base_name = wrap_layer["name"]
+    else:
+        base_name = part_name or "Part"
+
+    # Studio-style naming for multi-model scenes: when the entry carries a
+    # model tag (set by the rbxm importer), name the object
+    # "<Model>.model/<Part>.<Class>" so parts group under their source model
+    # and never collide across models. The class suffix uses Roblox's exact
+    # PascalCase class name (Part / MeshPart / UnionOperation) so it reads
+    # identically to Studio's class panel. Bind-phase lookups strip the prefix
+    # and class suffix, so name matching still works.
+    model_tag = entry.get("model_tag") if isinstance(entry, dict) else None
+    if model_tag:
+        class_name = entry.get("class_name") or "Part"
+        object_name = f"{model_tag}/{base_name}.{class_name}"
+    else:
+        object_name = base_name
     mesh_obj = bpy.data.objects.new(object_name, mesh)
+    if native_matrix is not None and native_object_transform:
+        mesh_obj.matrix_world = native_matrix
     mesh_obj["RBXSynthesizedPart"] = True
-    _configure_synthesized_mesh_surface(mesh_obj, vertices)
+    if isinstance(entry, dict) and entry.get("class_name") == "Part" and not entry.get("mesh_id"):
+        # Primitive Parts carry Roblox's canonical local per-face UVs.  Write
+        # the built-in material layer from those local loop UVs directly: the
+        # material pass must never re-project in world space, where the
+        # Y-up -> Z-up axis remap would put U along the world's vertical on
+        # some faces (brick courses running sideways).
+        mesh["RBXPrimitiveShape"] = str(entry.get("shape", "block") or "block")
+        try:
+            from .textures import _BUILTIN_MATERIAL_UV_LAYER, _BUILTIN_MATERIAL_STUDS_PER_TILE
+
+            loop_uvs = mesh_data.get("loop_uvs") or []
+            if len(loop_uvs) == len(mesh.loops):
+                uv_layer = mesh.uv_layers.get(_BUILTIN_MATERIAL_UV_LAYER)
+                if uv_layer is None:
+                    uv_layer = mesh.uv_layers.new(name=_BUILTIN_MATERIAL_UV_LAYER)
+                units = 1.0 / float(_BUILTIN_MATERIAL_STUDS_PER_TILE)
+                # loop_uvs are band units (0.5/stud u, 0.125/stud v).
+                values = [0.0] * (2 * len(loop_uvs))
+                for index, (band_u, band_v) in enumerate(loop_uvs):
+                    values[2 * index] = (band_u / 0.5) * units
+                    values[2 * index + 1] = (band_v / 0.125) * units
+                _bulk_set(uv_layer.data, "uv", values)
+        except Exception:
+            pass
+    if isinstance(entry, dict):
+        if entry.get("idx") is not None:
+            mesh_obj["RBXPartIdx"] = int(entry["idx"])
+        if entry.get("inst_ref") is not None:
+            mesh_obj["RBXInstRef"] = int(entry["inst_ref"])
+    if native_surface:
+        _set_mesh_smooth_shading(mesh)
+        # Built-in materials tile through the RBXMaterialUV layer; their
+        # shader never reads the mesh's native UVs.  Uploading both layers
+        # for every built-in part doubles UV memory and loop traffic for
+        # data nothing samples.  TextureID/SurfaceAppearance/clothing parts
+        # keep the native layer.
+        needs_native_uvs = True
+        if isinstance(entry, dict):
+            try:
+                from .textures import builtin_material_texture_refs
+
+                if builtin_material_texture_refs(entry):
+                    needs_native_uvs = False
+            except Exception:
+                pass
+        mesh_obj["RBXSynthesizedUVs"] = bool(
+            _apply_mesh_loop_uvs(mesh, (), mesh_data.get("loop_uvs"))
+            if needs_native_uvs
+            else False
+        )
+        mesh_obj["RBXSynthesizedCustomNormals"] = False
+        mesh_obj["RBXSynthesizedVertexColors"] = False
+        mesh_obj["RBXSynthesizedTangents"] = False
+    else:
+        _configure_synthesized_mesh_surface(mesh_obj, vertices, mesh_data.get(
+            "loop_uvs"), apply_custom_normals=not skip_custom_normals)
     _configure_synthesized_mesh_display(mesh_obj, entry)
+    try:
+        from .textures import apply_part_material
+        if isinstance(entry, dict) and mesh_data.get("face_surface_types"):
+            entry["_face_surface_types"] = mesh_data["face_surface_types"]
+        apply_part_material(mesh_obj, entry)
+    except Exception as exc:
+        print(f"[RigCreate] Material build failed for '{object_name}': {exc}")
     parts_collection.objects.link(mesh_obj)
+    return mesh_obj
+
+
+def _apply_batched_mesh_vertex_colors(mesh, colors, loop_vidx):
+    """Per-corner colors from a per-vertex numpy matrix (batch path)."""
+    if colors is None or len(colors) == 0 or len(loop_vidx) == 0:
+        return False
+    try:
+        import numpy as np  # bundled with Blender
+
+        first = colors[0]
+        if not np.any(np.abs(colors - first) > 1e-6):
+            return False
+        layer = _new_mesh_color_attribute(mesh)
+        if layer is None:
+            return False
+        valid = (loop_vidx >= 0) & (loop_vidx < len(colors))
+        clip = np.clip(loop_vidx, 0, len(colors) - 1)
+        width = min(colors.shape[1], 4)
+        values = np.ones((len(loop_vidx), 4), dtype=np.float32)
+        values[valid, :width] = colors[clip[valid], :width]
+        _bulk_set(layer.data, "color", values.ravel())
+        return True
+    except Exception:
+        return False
+
+
+def _create_batched_filemesh_instances_np(np, parts_collection, batch_name, mesh_data, entries):
+    """numpy batch path: one matrix multiply per instance, bulk corner data.
+
+    Raises on malformed payloads so the caller falls back to the per-vertex
+    python builder.
+    """
+    src_positions = mesh_data.get("positions") or []
+    src_faces = mesh_data.get("faces") or []
+    if not src_positions or not src_faces:
+        return None
+    pos_np = np.asarray(src_positions, dtype=np.float32)
+    if pos_np.ndim != 2 or pos_np.shape[0] != len(src_positions) or pos_np.shape[1] < 3:
+        raise ValueError("positions must be a flat list of vec3 rows")
+    face_np = np.asarray(src_faces, dtype=np.int64)
+    if face_np.ndim != 2:
+        raise ValueError("faces must be a flat list of index rows")
+    uv_np = None
+    src_uvs = mesh_data.get("uvs") or []
+    if src_uvs:
+        uv_np = np.asarray(src_uvs, dtype=np.float32)
+        if uv_np.ndim != 2 or uv_np.shape[1] < 2:
+            raise ValueError("uvs must be a flat list of vec2 rows")
+    col_np = None
+    src_colors = mesh_data.get("colors") or []
+    if src_colors:
+        col_np = np.asarray(src_colors, dtype=np.float32)
+        if col_np.ndim != 2 or col_np.shape[1] < 3:
+            raise ValueError("colors must be a flat list of vec3/vec4 rows")
+
+    t2b = get_transform_to_blender()
+    parts_pos = []
+    parts_faces = []
+    parts_vidx = []
+    vertex_offset = 0
+    for entry in entries:
+        transform = Matrix.Identity(4)
+        if entry.get("part_cf"):
+            try:
+                transform = t2b @ cf_to_mat(entry["part_cf"])
+            except Exception:
+                continue
+        m3 = np.array(
+            [
+                [transform[0][0], transform[0][1], transform[0][2]],
+                [transform[1][0], transform[1][1], transform[1][2]],
+                [transform[2][0], transform[2][1], transform[2][2]],
+            ],
+            dtype=np.float32,
+        )
+        translation = np.array(
+            [transform[0][3], transform[1][3], transform[2][3]], dtype=np.float32
+        )
+        scale = _compute_mesh_scale(
+            entry.get("part_size"), _get_effective_mesh_size(entry, mesh_data)
+        )
+        scale_arr = np.array([float(scale[0]), float(scale[1]), float(scale[2])], dtype=np.float32)
+        parts_pos.append((pos_np * scale_arr) @ m3.T + translation)
+        parts_faces.append(face_np + vertex_offset)
+        parts_vidx.append(face_np.ravel())
+        vertex_offset += len(pos_np)
+    if not parts_pos:
+        return None
+
+    positions = np.concatenate(parts_pos)
+    faces = np.concatenate(parts_faces)
+    loop_vidx = np.concatenate(parts_vidx)
+
+    mesh = bpy.data.meshes.new(f"mesh_{batch_name}")
+    mesh_obj = None
+    try:
+        if not _populate_mesh_geometry(mesh, positions, faces):
+            raise ValueError("geometry upload failed")
+        if uv_np is not None:
+            uv_layer = mesh.uv_layers.new(name="UVMap")
+            valid = loop_vidx < len(uv_np)
+            uv_values = np.zeros(2 * len(loop_vidx), dtype=np.float32)
+            filled = np.flatnonzero(valid)
+            if filled.size:
+                uv = uv_np[loop_vidx[filled]]
+                uv_values[2 * filled] = uv[:, 0]
+                uv_values[2 * filled + 1] = 1.0 - uv[:, 1]
+            _bulk_set(uv_layer.data, "uv", uv_values)
+        mesh_obj = bpy.data.objects.new(batch_name, mesh)
+        mesh_obj["RBXSynthesizedPart"] = True
+        mesh_obj["RBXMeshPartBatch"] = True
+        mesh_obj["RBXStaticPartCount"] = len(entries)
+        _set_mesh_smooth_shading(mesh)
+        mesh_obj["RBXSynthesizedUVs"] = uv_np is not None
+        # Batched place geometry joins the same quality path as every other
+        # lazy mesh: smooth generated normals instead of a per-vertex custom
+        # normal transform (the latter needs a python pass per vertex).
+        mesh_obj["RBXSynthesizedCustomNormals"] = False
+        mesh_obj["RBXSynthesizedVertexColors"] = _apply_batched_mesh_vertex_colors(
+            mesh, col_np, loop_vidx
+        )
+        mesh_obj["RBXSynthesizedTangents"] = False
+        mesh.update()
+        try:
+            from .textures import apply_part_material
+            apply_part_material(mesh_obj, entries[0])
+        except Exception as exc:
+            print(f"[RigCreate] Batched FileMesh material failed for '{batch_name}': {exc}")
+        parts_collection.objects.link(mesh_obj)
+        return mesh_obj
+    except Exception:
+        if mesh_obj is not None and mesh_obj.name in bpy.data.objects:
+            bpy.data.objects.remove(mesh_obj, do_unlink=True)
+        elif mesh.name in bpy.data.meshes:
+            bpy.data.meshes.remove(mesh)
+        raise
+
+
+def _create_batched_filemesh_instances(parts_collection, batch_name, mesh_data, entries, lod_index=0):
+    """Merge visually identical, non-rigged FileMesh instances into one object."""
+    if not entries:
+        return None
+    mesh_data = _slice_mesh_data_to_lod(mesh_data, lod_index)
+    try:
+        import numpy as np  # bundled with Blender
+
+        return _create_batched_filemesh_instances_np(
+            np, parts_collection, batch_name, mesh_data, entries
+        )
+    except Exception:
+        pass
+    positions = []
+    faces = []
+    surface_vertices = []
+    for entry in entries:
+        vertices, entry_faces = _build_transformed_filemesh_geometry(
+            mesh_data,
+            part_cf=entry.get("part_cf"),
+            part_size=entry.get("part_size"),
+            mesh_size=_get_effective_mesh_size(entry, mesh_data),
+        )
+        if not vertices:
+            continue
+        offset = len(positions)
+        positions.extend(tuple(vertex["position"]) for vertex in vertices)
+        surface_vertices.extend(vertices)
+        faces.extend(tuple(offset + index for index in face) for face in entry_faces)
+    if not positions or not faces:
+        return None
+    mesh = bpy.data.meshes.new(f"mesh_{batch_name}")
+    if not _populate_mesh_geometry(mesh, positions, faces):
+        bpy.data.meshes.remove(mesh)
+        return None
+    mesh_obj = bpy.data.objects.new(batch_name, mesh)
+    mesh_obj["RBXSynthesizedPart"] = True
+    mesh_obj["RBXMeshPartBatch"] = True
+    mesh_obj["RBXStaticPartCount"] = len(entries)
+    _configure_synthesized_mesh_surface(mesh_obj, surface_vertices)
+    try:
+        from .textures import apply_part_material
+        apply_part_material(mesh_obj, entries[0])
+    except Exception as exc:
+        print(f"[RigCreate] Batched FileMesh material failed for '{batch_name}': {exc}")
+    parts_collection.objects.link(mesh_obj)
+    return mesh_obj
+
+
+# Batched static-primitive builders live in primitive_shapes.py (imported above).
+
+def _create_pending_filemesh_proxy(parts_collection, part_name, entry):
+    """Create a cheap bounds proxy while a place FileMesh downloads."""
+    cube_positions = [
+        (-0.5, -0.5, -0.5), (0.5, -0.5, -0.5), (0.5, 0.5, -0.5), (-0.5, 0.5, -0.5),
+        (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5), (0.5, 0.5, 0.5), (-0.5, 0.5, 0.5),
+    ]
+    cube_faces = [
+        (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+        (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+        (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7),
+    ]
+    # Do not fetch the eventual mesh texture just to shade a temporary box.
+    proxy_entry = dict(entry)
+    proxy_entry.pop("texture_id", None)
+    proxy_entry.pop("texture_instance", None)
+    proxy_entry.pop("texture_instances", None)
+    proxy_entry.pop("surface_appearance", None)
+    proxy_entry.pop("surface_appearances", None)
+    proxy_entry.pop("face_decal", None)
+    proxy_data = {
+        "positions": cube_positions,
+        "faces": cube_faces,
+        "normals": [],
+        "uvs": [],
+        "vertex_weights": [{} for _ in cube_positions],
+    }
+    mesh_obj = _create_mesh_object_from_filemesh(
+        parts_collection, part_name, proxy_data, proxy_entry
+    )
+    if mesh_obj is not None:
+        mesh_obj["RBXPendingFileMesh"] = True
+        mesh_obj["RBXPendingMeshId"] = str(entry.get("mesh_id", ""))
     return mesh_obj
 
 
@@ -1214,8 +943,12 @@ def _collect_intentionally_missing_wrap_target_parts(meta_loaded, parts_collecti
 
 
 def _build_wrap_target_snapshot(meta_loaded, parts_collection):
-    snapshot_vertices = []
-    snapshot_faces = []
+    """Build per-body-part wrap target cage snapshots keyed by part name.
+
+    Returns {part_name_lower: {"vertices": [...], "faces": [...]}} so the cage
+    solver can match each clothing item against only the body part it wraps.
+    """
+    snapshots = {}
     snapshot_sources = []
 
     for entry in _iter_part_aux_entries(meta_loaded):
@@ -1226,7 +959,7 @@ def _build_wrap_target_snapshot(meta_loaded, parts_collection):
         if not wrap_target_metadata:
             continue
 
-        mesh_obj = _find_parts_object(parts_collection, entry.get("name"))
+        mesh_obj = _find_parts_object_for_entry(parts_collection, entry)
         if mesh_obj is not None and mesh_obj.type != "MESH":
             continue
 
@@ -1256,26 +989,22 @@ def _build_wrap_target_snapshot(meta_loaded, parts_collection):
         if not cage_vertices:
             continue
 
-        vertex_offset = len(snapshot_vertices)
-        snapshot_vertices.extend(cage_vertices)
-        snapshot_faces.extend(
-            (face[0] + vertex_offset, face[1] + vertex_offset, face[2] + vertex_offset)
-            for face in cage_faces
-        )
+        part_name = (entry.get("name") or "").lower()
+        snapshots[part_name] = {
+            "vertices": cage_vertices,
+            "faces": cage_faces,
+        }
         source_name = mesh_obj.name if mesh_obj is not None else (entry.get("name") or "unknown")
         snapshot_sources.append(f"{source_name}:{len(cage_vertices)}")
 
     if snapshot_sources:
         print(f"[RigCreate] Built wrap target cage snapshot from {snapshot_sources}")
 
-    return {
-        "vertices": snapshot_vertices,
-        "faces": snapshot_faces,
-    }
+    return snapshots
 
 
 def _build_wrap_solver_binding(binding, current_wrap_snapshot):
-    if not current_wrap_snapshot or not current_wrap_snapshot.get("vertices"):
+    if not current_wrap_snapshot:
         return None, None
 
     wrap_layer_metadata = _get_wrap_layer_metadata(binding.get("entry") or {})
@@ -1294,6 +1023,24 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
         return None, "missing source skinned mesh data"
 
     entry = binding["entry"]
+
+    # WrapLayer reference/cage meshes are avatar-space cages, not cages for the
+    # rigid attachment part.  The attachment is useful for skinning, but using
+    # it to select one WrapTarget here makes a full-body reference cage (jacket,
+    # trousers, shoes, etc.) try to link against only a torso/foot snapshot.
+    # That loses most UV links and gives the RBF solver nonsense controls.
+    # Always reconstruct the full avatar target cage, preserving the source
+    # ordering of the per-part snapshots.
+    all_vertices = []
+    all_faces = []
+    for snap in current_wrap_snapshot.values():
+        offset = len(all_vertices)
+        all_vertices.extend(snap["vertices"])
+        all_faces.extend(
+            (face[0] + offset, face[1] + offset, face[2] + offset)
+            for face in snap.get("faces", [])
+        )
+    target_snapshot = {"vertices": all_vertices, "faces": all_faces}
     try:
         reference_mesh_data = fetch_and_parse_filemesh(reference_mesh_id)
         outer_cage_mesh_data = fetch_and_parse_filemesh(cage_mesh_id)
@@ -1337,6 +1084,32 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
     if not reference_vertices or not outer_cage_vertices or not source_mesh_vertices:
         return None, "incomplete cage geometry"
 
+    def _bbox(vertices):
+        # Positions may be Vectors or plain tuples; both support indexing,
+        # tuples do not support .x/.y/.z.
+        xs = [v["position"][0] for v in vertices]
+        ys = [v["position"][1] for v in vertices]
+        zs = [v["position"][2] for v in vertices]
+        return (
+            f"x[{min(xs):.2f},{max(xs):.2f}] "
+            f"y[{min(ys):.2f},{max(ys):.2f}] "
+            f"z[{min(zs):.2f},{max(zs):.2f}]"
+        )
+
+    snapshot_vertices = target_snapshot.get("vertices") or []
+    print(
+        f"[RigCreate] Wrap geometry for '{binding['object'].name}': "
+        f"ref={_bbox(reference_vertices)} "
+        f"target_cage=all "
+        f"snapshot={_bbox(snapshot_vertices) if snapshot_vertices else 'empty'} "
+        f"cage={_bbox(outer_cage_vertices)} "
+        f"src={_bbox(source_mesh_vertices)}"
+    )
+
+    # UV link precision 3 matches MaximumADHD's hashUV (round(uv * 1e3) / 1e3);
+    # the reference cage and the body cage snapshot come from different assets,
+    # so 4-decimal buckets miss correspondences the reference implementation catches.
+    rbf_global_threshold = 4096 if numpy_available() else 96
     solved = solve_two_stage_cage_deformation(
         build_mesh_vertices(
             [vertex["position"] for vertex in reference_vertices],
@@ -1344,9 +1117,9 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
             uvs=[vertex.get("uv") for vertex in reference_vertices],
         ),
         build_mesh_vertices(
-            [vertex["position"] for vertex in current_wrap_snapshot["vertices"]],
-            normals=[vertex.get("normal") for vertex in current_wrap_snapshot["vertices"]],
-            uvs=[vertex.get("uv") for vertex in current_wrap_snapshot["vertices"]],
+            [vertex["position"] for vertex in target_snapshot["vertices"]],
+            normals=[vertex.get("normal") for vertex in target_snapshot["vertices"]],
+            uvs=[vertex.get("uv") for vertex in target_snapshot["vertices"]],
         ),
         build_mesh_vertices(
             [vertex["position"] for vertex in outer_cage_vertices],
@@ -1358,8 +1131,11 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
             normals=[vertex.get("normal") for vertex in source_mesh_vertices],
             uvs=[vertex.get("uv") for vertex in source_mesh_vertices],
         ),
+        precision=3,
+        inner_global_threshold=rbf_global_threshold,
+        outer_global_threshold=rbf_global_threshold,
         reference_inner_faces=reference_faces,
-        current_inner_faces=current_wrap_snapshot.get("faces"),
+        current_inner_faces=target_snapshot.get("faces"),
     )
     if not solved:
         return None, "insufficient cage links"
@@ -1373,7 +1149,7 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
         predicted_vertices.append(
             {
                 "index": vertex.get("index", vertex_index),
-                "position": predicted_mesh_positions[vertex_index].copy(),
+                "position": _copy_position(predicted_mesh_positions[vertex_index]),
                 "normal": vertex.get("normal"),
                 "uv": vertex.get("uv"),
             }
@@ -1393,6 +1169,42 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
     if alignment:
         result["index_alignment"] = alignment
 
+    # Fit delta: how far the cage deformer moved the authored bind geometry
+    # (logged for diagnostics; the solution is authoritative with a true rbxm).
+    fit_total = 0.0
+    fit_max = 0.0
+    for vertex, predicted_position in zip(source_mesh_vertices, predicted_mesh_positions):
+        authored_position = vertex.get("position")
+        if authored_position is None:
+            continue
+        delta = (Vector(predicted_position) - Vector(authored_position)).length
+        fit_total += delta
+        fit_max = max(fit_max, delta)
+    fit_avg = fit_total / max(len(predicted_mesh_positions), 1)
+    result["fit_avg_distance"] = fit_avg
+    result["fit_max_distance"] = fit_max
+
+    # Cage delta: how much the deformer believes the OUTER CAGE itself must
+    # move to fit this body (reference vs avatar snapshot). The render mesh
+    # should never be dragged further than the cage that wraps it — a fit
+    # much larger than the cage delta means the field is extrapolating the
+    # reference-vs-avatar body re-proportioning through the garment, which
+    # is not a fit (Roblox anchors garments against the reference body).
+    delta_total = 0.0
+    delta_max = 0.0
+    predicted_outer_positions = solved.get("predicted_outer_positions") or []
+    for cage_vertex, predicted_cage_position in zip(outer_cage_vertices, predicted_outer_positions):
+        cage_position = cage_vertex.get("position")
+        if cage_position is None:
+            continue
+        delta = (Vector(predicted_cage_position) - Vector(cage_position)).length
+        delta_total += delta
+        delta_max = max(delta_max, delta)
+    delta_avg = delta_total / max(len(predicted_outer_positions), 1)
+    result["cage_delta_avg"] = delta_avg
+    result["cage_delta_max"] = delta_max
+    fit_note = f", fit(avg={fit_avg:.4f}, max={fit_max:.4f}, cage delta={delta_avg:.4f}/{delta_max:.4f})"
+
     if (
         len(predicted_mesh_positions) == len(binding["object"].data.vertices)
         and alignment
@@ -1402,8 +1214,10 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
         result["mode"] = "index"
         return result, (
             "cage index "
-            f"(auto_skin={auto_skin or 'unknown'}, links={solved['inner_link_count']}, inner={solved.get('inner_solver_mode')}, "
-            f"outer={solved.get('outer_solver_mode')}, avg={alignment['avg']:.6f}, max={alignment['max']:.6f})"
+            f"(auto_skin={auto_skin or 'unknown'}, links={solved['inner_link_count']}, "
+            f"inner={solved.get('inner_solver_mode')}, "
+            f"outer={solved.get('outer_solver_mode')}, avg={alignment['avg']:.6f}, "
+            f"max={alignment['max']:.6f}{fit_note})"
         )
 
     result["mode"] = "position"
@@ -1411,56 +1225,124 @@ def _build_wrap_solver_binding(binding, current_wrap_snapshot):
     if alignment:
         return result, (
             "cage position "
-            f"(auto_skin={auto_skin or 'unknown'}, links={solved['inner_link_count']}, inner={solved.get('inner_solver_mode')}, "
-            f"outer={solved.get('outer_solver_mode')}, avg={alignment['avg']:.6f}, max={alignment['max']:.6f})"
+            f"(auto_skin={auto_skin or 'unknown'}, links={solved['inner_link_count']}, "
+            f"inner={solved.get('inner_solver_mode')}, "
+            f"outer={solved.get('outer_solver_mode')}, avg={alignment['avg']:.6f}, "
+            f"max={alignment['max']:.6f}{fit_note})"
         )
     return result, (
         "cage position "
-        f"(auto_skin={auto_skin or 'unknown'}, links={solved['inner_link_count']}, inner={solved.get('inner_solver_mode')}, "
-        f"outer={solved.get('outer_solver_mode')})"
+        f"(auto_skin={auto_skin or 'unknown'}, links={solved['inner_link_count']}, "
+        f"inner={solved.get('inner_solver_mode')}, "
+        f"outer={solved.get('outer_solver_mode')}{fit_note})"
     )
 
 
-def _estimate_index_alignment(mesh_obj, filemesh_world_positions):
-    if not filemesh_world_positions:
-        return None
-
-    vertex_count = len(mesh_obj.data.vertices)
-    if vertex_count != len(filemesh_world_positions):
-        return None
-
-    if vertex_count <= 0:
-        return None
-
-    if vertex_count <= 5000:
-        sample_indices = range(vertex_count)
-    else:
-        sample_count = min(vertex_count, 512)
-        step = max((vertex_count - 1) / max(sample_count - 1, 1), 1.0)
-        sample_indices = {min(int(round(index * step)), vertex_count - 1) for index in range(sample_count)}
-
-    max_distance = 0.0
-    total_distance = 0.0
-    compared = 0
-    for vertex_index in sample_indices:
-        mesh_world_position = mesh_obj.matrix_world @ mesh_obj.data.vertices[vertex_index].co
-        distance = (mesh_world_position - filemesh_world_positions[vertex_index]).length
-        total_distance += distance
-        max_distance = max(max_distance, distance)
-        compared += 1
-
-    if compared <= 0:
-        return None
-
-    return {
-        "avg": total_distance / compared,
-        "max": max_distance,
-        "count": compared,
-    }
+# Index alignment / face counting live in skin_binding.py (imported above).
 
 
-def _mesh_face_count(mesh_obj):
-    return len(_build_mesh_object_faces(mesh_obj)) if mesh_obj is not None else 0
+def _slice_mesh_data_to_lod(mesh_data, lod_index):
+    """Slice a parsed FileMesh dict to a single LOD: its face range plus a
+    compacted vertex buffer containing only referenced vertices (faces are
+    remapped accordingly). Returns the input unchanged when there is no LOD
+    table or the index is out of range."""
+    if not isinstance(mesh_data, dict):
+        return mesh_data
+
+    lod_offsets = mesh_data.get("lod_offsets") or []
+    all_faces = mesh_data.get("faces") or []
+    if len(lod_offsets) <= 1 or not all_faces:
+        return mesh_data
+    if lod_index < 0 or lod_index >= len(lod_offsets):
+        return mesh_data
+
+    start = max(0, min(int(lod_offsets[lod_index]), len(all_faces)))
+    end = lod_offsets[lod_index + 1] if lod_index + 1 < len(lod_offsets) else len(all_faces)
+    end = max(start, min(int(end), len(all_faces)))
+
+    try:
+        import numpy as np  # bundled with Blender
+
+        if isinstance(all_faces, np.ndarray):
+            selected_faces = all_faces[start:end]
+            if selected_faces.size == 0:
+                return mesh_data
+            from .filemesh import _as_rows
+
+            used_vertex_indices = np.unique(selected_faces)
+            remap = np.empty(int(used_vertex_indices.max()) + 1, dtype=np.int64)
+            remap[used_vertex_indices] = np.arange(len(used_vertex_indices))
+            out = dict(mesh_data)
+            for key in (
+                "positions",
+                "normals",
+                "uvs",
+                "tangents",
+                "tangent_bytes",
+                "tangent_signs",
+                "tangent_sign_bytes",
+                "colors",
+                "color_bytes",
+            ):
+                values = mesh_data.get(key)
+                if isinstance(values, np.ndarray):
+                    out[key] = _as_rows(values[used_vertex_indices])
+                else:
+                    out[key] = values
+            vertex_weights = mesh_data.get("vertex_weights")
+            if isinstance(vertex_weights, list):
+                out["vertex_weights"] = [
+                    vertex_weights[index] if index < len(vertex_weights) else {}
+                    for index in used_vertex_indices
+                ]
+            else:
+                out["vertex_weights"] = vertex_weights
+            out["faces"] = _as_rows(remap[selected_faces])
+            return out
+    except ImportError:
+        pass
+
+    selected_faces = list(all_faces[start:end])
+    if not selected_faces:
+        return mesh_data
+
+    used_vertex_indices = sorted(
+        {
+            int(vertex_index)
+            for face in selected_faces
+            for vertex_index in face[:3]
+            if vertex_index is not None
+        }
+    )
+    if not used_vertex_indices:
+        out = dict(mesh_data)
+        out["faces"] = selected_faces
+        return out
+
+    remap = {source_index: remapped_index for remapped_index, source_index in enumerate(used_vertex_indices)}
+    remapped_faces = [
+        tuple(remap[int(vertex_index)] for vertex_index in face[:3])
+        for face in selected_faces
+    ]
+
+    def _select_vertex_array(values, default=None):
+        if not isinstance(values, list):
+            return values if values is not None else default
+        return [values[index] if 0 <= index < len(values) else default for index in used_vertex_indices]
+
+    selected_mesh_data = dict(mesh_data)
+    selected_mesh_data["positions"] = _select_vertex_array(mesh_data.get("positions"), default=None)
+    selected_mesh_data["normals"] = _select_vertex_array(mesh_data.get("normals"), default=None)
+    selected_mesh_data["uvs"] = _select_vertex_array(mesh_data.get("uvs"), default=None)
+    selected_mesh_data["tangents"] = _select_vertex_array(mesh_data.get("tangents"), default=None)
+    selected_mesh_data["tangent_bytes"] = _select_vertex_array(mesh_data.get("tangent_bytes"), default=None)
+    selected_mesh_data["tangent_signs"] = _select_vertex_array(mesh_data.get("tangent_signs"), default=None)
+    selected_mesh_data["tangent_sign_bytes"] = _select_vertex_array(mesh_data.get("tangent_sign_bytes"), default=None)
+    selected_mesh_data["colors"] = _select_vertex_array(mesh_data.get("colors"), default=None)
+    selected_mesh_data["color_bytes"] = _select_vertex_array(mesh_data.get("color_bytes"), default=None)
+    selected_mesh_data["vertex_weights"] = _select_vertex_array(mesh_data.get("vertex_weights"), default={})
+    selected_mesh_data["faces"] = remapped_faces
+    return selected_mesh_data
 
 
 def _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj):
@@ -1487,8 +1369,6 @@ def _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj):
         candidates.append(
             {
                 "index": index,
-                "start": start,
-                "end": end,
                 "face_count": face_count,
                 "high_quality": index < int(mesh_data.get("num_high_quality_lods") or 0),
             }
@@ -1506,47 +1386,9 @@ def _select_bind_mesh_data_for_target_mesh(mesh_data, mesh_obj):
         ),
     )
 
-    selected_faces = list(all_faces[best["start"] : best["end"]])
-    used_vertex_indices = sorted(
-        {
-            int(vertex_index)
-            for face in selected_faces
-            for vertex_index in face[:3]
-            if vertex_index is not None
-        }
-    )
-    if used_vertex_indices:
-        remap = {source_index: remapped_index for remapped_index, source_index in enumerate(used_vertex_indices)}
-        remapped_faces = [
-            tuple(remap[int(vertex_index)] for vertex_index in face[:3])
-            for face in selected_faces
-        ]
-
-        def _select_vertex_array(values, default=None):
-            if not isinstance(values, list):
-                return values if values is not None else default
-            return [values[index] if 0 <= index < len(values) else default for index in used_vertex_indices]
-
-        selected_mesh_data = dict(mesh_data)
-        selected_mesh_data["positions"] = _select_vertex_array(mesh_data.get("positions"), default=None)
-        selected_mesh_data["normals"] = _select_vertex_array(mesh_data.get("normals"), default=None)
-        selected_mesh_data["uvs"] = _select_vertex_array(mesh_data.get("uvs"), default=None)
-        selected_mesh_data["tangents"] = _select_vertex_array(mesh_data.get("tangents"), default=None)
-        selected_mesh_data["tangent_bytes"] = _select_vertex_array(mesh_data.get("tangent_bytes"), default=None)
-        selected_mesh_data["tangent_signs"] = _select_vertex_array(mesh_data.get("tangent_signs"), default=None)
-        selected_mesh_data["tangent_sign_bytes"] = _select_vertex_array(mesh_data.get("tangent_sign_bytes"), default=None)
-        selected_mesh_data["colors"] = _select_vertex_array(mesh_data.get("colors"), default=None)
-        selected_mesh_data["color_bytes"] = _select_vertex_array(mesh_data.get("color_bytes"), default=None)
-        selected_mesh_data["vertex_weights"] = _select_vertex_array(mesh_data.get("vertex_weights"), default={})
-        selected_mesh_data["faces"] = remapped_faces
-    else:
-        selected_mesh_data = dict(mesh_data)
-        selected_mesh_data["faces"] = selected_faces
-
+    selected_mesh_data = _slice_mesh_data_to_lod(mesh_data, best["index"])
     selected_mesh_data["lod_selection"] = {
         "index": best["index"],
-        "start": best["start"],
-        "end": best["end"],
         "face_count": best["face_count"],
         "target_face_count": target_face_count,
         "high_quality": best["high_quality"],
@@ -1603,7 +1445,8 @@ def _build_direct_skin_binding(binding, prefer_source_uv=False):
         return direct_binding, topology_index_message
 
     source_uv_binding, source_uv_message = _build_source_uv_binding(binding, target_faces=target_faces)
-    source_topology_binding, source_topology_message = _build_source_topology_binding(binding, target_faces=target_faces)
+    source_topology_binding, source_topology_message = _build_source_topology_binding(
+        binding, target_faces=target_faces)
     if wrap_layer_metadata and source_topology_binding:
         direct_binding.update(source_topology_binding)
         return direct_binding, source_topology_message
@@ -1694,11 +1537,14 @@ def _build_source_topology_binding(binding, target_faces=None):
     if not _has_meaningful_vertex_weights(vertex_weights):
         return None, None
 
+    from . import avatar_scale  # noqa: PLC0415
+    limb_scale = avatar_scale.entry_limb_scale(entry)
     source_vertices = _build_transformed_filemesh_vertices(
         mesh_data,
         part_cf=entry.get("part_cf"),
         part_size=entry.get("part_size"),
-        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
+        mesh_size=_get_effective_mesh_size(entry, mesh_data),
+        limb_scale=limb_scale,
     )
     source_faces = mesh_data.get("faces") or []
     target_vertices = _build_mesh_object_vertices(mesh_obj, world_space=True)
@@ -1751,8 +1597,10 @@ def _build_source_topology_binding(binding, target_faces=None):
             target_faces=target_faces,
         )
         if not links or len(links) < len(target_vertices):
+            link_count = len(links) if links else 0
             reject_notes.append(
-                f"p{precision}:links={len(links) if links else 0}/{len(target_vertices)},collapsed={len(collapsed_vertices)}"
+                f"p{precision}:links={link_count}/{len(target_vertices)},"
+                f"collapsed={len(collapsed_vertices)}"
             )
             continue
 
@@ -1779,32 +1627,55 @@ def _build_source_topology_binding(binding, target_faces=None):
             )
             continue
 
-        # For each collapsed vertex, resolve to the best individual original
-        # vertex (most similar normal to the collapsed average normal).  Using
-        # original per-vertex weights avoids the blending artifact where
-        # merging bone-boundary seam vertices gives incorrect LowerTorso/
-        # UpperTorso contamination.
+        # Resolve each collapsed vertex to the original vert whose authored bone
+        # weights best match the bucket's blended profile. Authored weights are
+        # authoritative — at a shoulder seam the arm verts are weighted to the
+        # arm and torso verts to the torso, so this is data-driven and side-
+        # independent, unlike normal-similarity or dedup-order guessing.
+        def _dominant_bone(weight_dict):
+            if not weight_dict:
+                return None
+            return max(weight_dict.items(), key=lambda item: item[1])[0]
+
+        def _weight_profile_distance(left, right):
+            keys = set(left) | set(right)
+            return sum(abs(float(left.get(k, 0.0)) - float(right.get(k, 0.0))) for k in keys)
+
         resolved_weights = []
         for collapsed_index, collapsed_vertex in enumerate(collapsed_vertices):
-            collapsed_normal = collapsed_vertex.get("normal")
             collapsed_pos = collapsed_vertex.get("position")
-            # gather original candidates at this collapsed position
             cand_key = _round_vector_key(collapsed_pos, precision=precision) if collapsed_pos else None
             cand_indices = position_to_original_indices.get((precision, cand_key), [])
             if not cand_indices:
                 cand_indices = [representative_original_indices[collapsed_index]]
-            best_orig = cand_indices[0]
-            if collapsed_normal is not None and len(cand_indices) > 1:
-                cn = Vector(collapsed_normal)
-                best_dot = -2.0
-                for orig_index in cand_indices:
-                    on = source_vertices[orig_index].get("normal")
-                    if on is None:
-                        continue
-                    dot = cn.dot(Vector(on))
-                    if dot > best_dot:
-                        best_dot = dot
-                        best_orig = orig_index
+
+            bucket_weights = collapsed_weights[collapsed_index] if collapsed_index < len(collapsed_weights) else {}
+            bucket_dominant = _dominant_bone(bucket_weights)
+            best_orig = None
+            if bucket_dominant is not None:
+                # Prefer candidates whose dominant bone matches the bucket's —
+                # this is what keeps an arm seam from resolving to a torso vert.
+                matching = [
+                    orig_index
+                    for orig_index in cand_indices
+                    if _dominant_bone(vertex_weights[orig_index] if orig_index < len(vertex_weights) else {}) == bucket_dominant
+                ]
+                if matching:
+                    best_orig = min(
+                        matching,
+                        key=lambda orig_index: _weight_profile_distance(
+                            bucket_weights,
+                            vertex_weights[orig_index] if orig_index < len(vertex_weights) else {},
+                        ),
+                    )
+            if best_orig is None:
+                best_orig = min(
+                    cand_indices,
+                    key=lambda orig_index: _weight_profile_distance(
+                        bucket_weights,
+                        vertex_weights[orig_index] if orig_index < len(vertex_weights) else {},
+                    ),
+                )
             orig_w = vertex_weights[best_orig] if best_orig < len(vertex_weights) else {}
             resolved_weights.append(_limit_weight_dict(orig_w) if orig_w else {})
 
@@ -1833,7 +1704,10 @@ def _build_source_topology_binding(binding, target_faces=None):
 
 def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
     rig_names = set(_iter_rig_node_names(meta_loaded.get("rig") or {}))
-    part_to_bone_map = _build_part_to_bone_map(meta_loaded.get("rig") or {})
+    # Prefer the authoritative meshToBone map built by rbxm.py (identity: part→bone
+    # when both use the same names). Fall back to the heuristic part→bone map for
+    # FBX-export rigs where part names differ from joint names.
+    part_to_bone_map = meta_loaded.get("meshToBone") or _build_part_to_bone_map(meta_loaded.get("rig") or {})
     bindings = {}
     wrap_target_snapshot = _build_wrap_target_snapshot(meta_loaded, parts_collection)
 
@@ -1847,13 +1721,12 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
         if mesh_class not in (None, "", "MeshPart"):
             continue
 
-        mesh_obj = _find_parts_object(parts_collection, entry.get("name"))
+        mesh_obj = _find_parts_object_for_entry(parts_collection, entry)
         if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
             continue
 
         wrap_layer_metadata = _get_wrap_layer_metadata(entry)
         wrap_target_metadata = _get_wrap_target_metadata(entry)
-        auto_skin = _normalize_wrap_auto_skin(wrap_layer_metadata.get("auto_skin")) if wrap_layer_metadata else None
 
         binding = {
             "object": mesh_obj,
@@ -1884,7 +1757,10 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
             if wrap_layer_metadata:
                 _log_lod_bind_selection(mesh_obj, mesh_data, binding_mesh_data)
             _log_binding_inspect(mesh_obj, binding, has_weights, bone_overlap)
-            if has_weights and bone_overlap:
+            # bone_overlap is advisory only: rbxm Bone instances are now part
+            # of the rig tree, so authored weights bind directly by name even
+            # when no Motor6D part shares the bone names.
+            if has_weights:
                 direct_binding, direct_mode_message = _build_direct_skin_binding(
                     binding,
                     prefer_source_uv=bool(wrap_layer_metadata),
@@ -1924,21 +1800,56 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
                         )
 
         if wrap_layer_metadata:
-            if auto_skin == "disabled" and direct_binding:
+            # Roblox refits EVERY wrap layer through its LinearRBF cage deformer
+            # (reference body cage -> this avatar's cage snapshot) before skinning,
+            # so solve it independently of the direct skin-bind result.  The
+            # direct bind is a Blender vertex/weight correspondence check; it
+            # can fail after a name or id change even when the FileMesh has the
+            # source positions and weights the cage solver needs.  Gating the
+            # cage solve on it made clothing remain in its authored shape.
+            wrap_solver_binding = None
+            wrap_solver_message = None
+            wrap_solver_binding, wrap_solver_message = _build_wrap_solver_binding(
+                binding, wrap_target_snapshot
+            )
+
+            if direct_binding:
+                # The mesh's authored weights (bound directly by bone name)
+                # are authoritative. AutoSkin=Disabled means Roblox itself
+                # uses the authored weights verbatim.
                 direct_mode = direct_binding.get("mode")
-                if direct_mode in ("uv-map", "vertex-map", "index"):
+                if direct_mode in ("uv-map", "vertex-map", "index", "position"):
                     binding.update(direct_binding)
                     if wrap_target_metadata:
                         binding["wrap_target"] = wrap_target_metadata
+                    cage_fit_note = None
+                    if wrap_solver_binding and wrap_solver_binding.get("predicted_mesh_positions"):
+                        fit_avg = wrap_solver_binding.get("fit_avg_distance")
+                        fit_max = wrap_solver_binding.get("fit_max_distance")
+                        delta_avg = wrap_solver_binding.get("cage_delta_avg")
+                        delta_max = wrap_solver_binding.get("cage_delta_max")
+                        # The cage solution is authoritative (true rbxm) — always
+                        # rebase. The old size/distance/consistency gates were an
+                        # OBJ-era heuristic and would leave wrap layers unfitted.
+                        binding["predicted_mesh_positions"] = wrap_solver_binding["predicted_mesh_positions"]
+                        binding["wrap_solver"] = wrap_solver_binding.get("wrap_solver")
+                        binding["wrap_auto_skin"] = wrap_solver_binding.get("wrap_auto_skin")
+                        binding["fit_avg_distance"] = fit_avg
+                        binding["fit_max_distance"] = fit_max
+                        binding["cage_delta_avg"] = delta_avg
+                        binding["cage_delta_max"] = delta_max
+                        cage_fit_note = (
+                            f"cage fit avg={fit_avg:.4f} max={fit_max:.4f} "
+                            f"(delta={delta_avg:.4f}/{delta_max:.4f})"
+                        )
+                    elif wrap_solver_message:
+                        cage_fit_note = f"cage solver skipped ({wrap_solver_message})"
                     label = direct_mode_message or direct_mode
-                    _log_binding_mode(mesh_obj, binding, f"{label}, auto_skin=disabled, prefer direct")
+                    if cage_fit_note:
+                        label = f"{label}, {cage_fit_note}"
+                    _log_binding_mode(mesh_obj, binding, f"{label}, wrap direct weights")
                     bindings[mesh_obj] = binding
                     continue
-
-            wrap_solver_binding = None
-            wrap_solver_message = None
-            if direct_binding:
-                wrap_solver_binding, wrap_solver_message = _build_wrap_solver_binding(binding, wrap_target_snapshot)
 
             if wrap_solver_binding:
                 binding.update(wrap_solver_binding)
@@ -1959,6 +1870,18 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
             continue
 
         if not direct_binding:
+            # Accessories that ship without per-vertex weights (classic
+            # texture meshes like ears/hats) cannot be skinned; bind them
+            # rigidly to the bone their part maps to instead of falling
+            # through to a CHILD_OF on the whole armature, which ignores
+            # bone motion entirely.
+            rigid_bone = part_to_bone_map.get(entry.get("name"))
+            if rigid_bone:
+                binding["mode"] = "rigid"
+                binding["rigid_bone"] = rigid_bone
+                _log_binding_mode(mesh_obj, binding, f"rigid follow ({rigid_bone})")
+                bindings[mesh_obj] = binding
+                continue
             print(
                 f"[RigCreate] Skipping skin bind for '{mesh_obj.name}': no usable direct skin binding; "
                 f"{_format_binding_context(binding)}"
@@ -2007,7 +1930,7 @@ def _build_filemesh_bone_world_matrix(binding, bone_record):
     )
     scale = _compute_mesh_scale(
         entry.get("part_size"),
-        entry.get("mesh_size") or entry.get("part_size"),
+        _get_effective_mesh_size(entry, binding.get("mesh_data") or {}),
     )
     local_matrix.translation = Vector(
         (
@@ -2120,1508 +2043,16 @@ def _collect_facs_payload_from_bindings(bindings):
     return merge_facs_payloads(payloads)
 
 
-def _limit_weight_dict(weights, max_influences=4):
-    filtered = [(bone_name, float(weight)) for bone_name, weight in weights.items() if weight > 0]
-    if not filtered:
-        return {}
-
-    filtered.sort(key=lambda item: item[1], reverse=True)
-    limited = filtered[:max_influences]
-    total = sum(weight for _, weight in limited)
-    if total <= 0:
-        return {}
-
-    return {bone_name: weight / total for bone_name, weight in limited}
-
-
-def _collect_vertex_group_weights(mesh_obj, available_bones):
-    group_names = {
-        group.index: group.name
-        for group in mesh_obj.vertex_groups
-        if group.name in available_bones
-    }
-    if not group_names:
-        return []
-
-    weights_per_vertex = []
-    for vertex in mesh_obj.data.vertices:
-        vertex_weights = {}
-        total = 0.0
-        for group_ref in vertex.groups:
-            bone_name = group_names.get(group_ref.group)
-            if not bone_name or group_ref.weight <= 0:
-                continue
-            vertex_weights[bone_name] = vertex_weights.get(bone_name, 0.0) + float(group_ref.weight)
-            total += float(group_ref.weight)
-
-        if total > 0:
-            weights_per_vertex.append({
-                bone_name: weight / total for bone_name, weight in vertex_weights.items()
-            })
-        else:
-            weights_per_vertex.append({})
-
-    return weights_per_vertex
-
-
-def _measure_transfer_coverage(mesh_obj, available_bones):
-    assigned_weights = _collect_vertex_group_weights(mesh_obj, available_bones)
-    assigned_vertices = sum(1 for weights in assigned_weights if weights)
-    total_vertices = len(mesh_obj.data.vertices)
-    coverage = assigned_vertices / max(total_vertices, 1)
-    return assigned_vertices, total_vertices, coverage
-
-
-def _ensure_vertex_groups(mesh_obj, bone_names):
-    groups = {}
-    existing = {group.name: group for group in mesh_obj.vertex_groups}
-    for bone_name in bone_names or []:
-        if not bone_name:
-            continue
-        group = existing.get(bone_name)
-        if group is None:
-            group = mesh_obj.vertex_groups.new(name=bone_name)
-            existing[bone_name] = group
-        groups[bone_name] = group
-    return groups
-
-
-def _run_weight_transfer_sequence(mesh_obj, source_obj, available_bones, initial_max_distance, label, preferred_mapping=None):
-    if preferred_mapping is None:
-        preferred_mapping = "POLYINTERP_NEAREST" if source_obj.data.polygons else "NEAREST"
-
-    mapping, max_distance = _apply_weight_data_transfer(
-        mesh_obj,
-        source_obj,
-        max_distance=initial_max_distance,
-        mapping=preferred_mapping,
-    )
-    assigned_vertices, total_vertices, coverage = _measure_transfer_coverage(mesh_obj, available_bones)
-
-    if coverage < 0.98 and max_distance is not None:
-        mapping, max_distance = _apply_weight_data_transfer(
-            mesh_obj,
-            source_obj,
-            max_distance=None,
-            mapping=preferred_mapping,
-        )
-        assigned_vertices, total_vertices, coverage = _measure_transfer_coverage(mesh_obj, available_bones)
-        print(
-            f"[RigCreate] {label} retried without distance limit for '{mesh_obj.name}' "
-            f"(assigned={assigned_vertices}/{total_vertices}, mapping={mapping})"
-        )
-
-    if preferred_mapping != "NEAREST" and assigned_vertices <= 0:
-        mapping, max_distance = _apply_weight_data_transfer(
-            mesh_obj,
-            source_obj,
-            max_distance=None,
-            mapping="NEAREST",
-        )
-        assigned_vertices, total_vertices, coverage = _measure_transfer_coverage(mesh_obj, available_bones)
-        print(
-            f"[RigCreate] {label} retried with nearest-vertex mapping for '{mesh_obj.name}' "
-            f"(assigned={assigned_vertices}/{total_vertices})"
-        )
-
-    return assigned_vertices, total_vertices, coverage, mapping, max_distance
-
-
-def _determine_binding_fallback_bone(binding, available_bones):
-    part_to_bone = binding.get("part_to_bone_map") or {}
-    entry = binding.get("entry") or {}
-
-    entry_name = entry.get("name")
-    resolved_entry_name = part_to_bone.get(entry_name, entry_name)
-    if resolved_entry_name in available_bones:
-        return resolved_entry_name
-
-    resolved_weight_totals = {}
-    for weights in binding.get("mesh_data", {}).get("vertex_weights") or []:
-        for bone_name, weight in (weights or {}).items():
-            resolved = part_to_bone.get(bone_name, bone_name)
-            if resolved in available_bones and weight > 0:
-                resolved_weight_totals[resolved] = resolved_weight_totals.get(resolved, 0.0) + float(weight)
-
-    if resolved_weight_totals:
-        return max(resolved_weight_totals.items(), key=lambda item: item[1])[0]
-
-    return None
-
-
-def _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone=None):
-    resolved = part_to_bone.get(bone_name, bone_name)
-    if resolved in available_bones:
-        return resolved
-    if fallback_bone in available_bones:
-        return fallback_bone
-    return None
-
-
-def _get_position_transfer_vertices(binding):
-    predicted_mesh_positions = binding.get("predicted_mesh_positions") or []
-    if predicted_mesh_positions:
-        return [position.copy() for position in predicted_mesh_positions]
-
-    entry = binding["entry"]
-    vertices = _build_transformed_filemesh_vertices(
-        binding["mesh_data"],
-        part_cf=entry.get("part_cf"),
-        part_size=entry.get("part_size"),
-        mesh_size=entry.get("mesh_size") or entry.get("part_size"),
-    )
-    return [vertex["position"].copy() for vertex in vertices]
-
-
-def _build_transfer_source_object(mesh_obj, armature_obj, binding):
-    part_to_bone = binding.get("part_to_bone_map") or {}
-    available_bones = {bone.name for bone in armature_obj.data.bones}
-    fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
-    vertex_weights = binding.get("binding_vertex_weights") or binding["mesh_data"].get("vertex_weights") or []
-    vertices_world = _get_position_transfer_vertices(binding)
-    if not vertices_world or len(vertices_world) != len(vertex_weights):
-        return None
-
-    faces = []
-    for face in binding["mesh_data"].get("faces") or []:
-        if face is None or len(face) < 3:
-            continue
-        try:
-            indices = (int(face[0]), int(face[1]), int(face[2]))
-        except Exception:
-            continue
-        if min(indices) < 0 or max(indices) >= len(vertices_world):
-            continue
-        faces.append(indices)
-
-    local_matrix = mesh_obj.matrix_world.inverted_safe()
-    local_vertices = [tuple((local_matrix @ position)) for position in vertices_world]
-
-    source_mesh = bpy.data.meshes.new(get_unique_name(f"__rbxskin_mesh_{mesh_obj.name}"))
-    source_mesh.from_pydata(local_vertices, [], faces)
-    source_mesh.update()
-
-    source_obj = bpy.data.objects.new(get_unique_name(f"__rbxskin_{mesh_obj.name}"), source_mesh)
-    source_obj.matrix_world = mesh_obj.matrix_world.copy()
-
-    target_collection = mesh_obj.users_collection[0] if mesh_obj.users_collection else bpy.context.scene.collection
-    target_collection.objects.link(source_obj)
-    source_obj.hide_viewport = True
-    source_obj.hide_render = True
-
-    groups = {}
-    for weights in vertex_weights:
-        for bone_name in (weights or {}).keys():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
-            if resolved and resolved not in groups:
-                groups[resolved] = source_obj.vertex_groups.new(name=resolved)
-
-    if not groups:
-        _remove_object_and_data(source_obj)
-        return None
-
-    matched = 0
-    for vertex_index, weights in enumerate(vertex_weights):
-        for bone_name, weight in (weights or {}).items():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
-            group = groups.get(resolved)
-            if group and weight > 0:
-                group.add([vertex_index], float(weight), "REPLACE")
-                matched += 1
-
-    if matched <= 0:
-        _remove_object_and_data(source_obj)
-        return None
-
-    return source_obj
-
-
-def _apply_weight_data_transfer(mesh_obj, source_obj, max_distance=None, mapping=None):
-    mapping = mapping or ("POLYINTERP_NEAREST" if source_obj.data.polygons else "NEAREST")
-
-    modifier = mesh_obj.modifiers.new(name="RBXWeightTransfer", type="DATA_TRANSFER")
-    modifier.object = source_obj
-    modifier.use_vert_data = True
-    modifier.data_types_verts = {"VGROUP_WEIGHTS"}
-    modifier.vert_mapping = mapping
-    modifier.layers_vgroup_select_src = "ALL"
-    modifier.layers_vgroup_select_dst = "NAME"
-    modifier.mix_mode = "REPLACE"
-    modifier.mix_factor = 1.0
-    modifier.use_max_distance = max_distance is not None
-    if max_distance is not None:
-        modifier.max_distance = max_distance
-
-    try:
-        if hasattr(bpy.context, "temp_override"):
-            with bpy.context.temp_override(
-                active_object=mesh_obj,
-                object=mesh_obj,
-                selected_objects=[mesh_obj],
-                selected_editable_objects=[mesh_obj],
-            ):
-                bpy.ops.object.modifier_apply(modifier=modifier.name)
-        else:
-            bpy.context.view_layer.objects.active = mesh_obj
-            mesh_obj.select_set(True)
-            bpy.ops.object.modifier_apply(modifier=modifier.name)
-    except Exception:
-        try:
-            mesh_obj.modifiers.remove(modifier)
-        except Exception:
-            pass
-        raise
-
-    return mapping, max_distance
-
-
-def _apply_inherited_weight_transfer(mesh_obj, armature_obj, source_meshes):
-    available_bones = {bone.name for bone in armature_obj.data.bones}
-    if not available_bones:
-        return False
-
-    target_center = _get_mesh_world_center(mesh_obj)
-    candidates = []
-    for source_mesh in source_meshes:
-        if source_mesh == mesh_obj or source_mesh.type != "MESH" or source_mesh.data is None:
-            continue
-        bone_names = [group.name for group in source_mesh.vertex_groups if group.name in available_bones]
-        if not bone_names:
-            continue
-        distance = (_get_mesh_world_center(source_mesh) - target_center).length
-        candidates.append((distance, source_mesh, bone_names))
-
-    if not candidates:
-        return False
-
-    candidates.sort(key=lambda item: item[0])
-    max_dimension = max(max(mesh_obj.dimensions), 1.0)
-    initial_max_distance = max_dimension * 0.05
-
-    for distance, source_mesh, bone_names in candidates[:3]:
-        _remove_all_vertex_groups(mesh_obj)
-        _ensure_vertex_groups(mesh_obj, bone_names)
-        try:
-            assigned_vertices, total_vertices, coverage, mapping, max_distance = _run_weight_transfer_sequence(
-                mesh_obj,
-                source_mesh,
-                available_bones,
-                initial_max_distance,
-                label="Inherited weight transfer",
-            )
-        except Exception as exc:
-            _remove_all_vertex_groups(mesh_obj)
-            print(
-                f"[RigCreate] Inherited weight transfer failed for '{mesh_obj.name}' from '{source_mesh.name}': {exc}"
-            )
-            continue
-
-        if assigned_vertices <= 0:
-            continue
-
-        print(
-            f"[RigCreate] Inherited weights used for '{mesh_obj.name}' from '{source_mesh.name}' "
-            f"(assigned={assigned_vertices}/{total_vertices}, coverage={coverage:.3f}, mapping={mapping}, "
-            f"max_distance={'none' if max_distance is None else f'{max_distance:.6f}'}, distance={distance:.6f})"
-        )
-        _clear_child_of_constraints(mesh_obj)
-        _ensure_armature_modifier(mesh_obj, armature_obj)
-        return True
-
-    _remove_all_vertex_groups(mesh_obj)
-    return False
-
-
-def _build_vertex_component_ids(vertex_count, faces):
-    if vertex_count <= 0:
-        return [], 0
-
-    parents = list(range(vertex_count))
-
-    def find(index):
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def union(left, right):
-        left_root = find(left)
-        right_root = find(right)
-        if left_root != right_root:
-            parents[right_root] = left_root
-
-    for face in faces or []:
-        if face is None or len(face) < 2:
-            continue
-        try:
-            indices = [int(index) for index in face if 0 <= int(index) < vertex_count]
-        except Exception:
-            continue
-        if len(indices) < 2:
-            continue
-        anchor = indices[0]
-        for vertex_index in indices[1:]:
-            union(anchor, vertex_index)
-
-    component_by_root = {}
-    component_ids = []
-    for vertex_index in range(vertex_count):
-        root = find(vertex_index)
-        component_id = component_by_root.get(root)
-        if component_id is None:
-            component_id = len(component_by_root)
-            component_by_root[root] = component_id
-        component_ids.append(component_id)
-
-    return component_ids, len(component_by_root)
-
-
-def _build_component_centers(component_ids, positions):
-    sums = {}
-    for vertex_index, component_id in enumerate(component_ids or []):
-        if vertex_index >= len(positions):
-            continue
-        position = positions[vertex_index]
-        if position is None:
-            continue
-        vec = position if isinstance(position, Vector) else Vector(position)
-        current = sums.setdefault(component_id, [0.0, 0.0, 0.0, 0])
-        current[0] += float(vec.x)
-        current[1] += float(vec.y)
-        current[2] += float(vec.z)
-        current[3] += 1
-
-    centers = {}
-    for component_id, values in sums.items():
-        count = max(int(values[3]), 1)
-        centers[component_id] = Vector((values[0] / count, values[1] / count, values[2] / count))
-    return centers
-
-
-def _map_target_components_to_source_components(target_centers, source_centers):
-    mapping = {}
-    if not target_centers or not source_centers:
-        return mapping
-
-    pair_budget = 250_000
-    if len(target_centers) * len(source_centers) <= pair_budget:
-        pairs = []
-        for target_component, target_center in target_centers.items():
-            for source_component, source_center in source_centers.items():
-                pairs.append(((target_center - source_center).length_squared, target_component, source_component))
-
-        used_targets = set()
-        used_sources = set()
-        for _distance, target_component, source_component in sorted(pairs, key=lambda item: item[0]):
-            if target_component in used_targets or source_component in used_sources:
-                continue
-            mapping[target_component] = source_component
-            used_targets.add(target_component)
-            used_sources.add(source_component)
-            if len(used_targets) == len(target_centers) or len(used_sources) == len(source_centers):
-                break
-
-    for target_component, target_center in target_centers.items():
-        if target_component in mapping:
-            continue
-        best_source_component = None
-        best_distance = None
-        for source_component, source_center in source_centers.items():
-            distance = (target_center - source_center).length_squared
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_source_component = source_component
-        if best_source_component is not None:
-            mapping[target_component] = best_source_component
-
-    return mapping
-
-
-def _closest_point_on_triangle(point, first, second, third):
-    edge_ab = second - first
-    edge_ac = third - first
-    point_a = point - first
-    d1 = edge_ab.dot(point_a)
-    d2 = edge_ac.dot(point_a)
-    if d1 <= 0.0 and d2 <= 0.0:
-        return first, (1.0, 0.0, 0.0)
-
-    point_b = point - second
-    d3 = edge_ab.dot(point_b)
-    d4 = edge_ac.dot(point_b)
-    if d3 >= 0.0 and d4 <= d3:
-        return second, (0.0, 1.0, 0.0)
-
-    vc = d1 * d4 - d3 * d2
-    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-        blend = d1 / max(d1 - d3, 1e-12)
-        return first + edge_ab * blend, (1.0 - blend, blend, 0.0)
-
-    point_c = point - third
-    d5 = edge_ab.dot(point_c)
-    d6 = edge_ac.dot(point_c)
-    if d6 >= 0.0 and d5 <= d6:
-        return third, (0.0, 0.0, 1.0)
-
-    vb = d5 * d2 - d1 * d6
-    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-        blend = d2 / max(d2 - d6, 1e-12)
-        return first + edge_ac * blend, (1.0 - blend, 0.0, blend)
-
-    va = d3 * d6 - d5 * d4
-    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
-        blend = (d4 - d3) / max((d4 - d3) + (d5 - d6), 1e-12)
-        return second + (third - second) * blend, (0.0, 1.0 - blend, blend)
-
-    denom = max(va + vb + vc, 1e-12)
-    v_weight = vb / denom
-    w_weight = vc / denom
-    u_weight = 1.0 - v_weight - w_weight
-    return first + edge_ab * v_weight + edge_ac * w_weight, (u_weight, v_weight, w_weight)
-
-
-def _blend_weight_dicts(weighted_sources):
-    blended = {}
-    total_factor = 0.0
-    for weights, factor in weighted_sources or []:
-        if not weights or factor <= 0.0:
-            continue
-        for bone_name, weight in weights.items():
-            if weight > 0:
-                blended[bone_name] = blended.get(bone_name, 0.0) + (float(weight) * float(factor))
-        total_factor += float(factor)
-
-    if total_factor <= 0.0 or not blended:
-        return None
-    return _limit_weight_dict({bone_name: weight / total_factor for bone_name, weight in blended.items()})
-
-
-def _apply_position_bound_weights(mesh_obj, armature_obj, binding):
-    """Assign bone weights from filemesh vertex data via UV-first, position-fallback matching.
-
-    The old Blender data-transfer approach (POLYINTERP_NEAREST / NEAREST) fails on
-    garments with two close-together geometry regions (e.g. shorts inner thigh) because:
-    - POLYINTERP_NEAREST barycentric-interpolates across polygon faces, blending
-      bone assignments across zone boundaries.
-    - NEAREST still relies on cage-predicted positions (avg ~10 cm off), which can
-      place inner-thigh verts from opposite legs closer to each other than to their
-      own side, causing topology inversion.
-
-    This implementation uses UV coordinates as the primary matching key (which are
-    topology-stable and cleanly divide e.g. left vs right leg), with cage-predicted
-    world-position as a tie-breaker when multiple filemesh verts share a UV, and a
-    pure nearest-position fallback for any target verts whose UV has no filemesh match.
-    """
-    part_to_bone = binding.get("part_to_bone_map") or {}
-    available_bones = {bone.name for bone in armature_obj.data.bones}
-    fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
-
-    mesh_data = binding["mesh_data"]
-    vertex_weights = binding.get("binding_vertex_weights") or mesh_data.get("vertex_weights") or []
-    if not vertex_weights:
-        return False
-
-    # Build resolved bone groups
-    bone_names = mesh_data.get("bone_names") or []
-    groups = {}
-    for bone_name in bone_names:
-        resolved = _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone)
-        if resolved and resolved not in groups:
-            groups[resolved] = mesh_obj.vertex_groups.new(name=resolved)
-    if not groups:
-        return False
-
-    # Source positions in world space (cage-predicted or raw filemesh)
-    source_positions_world = _get_position_transfer_vertices(binding)
-    if not source_positions_world or len(source_positions_world) != len(vertex_weights):
-        _remove_all_vertex_groups(mesh_obj)
-        print(f"[RigCreate] Position bind could not build source positions for '{mesh_obj.name}'")
-        return False
-
-    # Build filemesh UV bucket: (round(u,4), 1-round(v,4)) → [source_indices]
-    # Note: match both raw and V-flipped filemesh UVs against Blender UVs (Blender
-    # stores V from bottom, Roblox stores V from top; the OBJ exporter may or may not flip).
-    filemesh_uvs = mesh_data.get("uvs") or []
-    uv_bucket_raw = {}
-    uv_bucket_flip = {}
-    for src_idx, uv in enumerate(filemesh_uvs):
-        if uv is None:
-            continue
-        u = round(float(uv[0]), 4)
-        v = round(float(uv[1]), 4)
-        uv_bucket_raw.setdefault((u, v), []).append(src_idx)
-        uv_bucket_flip.setdefault((u, round(1.0 - float(uv[1]), 4)), []).append(src_idx)
-
-    # Also build precision-3 fallback buckets for float rounding differences between
-    # OBJ export and the binary filemesh (a p4 miss can match at p3).
-    uv_bucket_raw3 = {}
-    uv_bucket_flip3 = {}
-    for src_idx, uv in enumerate(filemesh_uvs):
-        if uv is None:
-            continue
-        u3 = round(float(uv[0]), 3)
-        v3 = round(float(uv[1]), 3)
-        uv_bucket_raw3.setdefault((u3, v3), []).append(src_idx)
-        uv_bucket_flip3.setdefault((u3, round(1.0 - float(uv[1]), 3)), []).append(src_idx)
-
-    # Target Blender vertex UVs — collect ALL loop UVs per vertex so seam vertices
-    # (which have multiple loops with different UV coordinates) don't miss their match.
-    target_all_uvs = _compute_mesh_vertex_all_uvs(mesh_obj)
-
-    # Pick the UV bucket (raw or v-flipped) that gives more matches
-    uv_match_raw = 0
-    uv_match_flip = 0
-    for uvs in target_all_uvs.values():
-        for tgt_uv in uvs:
-            u = round(float(tgt_uv[0]), 4)
-            v = round(float(tgt_uv[1]), 4)
-            if (u, v) in uv_bucket_raw:
-                uv_match_raw += 1
-                break
-        for tgt_uv in uvs:
-            u = round(float(tgt_uv[0]), 4)
-            v = round(float(tgt_uv[1]), 4)
-            if (u, v) in uv_bucket_flip:
-                uv_match_flip += 1
-                break
-    uv_bucket = uv_bucket_flip if uv_match_flip > uv_match_raw else uv_bucket_raw
-    uv_bucket3 = uv_bucket_flip3 if uv_match_flip > uv_match_raw else uv_bucket_raw3
-    uv_method = "flip" if uv_match_flip > uv_match_raw else "raw"
-    uv_matched_count = max(uv_match_raw, uv_match_flip)
-
-    # Pre-compute target world positions and normals.
-    # Normals are the key discriminator for symmetric garments: left/right legs
-    # share identical UV coordinates but face opposite directions.  Position
-    # alone is unreliable (cage avg error ~10 cm can exceed the inter-leg gap),
-    # but normal direction is barely affected by cage translation error.
-    matrix_world = mesh_obj.matrix_world
-    normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
-    target_world_positions = [matrix_world @ v.co for v in mesh_obj.data.vertices]
-    target_world_normals = [
-        (normal_matrix @ v.normal).normalized()
-        for v in mesh_obj.data.vertices
-    ]
-
-    source_component_ids, source_component_count = _build_vertex_component_ids(
-        len(vertex_weights),
-        mesh_data.get("faces") or [],
-    )
-    target_faces = _build_mesh_object_faces(mesh_obj)
-    target_component_ids, target_component_count = _build_vertex_component_ids(
-        len(mesh_obj.data.vertices),
-        target_faces,
-    )
-    source_component_centers = _build_component_centers(source_component_ids, source_positions_world)
-    target_component_centers = _build_component_centers(target_component_ids, target_world_positions)
-    target_to_source_component = _map_target_components_to_source_components(
-        target_component_centers,
-        source_component_centers,
-    )
-    use_component_filter = source_component_count > 1 and target_component_count > 1 and bool(target_to_source_component)
-    source_indices_by_component = {}
-    for source_index, component_id in enumerate(source_component_ids):
-        source_indices_by_component.setdefault(component_id, []).append(source_index)
-    source_face_records_by_component = {}
-    for face in mesh_data.get("faces") or []:
-        if face is None or len(face) < 3:
-            continue
-        try:
-            face_indices = tuple(int(index) for index in face[:3])
-        except Exception:
-            continue
-        if min(face_indices) < 0 or max(face_indices) >= len(source_positions_world):
-            continue
-        face_components = {
-            source_component_ids[index]
-            for index in face_indices
-            if 0 <= index < len(source_component_ids)
-        }
-        if len(face_components) != 1:
-            continue
-        face_positions = tuple(source_positions_world[index] for index in face_indices)
-        face_normal = _normalize_vector((face_positions[1] - face_positions[0]).cross(face_positions[2] - face_positions[0]))
-        component_id = next(iter(face_components))
-        source_face_records_by_component.setdefault(component_id, []).append(
-            {
-                "indices": face_indices,
-                "positions": face_positions,
-                "normal": face_normal,
-            }
-        )
-    source_face_records = [
-        face_record
-        for component_records in source_face_records_by_component.values()
-        for face_record in component_records
-    ]
-
-    # Filemesh source normals transformed into Blender world space for tie-breaking.
-    # Raw filemesh normals are in Roblox space (Y-up); applying t2b + part_cf rotation
-    # gives the correct Blender-space direction so the dot product with target_world_normals
-    # is meaningful.  This is esp. important for front/back disambiguation where Y and Z
-    # are swapped between the two coordinate systems.
-    entry = binding.get("entry") or {}
-    _t2b = get_transform_to_blender()
-    _source_normal_matrix = _t2b.to_3x3()
-    _part_cf = entry.get("part_cf")
-    if _part_cf is not None:
-        try:
-            _source_normal_matrix = (_t2b @ cf_to_mat(_part_cf)).to_3x3()
-        except Exception:
-            pass
-
-    filemesh_normals_raw = mesh_data.get("normals") or []
-    source_normals_world = []
-    for src_idx in range(len(vertex_weights)):
-        n = filemesh_normals_raw[src_idx] if src_idx < len(filemesh_normals_raw) else None
-        if n is not None:
-            wn = _normalize_vector(_source_normal_matrix @ Vector(n))
-            source_normals_world.append((float(wn.x), float(wn.y), float(wn.z)) if wn else None)
-        else:
-            source_normals_world.append(None)
-
-    def _preferred_source_component(target_index):
-        if not use_component_filter or target_index >= len(target_component_ids):
-            return None
-        return target_to_source_component.get(target_component_ids[target_index])
-
-    def _filter_candidates_to_component(candidates, preferred_component):
-        if preferred_component is None:
-            return candidates, False
-        filtered = [
-            candidate
-            for candidate in candidates
-            if 0 <= candidate < len(source_component_ids) and source_component_ids[candidate] == preferred_component
-        ]
-        return (filtered, True) if filtered else (candidates, False)
-
-    def _uv_tie_break_score(src_idx, tgt_world, tgt_normal, position_primary=False):
-        """Lower = better. Components prevent side swaps; normals help only inside an island."""
-        sp = source_positions_world[src_idx]
-        dx = sp.x - tgt_world.x
-        dy = sp.y - tgt_world.y
-        dz = sp.z - tgt_world.z
-        dist2 = dx * dx + dy * dy + dz * dz
-
-        sn = source_normals_world[src_idx] if src_idx < len(source_normals_world) else None
-        if sn is not None and tgt_normal is not None:
-            # dot product: 1.0 = same direction, -1.0 = opposite.
-            # Negate so lower score = better agreement
-            dot = tgt_normal.x * sn[0] + tgt_normal.y * sn[1] + tgt_normal.z * sn[2]
-            normal_cost = 1.0 - max(-1.0, min(1.0, dot))  # 0..2
-        else:
-            normal_cost = 1.0  # neutral when data missing
-
-        if position_primary:
-            return (dist2, normal_cost)
-        return (normal_cost, dist2)
-
-    matched = 0
-    uv_assigned = 0
-    pos_assigned = 0
-    # vertex_index → source index/weights for already-assigned local matches
-    assigned_source = {}
-    assigned_weights = {}
-    component_filtered_uv = 0
-    component_nearest_assigned = 0
-    neighbor_assigned = 0
-    blended_nearest_assigned = 0
-    face_project_assigned = 0
-
-    def _candidate_distance_normal_score(src_idx, tgt_world, tgt_normal):
-        sp = source_positions_world[src_idx]
-        dx = sp.x - tgt_world.x
-        dy = sp.y - tgt_world.y
-        dz = sp.z - tgt_world.z
-        dist2 = dx * dx + dy * dy + dz * dz
-
-        sn = source_normals_world[src_idx] if src_idx < len(source_normals_world) else None
-        if sn is not None and tgt_normal is not None:
-            dot = tgt_normal.x * sn[0] + tgt_normal.y * sn[1] + tgt_normal.z * sn[2]
-            normal_cost = 1.0 - max(-1.0, min(1.0, dot))
-        else:
-            normal_cost = 1.0
-
-        return dist2, normal_cost
-
-    def _blend_nearest_candidate_weights(candidate_indices, tgt_world, tgt_normal, max_samples=4):
-        best_entries = []
-        for candidate in candidate_indices or []:
-            if candidate < 0 or candidate >= len(vertex_weights):
-                continue
-            candidate_weights = vertex_weights[candidate] or {}
-            if not candidate_weights:
-                continue
-            dist2, normal_cost = _candidate_distance_normal_score(candidate, tgt_world, tgt_normal)
-            entry = (dist2, normal_cost, candidate)
-            best_entries.append(entry)
-            best_entries.sort(key=lambda item: (item[0], item[1]))
-            if len(best_entries) > max_samples:
-                best_entries.pop()
-
-        if not best_entries:
-            return None, None, False
-
-        best_entries.sort(key=lambda item: (item[0], item[1]))
-        representative = best_entries[0][2]
-        if len(best_entries) == 1 or best_entries[0][0] <= 1e-12:
-            return _limit_weight_dict(vertex_weights[representative] or {}), representative, False
-
-        blended = {}
-        total_factor = 0.0
-        for dist2, normal_cost, candidate in best_entries:
-            distance = max(dist2 ** 0.5, 1e-6)
-            normal_factor = 1.0 / max(0.25 + normal_cost, 0.25)
-            factor = (1.0 / distance) * normal_factor
-            if factor <= 0.0:
-                continue
-            for bone_name, weight in (vertex_weights[candidate] or {}).items():
-                if weight > 0:
-                    blended[bone_name] = blended.get(bone_name, 0.0) + (float(weight) * factor)
-            total_factor += factor
-
-        if total_factor <= 0.0 or not blended:
-            return _limit_weight_dict(vertex_weights[representative] or {}), representative, False
-
-        return _limit_weight_dict({bone_name: weight / total_factor for bone_name, weight in blended.items()}), representative, True
-
-    def _blend_face_projected_weights(face_records, tgt_world, tgt_normal):
-        best_record = None
-        best_score = None
-        best_barycentric = None
-        for face_record in face_records or []:
-            face_positions = face_record["positions"]
-            closest_point, barycentric = _closest_point_on_triangle(
-                tgt_world,
-                face_positions[0],
-                face_positions[1],
-                face_positions[2],
-            )
-            distance_squared = (closest_point - tgt_world).length_squared
-            face_normal = face_record.get("normal")
-            if face_normal is not None and tgt_normal is not None:
-                dot = tgt_normal.dot(face_normal)
-                normal_cost = 1.0 - max(-1.0, min(1.0, dot))
-            else:
-                normal_cost = 1.0
-            score = (distance_squared, normal_cost)
-            if best_score is None or score < best_score:
-                best_score = score
-                best_record = face_record
-                best_barycentric = barycentric
-
-        if best_record is None or best_barycentric is None:
-            return None, None
-
-        weighted_sources = []
-        representative = None
-        representative_factor = -1.0
-        for source_index, factor in zip(best_record["indices"], best_barycentric):
-            if factor <= 0.0:
-                continue
-            if factor > representative_factor:
-                representative = source_index
-                representative_factor = factor
-            weighted_sources.append((vertex_weights[source_index] or {}, factor))
-
-        blended = _blend_weight_dicts(weighted_sources)
-        if blended is None:
-            return None, None
-        return blended, representative
-
-    for blender_vertex in mesh_obj.data.vertices:
-        tgt_idx = blender_vertex.index
-        tgt_world = target_world_positions[tgt_idx]
-        tgt_normal = target_world_normals[tgt_idx] if tgt_idx < len(target_world_normals) else None
-        target_component = target_component_ids[tgt_idx] if tgt_idx < len(target_component_ids) else None
-        preferred_source_component = _preferred_source_component(tgt_idx)
-        best_src = None
-        best_weights = None
-
-        # 1. UV match — try all loop UVs for this vertex, tie-break with normal then position
-        tgt_uvs_list = target_all_uvs.get(tgt_idx) or []
-        for tgt_uv in tgt_uvs_list:
-            u = round(float(tgt_uv[0]), 4)
-            v = round(float(tgt_uv[1]), 4)
-            candidates = uv_bucket.get((u, v))
-            if not candidates:
-                # Precision-3 fallback for float rounding mismatches
-                u3 = round(float(tgt_uv[0]), 3)
-                v3 = round(float(tgt_uv[1]), 3)
-                candidates = uv_bucket3.get((u3, v3))
-            if candidates:
-                candidates, component_filtered = _filter_candidates_to_component(candidates, preferred_source_component)
-                if component_filtered:
-                    component_filtered_uv += 1
-                if len(candidates) == 1:
-                    best_src = candidates[0]
-                else:
-                    best_score = None
-                    for c in candidates:
-                        score = _uv_tie_break_score(c, tgt_world, tgt_normal, position_primary=component_filtered)
-                        if best_score is None or score < best_score:
-                            best_score = score
-                            best_src = c
-                uv_assigned += 1
-                assigned_source[tgt_idx] = best_src
-                best_weights = vertex_weights[best_src] or {}
-                assigned_weights[tgt_idx] = best_weights
-                break  # stop once any loop UV matched
-
-        # If the UV exists elsewhere but not on the mapped component, stay on the
-        # mapped island and use nearest local position. Mirrored accessories often
-        # reuse UVs across wrists/ankles; accepting a global UV candidate here swaps sides.
-        if best_src is not None and preferred_source_component is not None:
-            if 0 <= best_src < len(source_component_ids) and source_component_ids[best_src] != preferred_source_component:
-                assigned_source.pop(tgt_idx, None)
-                assigned_weights.pop(tgt_idx, None)
-                uv_assigned = max(0, uv_assigned - 1)
-                best_src = None
-                best_weights = None
-
-        if best_src is None and preferred_source_component is not None:
-            component_faces = source_face_records_by_component.get(preferred_source_component) or []
-            if component_faces:
-                best_weights, best_src = _blend_face_projected_weights(
-                    component_faces,
-                    tgt_world,
-                    tgt_normal,
-                )
-                if best_src is not None:
-                    component_nearest_assigned += 1
-                    face_project_assigned += 1
-                    assigned_source[tgt_idx] = best_src
-                    assigned_weights[tgt_idx] = best_weights
-
-            if best_src is None:
-                component_candidates = source_indices_by_component.get(preferred_source_component) or []
-                if component_candidates:
-                    best_weights, best_src, blended = _blend_nearest_candidate_weights(
-                        component_candidates,
-                        tgt_world,
-                        tgt_normal,
-                    )
-                if best_src is not None:
-                    component_nearest_assigned += 1
-                    if blended:
-                        blended_nearest_assigned += 1
-                    assigned_source[tgt_idx] = best_src
-                    assigned_weights[tgt_idx] = best_weights
-
-        # 2. Fallback: propagate from nearest already-UV-matched Blender neighbour
-        #    (avoids using cage-predicted positions directly for seam/border verts).
-        if best_src is None:
-            best_dist2 = float("inf")
-            for matched_tgt, matched_src in assigned_source.items():
-                if use_component_filter and matched_tgt < len(target_component_ids) and target_component_ids[matched_tgt] != target_component:
-                    continue
-                mp = target_world_positions[matched_tgt]
-                dx = mp.x - tgt_world.x
-                dy = mp.y - tgt_world.y
-                dz = mp.z - tgt_world.z
-                d2 = dx * dx + dy * dy + dz * dz
-                if d2 < best_dist2:
-                    best_dist2 = d2
-                    best_src = matched_src
-                    best_weights = assigned_weights.get(matched_tgt)
-            if best_src is not None:
-                neighbor_assigned += 1
-
-        # 3. Last resort: nearest cage-predicted filemesh position
-        if best_src is None:
-            fallback_source_indices = source_indices_by_component.get(preferred_source_component) if preferred_source_component is not None else None
-            if not fallback_source_indices:
-                fallback_source_indices = range(len(source_positions_world))
-            fallback_faces = (
-                source_face_records_by_component.get(preferred_source_component)
-                if preferred_source_component is not None
-                else source_face_records
-            )
-            if fallback_faces:
-                best_weights, best_src = _blend_face_projected_weights(
-                    fallback_faces,
-                    tgt_world,
-                    tgt_normal,
-                )
-                if best_src is not None:
-                    face_project_assigned += 1
-            if best_src is None:
-                best_weights, best_src, blended = _blend_nearest_candidate_weights(
-                    fallback_source_indices,
-                    tgt_world,
-                    tgt_normal,
-                )
-                if blended:
-                    blended_nearest_assigned += 1
-            pos_assigned += 1
-
-        if best_src is None:
-            continue
-
-        weights_src = best_weights if best_weights is not None else (vertex_weights[best_src] or {})
-        for bone_name, weight in weights_src.items():
-            resolved = _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone)
-            group = groups.get(resolved)
-            if group and weight > 0:
-                group.add([tgt_idx], float(weight), "REPLACE")
-                matched += 1
-
-    if matched <= 0:
-        _remove_all_vertex_groups(mesh_obj)
-        print(f"[RigCreate] Position bind produced no weights for '{mesh_obj.name}'")
-        return False
-
-    total_vertices = len(mesh_obj.data.vertices)
-    uv_ratio = uv_assigned / max(total_vertices, 1)
-    local_transfer_count = component_nearest_assigned + pos_assigned
-    nearest_transfer_count = max(0, local_transfer_count - face_project_assigned)
-    nearest_ratio = nearest_transfer_count / max(total_vertices, 1)
-    face_project_ratio = face_project_assigned / max(total_vertices, 1)
-    strong_face_projection = face_project_ratio >= 0.90 and nearest_ratio <= 0.05
-    island_ratio = target_component_count / max(source_component_count, 1)
-    confidence_notes = []
-    if uv_assigned <= 0:
-        confidence_notes.append("no uv links")
-    elif uv_ratio < 0.75:
-        confidence_notes.append(f"partial uv coverage {uv_ratio:.3f}")
-    if face_project_ratio > 0.50:
-        confidence_notes.append(f"mostly face projection {face_project_ratio:.3f}")
-    if nearest_ratio > 0.50:
-        confidence_notes.append(f"mostly nearest transfer {nearest_ratio:.3f}")
-    elif nearest_ratio > 0.20:
-        confidence_notes.append(f"substantial nearest transfer {nearest_ratio:.3f}")
-    if island_ratio > 4.0:
-        confidence_notes.append(f"fragmented target islands {target_component_count}->{source_component_count}")
-
-    if not confidence_notes:
-        bind_confidence = "high"
-    elif nearest_ratio > 0.50 or (uv_assigned <= 0 and not strong_face_projection) or (island_ratio > 4.0 and not strong_face_projection):
-        bind_confidence = "low"
-    else:
-        bind_confidence = "medium"
-
-    print(
-        f"[RigCreate] Position bind used for '{mesh_obj.name}' "
-        f"(uv={uv_assigned}/{total_vertices} [{uv_method}, candidates={uv_matched_count}], "
-        f"islands={target_component_count}->{source_component_count}, island_uv={component_filtered_uv}/{uv_assigned}, "
-        f"island_nearest={component_nearest_assigned}/{total_vertices}, "
-        f"face_project={face_project_assigned}/{total_vertices}, "
-        f"nearest_blend={blended_nearest_assigned}/{total_vertices}, "
-        f"neighbor_propagate={neighbor_assigned}/{total_vertices}, "
-        f"pos_fallback={pos_assigned}/{total_vertices}, confidence={bind_confidence})"
-    )
-    if bind_confidence == "low":
-        print(
-            f"[RigCreate] Position bind low-confidence for '{mesh_obj.name}': "
-            f"{'; '.join(confidence_notes)}"
-        )
-    _clear_child_of_constraints(mesh_obj)
-    _ensure_armature_modifier(mesh_obj, armature_obj)
-    return True
-
-
-def _apply_index_bound_weights(mesh_obj, armature_obj, binding):
-    part_to_bone = binding.get("part_to_bone_map") or {}
-    groups = {}
-    available_bones = {bone.name for bone in armature_obj.data.bones}
-    fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
-    for bone_name in binding["mesh_data"].get("bone_names") or []:
-        resolved = _resolve_binding_bone_name(
-            bone_name,
-            part_to_bone,
-            available_bones,
-            fallback_bone=fallback_bone,
-        )
-        if resolved and resolved not in groups:
-            groups[resolved] = mesh_obj.vertex_groups.new(name=resolved)
-
-    if not groups:
-        return False
-
-    matched = 0
-    for vertex, weights in zip(mesh_obj.data.vertices, binding["mesh_data"].get("vertex_weights") or []):
-        for bone_name, weight in weights.items():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
-            group = groups.get(resolved)
-            if group and weight > 0:
-                group.add([vertex.index], weight, "REPLACE")
-                matched += 1
-
-    if matched <= 0:
-        return False
-
-    _clear_child_of_constraints(mesh_obj)
-    _ensure_armature_modifier(mesh_obj, armature_obj)
-    return True
-
-
-def _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding):
-    part_to_bone = binding.get("part_to_bone_map") or {}
-    groups = {}
-    available_bones = {bone.name for bone in armature_obj.data.bones}
-    fallback_bone = _determine_binding_fallback_bone(binding, available_bones)
-    for bone_name in binding["mesh_data"].get("bone_names") or []:
-        resolved = _resolve_binding_bone_name(
-            bone_name,
-            part_to_bone,
-            available_bones,
-            fallback_bone=fallback_bone,
-        )
-        if resolved and resolved not in groups:
-            groups[resolved] = mesh_obj.vertex_groups.new(name=resolved)
-
-    if not groups:
-        return False
-
-    # vertex-map links index into the collapsed vertex array (binding_vertex_weights),
-    # NOT the original filemesh vertex_weights. Using the wrong array causes arbitrary
-    # bone assignments (e.g. LowerTorso bleeding into clothing fronts).
-    vertex_weights = (
-        binding.get("binding_vertex_weights")
-        or binding["mesh_data"].get("vertex_weights")
-        or []
-    )
-    matched_vertices = set()
-    matched = 0
-    for source_index, target_index in binding.get("vertex_links") or []:
-        if target_index in matched_vertices:
-            continue
-        if source_index < 0 or source_index >= len(vertex_weights):
-            continue
-        if target_index < 0 or target_index >= len(mesh_obj.data.vertices):
-            continue
-        matched_vertices.add(target_index)
-        for bone_name, weight in (vertex_weights[source_index] or {}).items():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
-            group = groups.get(resolved)
-            if group and weight > 0:
-                group.add([target_index], weight, "REPLACE")
-                matched += 1
-
-    if matched <= 0:
-        return False
-
-    mode = binding.get("mode")
-    if mode == "vertex-map":
-        label = "Triangulated vertex bind"
-        coverage = binding.get("vertex_link_coverage", 0.0)
-    else:
-        label = "Source uv bind"
-        coverage = binding.get("uv_link_coverage", 0.0)
-
-    print(
-        f"[RigCreate] {label} used for '{mesh_obj.name}' "
-        f"(links={len(binding.get('vertex_links') or [])}, coverage={coverage:.3f})"
-    )
-    _clear_child_of_constraints(mesh_obj)
-    _ensure_armature_modifier(mesh_obj, armature_obj)
-    return True
-
-
-def _apply_skinned_mesh_bindings(armature_obj, bindings):
-    applied = 0
-    wrap_bindings = []
-    weighted_meshes = []
-
-    for mesh_obj, binding in bindings.items():
-        if mesh_obj.type != "MESH" or mesh_obj.data is None:
-            continue
-
-        _remove_all_vertex_groups(mesh_obj)
-        if _get_wrap_layer_metadata(binding.get("entry") or {}):
-            wrap_bindings.append((mesh_obj, binding))
-            continue
-
-        _log_binding_apply(mesh_obj, binding, "skin bind")
-
-        if binding.get("mode") in ("uv-map", "vertex-map"):
-            success = _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding)
-        elif binding.get("mode") == "position":
-            success = _apply_position_bound_weights(mesh_obj, armature_obj, binding)
-        else:
-            success = _apply_index_bound_weights(mesh_obj, armature_obj, binding)
-
-        if success:
-            applied += 1
-            weighted_meshes.append(mesh_obj)
-        else:
-            print(f"[RigCreate] Failed to apply skinned weights to '{mesh_obj.name}'")
-
-    for mesh_obj, binding in wrap_bindings:
-        _remove_all_vertex_groups(mesh_obj)
-        success = False
-        _log_binding_apply(mesh_obj, binding, "layered clothing bind")
-
-        if binding.get("mode") in ("uv-map", "vertex-map"):
-            success = _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding)
-        elif binding.get("mode") == "position":
-            success = _apply_position_bound_weights(mesh_obj, armature_obj, binding)
-        elif binding.get("mode") == "index":
-            success = _apply_index_bound_weights(mesh_obj, armature_obj, binding)
-
-        if not success:
-            success = _apply_inherited_weight_transfer(mesh_obj, armature_obj, weighted_meshes)
-
-        if success:
-            applied += 1
-            weighted_meshes.append(mesh_obj)
-        else:
-            print(f"[RigCreate] Failed to apply layered clothing weights to '{mesh_obj.name}' (no deterministic bind)")
-
-    return applied
-
-
-def _fingerprint_position(matrix: Matrix, precision: int = 2) -> str:
-    """Create a position-only fingerprint for coarse matching."""
-    loc = matrix.to_translation()
-    return f"{round(loc.x, precision)},{round(loc.y, precision)},{round(loc.z, precision)}"
-
-
-def _build_match_context(parts_collection):
-    """Precompute lookup maps for matching imported meshes to rig metadata."""
-    name_index = {}
-    # Position indices at multiple precision levels — use vertex centroid
-    # corrected into t2b space so distances to expected positions are accurate.
-    position_index_p2 = {}  # precision 2 (0.01 units)
-    position_index_p1 = {}  # precision 1 (0.1 units)
-    position_index_p0 = {}  # precision 0 (1 unit)
-
-    mesh_centers = {}  # obj -> Vector (in t2b-corrected space)
-
-    for obj in parts_collection.objects:
-        if obj.type != "MESH":
-            continue
-        base = _strip_suffix(obj.name).lower()
-        name_index.setdefault(base, []).append(obj)
-
-        center = _mesh_center_in_t2b_space(obj)
-        mesh_centers[obj] = center
-
-        # Build a fake 4x4 from the centroid so _fingerprint_position works
-        center_mat = Matrix.Translation(center)
-        for prec, idx in [(2, position_index_p2), (1, position_index_p1), (0, position_index_p0)]:
-            fp = _fingerprint_position(center_mat, prec)
-            idx.setdefault(fp, []).append(obj)
-
-    return {
-        "name_index": name_index,
-        "position_index_p2": position_index_p2,
-        "position_index_p1": position_index_p1,
-        "position_index_p0": position_index_p0,
-        "mesh_centers": mesh_centers,
-        "used": set(),
-        "t2b": get_transform_to_blender(),
-        "parts_collection": parts_collection,
-    }
-
-
-def _refresh_match_context(match_ctx):
-    """Rebuild lookup indices after objects have been renamed.
-
-    Name-based and position-based caches become stale after the two-pass
-    rename flow. Recompute them while preserving the runtime state that
-    create_rig accumulates around matching and constraint application.
-    """
-    parts_collection = match_ctx["parts_collection"]
-    refreshed = _build_match_context(parts_collection)
-
-    for key in (
-        "fingerprint_object_map",
-        "intentionally_missing_parts",
-        "skinned_mesh_bindings",
-        "pending_constraints",
-    ):
-        if key in match_ctx:
-            refreshed[key] = match_ctx[key]
-
-    if "used" in match_ctx:
-        refreshed["used"] = match_ctx["used"]
-
-    return refreshed
-
-
-def _find_matching_part(aux_name, aux_cf, match_ctx):
-    """Resolve an aux entry to a mesh.
-    
-    Priority order:
-    1. Fingerprint object map (authoritative, from index-based matching)
-    2. Name-based lookup with side + position tiebreaking (for duplicates)
-    3. Position fingerprint (last resort)
-    """
-    used = match_ctx["used"]
-    t2b = match_ctx.get("t2b") or get_transform_to_blender()
-    mesh_centers = match_ctx.get("mesh_centers", {})
-    base_name = _strip_suffix(aux_name or "").lower()
-    intentionally_missing_parts = match_ctx.get("intentionally_missing_parts", set())
-
-    if base_name in intentionally_missing_parts:
-        return None
-    
-    # Pre-compute expected position if we have transform data
-    expected_pos = None
-    if aux_cf:
-        try:
-            expected_pos = (t2b @ cf_to_mat(aux_cf)).to_translation()
-        except Exception:
-            pass
-
-    # Side detection from target name
-    target_lower = (aux_name or "").lower()
-    is_left = "left" in target_lower
-    is_right = "right" in target_lower
-    has_side = is_left or is_right
-    expected_side_positive = None
-    if has_side and expected_pos is not None and abs(expected_pos.x) >= 0.05:
-        expected_side_positive = expected_pos.x > 0
-    
-    def _side_ok(obj):
-        """Return False if mesh is on the wrong side of the rig."""
-        if expected_side_positive is None:
-            return True
-        center = mesh_centers.get(obj)
-        if center is None:
-            center = _mesh_center_in_t2b_space(obj)
-        return (center.x > 0) == expected_side_positive
-    
-    # This is the definitive mapping established during import fingerprinting.
-    # Map is keyed by obj.name (which is the target bone name, possibly with
-    # .001/.002 suffix for duplicates). Exact suffixed names are authoritative;
-    # unsuffixed names still use base-name matching plus position tiebreaking.
-    fp_map = match_ctx.get("fingerprint_object_map", {})
-    if aux_name and fp_map:
-        aux_key = aux_name or ""
-        aux_key_lower = aux_key.lower()
-        aux_base_lower = _strip_suffix(aux_key).lower()
-        aux_has_suffix = aux_base_lower != aux_key_lower
-        exact_fp_exists = any((k or "").lower() == aux_key_lower for k in fp_map.keys())
-        exact_fp_candidates = []
-        base_fp_candidates = []
-        for obj_name, obj in fp_map.items():
-            if obj in used:
-                continue
-            obj_key = obj_name or ""
-            obj_key_lower = obj_key.lower()
-            if obj_key_lower == aux_key_lower:
-                exact_fp_candidates.append(obj)
-            elif _strip_suffix(obj_key).lower() == aux_base_lower:
-                base_fp_candidates.append(obj)
-
-        if aux_has_suffix and exact_fp_exists:
-            # Suffixed query whose exact key exists in fp_map — exact only.
-            # (e.g. "S26_low.007" should only match "S26_low.007", not
-            # fall back to "S26_low.008" through base-name matching.)
-            fp_candidates = exact_fp_candidates
-        elif not aux_has_suffix and not exact_fp_exists:
-            # Unsuffixed query with no exact key in fp_map — do NOT match via
-            # base-name fallback here.  Handled by name_index instead, which
-            # includes position gating and side checks.
-            # (prevents "Cylinder" matching "Cylinder.001" in fp_map)
-            fp_candidates = []
-        else:
-            # Remaining cases:
-            #   a) unsuffixed + exact exists → exact + base for position disambig
-            #      (e.g. "Hand" matches both "Hand" and "Hand.001" in fp_map)
-            #   b) suffixed + no exact → exact + base fallback
-            #      (e.g. "Hand.001" when fp_map only has "Hand.002")
-            fp_candidates = exact_fp_candidates + base_fp_candidates
-        
-        if len(fp_candidates) == 1:
-            obj = fp_candidates[0]
-            print(f"[_find_matching_part] FINGERPRINT HIT: '{aux_name}' -> mesh '{obj.name}'")
-            return obj
-        elif len(fp_candidates) > 1:
-            # Multiple candidates with same base name — use position to disambiguate
-            if expected_pos is not None:
-                def _fp_dist(o):
-                    c = mesh_centers.get(o)
-                    if c is None:
-                        c = _mesh_center_in_t2b_space(o)
-                    return (c - expected_pos).length
-                fp_candidates.sort(key=_fp_dist)
-                obj = fp_candidates[0]
-                print(f"[_find_matching_part] FINGERPRINT HIT (pos disambig, {len(fp_candidates)} cands): '{aux_name}' -> mesh '{obj.name}' (dist={_fp_dist(obj):.4f})")
-                return obj
-            else:
-                # No position data — try side check
-                side_ok = [o for o in fp_candidates if _side_ok(o)]
-                pool = side_ok if side_ok else fp_candidates
-                obj = pool[0]
-                print(f"[_find_matching_part] FINGERPRINT HIT (side disambig): '{aux_name}' -> mesh '{obj.name}'")
-                return obj
-        else:
-            # No candidates — check if they existed but were used
-            has_any = any(
-                (k or "").lower() == aux_key_lower
-                or _strip_suffix(k or "").lower() == aux_base_lower
-                for k in fp_map.keys()
-            )
-            if has_any:
-                print(f"[_find_matching_part] FINGERPRINT found but all used: '{aux_name}'")
-                if aux_has_suffix and exact_fp_exists:
-                    return None
-            else:
-                print(f"[_find_matching_part] FINGERPRINT MISS: '{aux_name}' not in map (map has {len(fp_map)} entries)")
-    
-    # Fallback: Name-based candidates (base name match, ignoring suffixes)
-    # WITH SIDE CHECK + POSITION TIEBREAKING for multiple candidates
-    name_index = match_ctx.get("name_index", {})
-    candidates = []
-    if base_name and base_name in name_index:
-        for obj in name_index[base_name]:
-            if obj not in used:
-                candidates.append(obj)
-
-    if candidates:
-        if len(candidates) == 1:
-            obj = candidates[0]
-            if not _side_ok(obj):
-                print(f"[_find_matching_part] NAME MATCH '{aux_name}' -> '{obj.name}' BUT WRONG SIDE (using anyway, only candidate)")
-            return obj
-        # Multiple candidates — filter by side first, then distance
-        side_ok_cands = [o for o in candidates if _side_ok(o)]
-        pool = side_ok_cands if side_ok_cands else candidates
-        if len(pool) == 1:
-            print(f"[_find_matching_part] NAME+SIDE: '{aux_name}' -> '{pool[0].name}' (1 on correct side of {len(candidates)})")
-            return pool[0]
-        # Use vertex centroid distance to pick closest
-        MAX_NAME_POS_DIST = 2.0  # generous — centroid may differ from CFrame origin
-        if expected_pos is not None:
-            def _pos_dist(obj):
-                c = mesh_centers.get(obj)
-                if c is None:
-                    c = _mesh_center_in_t2b_space(obj)
-                return (c - expected_pos).length
-            pool.sort(key=_pos_dist)
-            best_obj = pool[0]
-            best_dist = _pos_dist(best_obj)
-            if best_dist <= MAX_NAME_POS_DIST:
-                print(f"[_find_matching_part] NAME+SIDE+POS: '{aux_name}' -> '{best_obj.name}' (dist={best_dist:.4f}, {len(candidates)} candidates)")
-                return best_obj
-            else:
-                print(f"[_find_matching_part] NAME+SIDE+POS REJECTED: '{aux_name}' best '{best_obj.name}' too far ({best_dist:.4f})")
-                return None
-        # No position data — take first from side-filtered pool
-        if len(pool) <= 3:
-            return pool[0]
-        print(f"[_find_matching_part] NAME AMBIGUOUS: '{aux_name}' has {len(pool)} candidates, no position data")
-        return None
-
-    # Position fingerprint fallback at multiple precision levels
-    # Only accept unambiguous matches within a small distance threshold.
-    if aux_cf:
-        try:
-            expected_mat = t2b @ cf_to_mat(aux_cf)
-            expected_pos = expected_mat.to_translation()
-            max_dist = 0.05
-
-            for prec in [2, 1, 0]:
-                fp = _fingerprint_position(expected_mat, prec)
-                idx = match_ctx.get(f"position_index_p{prec}", {})
-                candidates = [obj for obj in idx.get(fp, []) if obj not in used]
-                if len(candidates) != 1:
-                    continue
-
-                obj = candidates[0]
-                actual_pos = mesh_centers.get(obj)
-                if actual_pos is None:
-                    actual_pos = _mesh_center_in_t2b_space(obj)
-                if (actual_pos - expected_pos).length <= max_dist:
-                    if not _side_ok(obj):
-                        print(f"[_find_matching_part] POS FINGERPRINT '{aux_name}' -> '{obj.name}' WRONG SIDE, skipping")
-                        continue
-                    return obj
-        except Exception:
-            pass
-    return None
-
-
-def _apply_fingerprint_renames(rig_def, match_ctx, allow_aux_renames=True, all_bone_names=None):
-    """Rename meshes by comparing position fingerprints from rig metadata.
-    
-    Collects all renames first, then applies via two-pass temp-name approach
-    to avoid blender's auto-suffixing (.001) corrupting other objects' names.
-    """
-    if not allow_aux_renames:
-        return
-
-    name_index = match_ctx["name_index"]
-    pending = []  # (obj, aux_name)
-    all_bone_names = all_bone_names or set()
-
-    def walk(node):
-        # Collect child names to skip overlapping AUX renames
-        child_part_names = set()
-        for child in node.get("children") or []:
-            jname = child.get("jname")
-            pname = child.get("pname")
-            if jname:
-                child_part_names.add(jname.lower())
-            if pname:
-                child_part_names.add(pname.lower())
-
-        aux_list = node.get("aux") or []
-        aux_tf = node.get("auxTransform") or []
-        for idx, aux_name in enumerate(aux_list):
-            if not aux_name:
-                continue
-            aux_lower = aux_name.lower()
-            if aux_lower in child_part_names or aux_lower in all_bone_names:
-                continue
-            aux_cf = aux_tf[idx] if idx < len(aux_tf) else None
-            if not aux_cf:
-                continue
-            obj = _find_matching_part(aux_name, aux_cf, match_ctx)
-            if obj and _strip_suffix(obj.name) != aux_name:
-                pending.append((obj, aux_name))
-        for child in node.get("children", []):
-            walk(child)
-
-    walk(rig_def)
-    
-    if pending:
-        # Two-pass rename to avoid collisions
-        for i, (obj, _) in enumerate(pending):
-            obj.name = f"__rbxafr_{i}__"
-        for obj, aux_name in pending:
-            obj.name = aux_name
-            base = _strip_suffix(obj.name).lower()
-            name_index.setdefault(base, []).append(obj)
-
-
-def get_unique_collection_name(basename):
-    """Generate a unique collection name to avoid conflicts."""
-    if basename not in bpy.data.collections:
-        return basename
-    i = 1
-    while True:
-        name = f"{basename}.{i:03d}"
-        if name not in bpy.data.collections:
-            return name
-        i += 1
-
+# Weight limits, group collection, data-transfer sequencing, and the vertex
+# component/geometry helpers all live in skin_binding.py (imported above).
+
+# All weight-application paths and the part-matching/fingerprint machinery
+# live in skin_binding.py / part_matching.py (imported above).
 
 def _collect_all_bone_names(rig_def):
     """Walk the rig tree and collect every jname and pname into a set."""
     names = set()
+
     def walk(node):
         jname = node.get("jname")
         pname = node.get("pname")
@@ -3658,14 +2089,113 @@ def _articulated_chain_children(rigsubdef):
     return [
         child
         for child in children
-        if (child.get("jointType") or "Motor6D") not in {"Weld", "WeldConstraint"}
+        if (child.get("jointType") or "Motor6D") not in {"Weld", "WeldConstraint", "RigidConstraint", "Snap"}
     ]
 
 
-def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, match_ctx, all_bone_names):
+def _collect_deform_bone_names(rig_def):
+    names = set()
+
+    def walk(node):
+        if node.get("isDeformBone") and node.get("jname"):
+            names.add(node["jname"].casefold())
+        for child in node.get("children") or []:
+            walk(child)
+
+    walk(rig_def)
+    return names
+
+
+def create_joint_bone(
+    ao,
+    parent_bone_name,
+    transform_cf,
+    c0_cf,
+    c1_cf,
+    bone_name,
+    joint_type="Motor6D",
+):
+    """Create a Motor6D-style bone on an armature, mirroring load_rigbone's
+    non-root branch.
+
+    The bone head sits at the joint position (transform * C1 in Roblox
+    space) and every prop the animation serializer/sampler expects is
+    stamped (transform, transform0, transform1, nicetransform, rbx_*,
+    is_transformable).  The caller is responsible for bone-collection
+    visibility and object mode state.  Returns the created bone name, or
+    None on failure.
+    """
+    t2b = get_transform_to_blender()
+    mat = cf_to_mat(transform_cf)
+    mat0 = cf_to_mat(c0_cf)
+    mat1 = cf_to_mat(c1_cf)
+    o_trans = t2b @ (mat @ mat1)
+    bone_dir = (t2b @ mat).to_3x3().to_4x4() @ Vector((0, 0, 1))
+
+    amt = ao.data
+    prev_active = bpy.context.view_layer.objects.active
+    prev_mode = ao.mode if ao == prev_active else None
+    bpy.context.view_layer.objects.active = ao
+    if ao.mode != "EDIT":
+        if not _safe_mode_set("EDIT", ao):
+            return None
+    try:
+        edit_bones = amt.edit_bones
+        parent_edit = edit_bones.get(parent_bone_name)
+        if parent_edit is None:
+            return None
+        final_name = bone_name
+        counter = 1
+        while final_name in edit_bones:
+            final_name = f"{bone_name}.{counter:03d}"
+            counter += 1
+        bone = edit_bones.new(final_name)
+        bone.parent = parent_edit
+        bone.head = o_trans.to_translation()
+        bone.tail = o_trans @ Vector((0, 0.25, 0))
+        bone.align_roll(bone_dir)
+        bone.use_deform = False
+        post_mat = bone.matrix
+        bone["transform"] = _matrix_to_idprop(mat)
+        bone["transform0"] = _matrix_to_idprop(mat0)
+        bone["transform1"] = _matrix_to_idprop(mat1)
+        bone["nicetransform"] = _matrix_to_idprop(o_trans.inverted() @ post_mat)
+        bone["rbx_joint_type"] = joint_type or "Motor6D"
+        bone["rbx_original_parent"] = parent_bone_name
+        bone["rbx_source_name"] = bone_name
+        bone["is_transformable"] = True
+        return bone.name
+    finally:
+        _safe_mode_set("OBJECT", ao)
+        if prev_active:
+            bpy.context.view_layer.objects.active = prev_active
+        if prev_mode and prev_active == ao and prev_mode != "EDIT":
+            _safe_mode_set(prev_mode, ao)
+
+
+def load_rigbone(
+    ao,
+    rigging_type,
+    rigsubdef,
+    parent_bone,
+    parts_collection,
+    match_ctx,
+    all_bone_names,
+    deform_bone_names=None,
+):
     """Load a single rig bone with its children."""
     amt = ao.data
-    bone = amt.edit_bones.new(rigsubdef["jname"])
+    if deform_bone_names is None:
+        deform_bone_names = _collect_deform_bone_names(rigsubdef)
+
+    source_name = rigsubdef["jname"]
+    is_deform_bone = rigsubdef.get("isDeformBone", False)
+    bone_name = source_name
+    if not is_deform_bone and source_name.casefold() in deform_bone_names:
+        bone_name = f"__RBX_STRUCTURAL__{source_name}"
+
+    bone = amt.edit_bones.new(bone_name)
+    bone["rbx_source_name"] = source_name
     joint_type = rigsubdef.get("jointType") or "Motor6D"
     original_parent_bone = rigsubdef.get("originalParentBone")
 
@@ -3675,7 +2205,6 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     bone_dir = (t2b @ mat).to_3x3().to_4x4() @ Vector((0, 0, 1))
 
     # Check if this bone is marked as a deform bone from Studio export
-    is_deform_bone = rigsubdef.get("isDeformBone", False)
     if joint_type:
         # Preserve joint type for downstream serialization/diagnostics (Motor6D/Weld/WeldConstraint/Bone)
         bone["rbx_joint_type"] = joint_type
@@ -3686,6 +2215,20 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
         bone["rbx_is_deform_bone"] = True
         bone["is_transformable"] = True
         bone.use_deform = True
+    else:
+        # Deform-capable joints (Motor6D/AnimationConstraint) must be Blender
+        # deform bones ONLY when their part is a skinned mesh
+        # (MeshPart.HasSkinnedMesh), or armature-modifier skinning silently
+        # does nothing while non-skinned joints would wrongly deform nearby
+        # geometry.  Legacy exports without the flag keep the old
+        # all-deformable behavior.  Structural rigid joints and Motor6D
+        # bones renamed to __RBX_STRUCTURAL__ never deform.
+        skinned = bool(rigsubdef.get("hasSkinnedMesh", True))
+        structural = (
+            bone_name.startswith("__RBX_STRUCTURAL__")
+            or joint_type in ("Weld", "WeldConstraint", "RigidConstraint", "Snap")
+        )
+        bone.use_deform = skinned and not structural
 
     if "jointtransform0" not in rigsubdef:
         # Rig root
@@ -3718,6 +2261,13 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
 
         # Store neutral matrix before any transforms (needed for all modes)
         pre_mat = bone.matrix
+
+        # NOTE: do NOT repoint Bone tails at child heads. Blender forces the
+        # bone Y axis along head->tail, so moving the tail rotates matrix_local
+        # away from the Roblox bone's rest frame. The deform import path applies
+        # the Roblox delta directly as matrix_basis and requires matrix_local to
+        # equal the Roblox rest frame (modulo the axis swizzle), otherwise
+        # rotations come out wrong. Keep the tail on the bone's local Z stub.
 
         # Deform bones need their imported local axes preserved exactly.
         # The "nice" articulated-chain adjustments are useful for Motor6D helper
@@ -3780,19 +2330,30 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
     # Process child bones first so they claim their own meshes before
     # this bone's AUX list can steal them.
     for child in children:
-        load_rigbone(ao, rigging_type, child, bone, parts_collection, match_ctx, all_bone_names)
+        load_rigbone(
+            ao,
+            rigging_type,
+            child,
+            bone,
+            parts_collection,
+            match_ctx,
+            all_bone_names,
+            deform_bone_names,
+        )
 
     # Process PRIMARY pname FIRST — every bone should claim its own mesh
     # before its AUX list takes leftovers.
     p_name = rigsubdef.get("pname")
     if p_name:
-        found_primary = _find_matching_part(p_name, None, match_ctx)
+        found_primary = _find_matching_part(
+            p_name, None, match_ctx, inst_ref=rigsubdef.get("inst_ref")
+        )
 
         # Fallback: simple lookup in collection if _find_matching_part fails
         if not found_primary and parts_collection:
-             found_primary = parts_collection.objects.get(p_name)
-             if found_primary and found_primary in match_ctx["used"]:
-                 found_primary = None
+            found_primary = parts_collection.objects.get(p_name)
+            if found_primary and found_primary in match_ctx["used"]:
+                found_primary = None
 
         if found_primary:
             match_ctx["used"].add(found_primary)
@@ -3836,41 +2397,41 @@ def load_rigbone(ao, rigging_type, rigsubdef, parent_bone, parts_collection, mat
 def _get_or_create_weld_bone_shape():
     """Get or create a simple line curve to use as custom bone shape for welds."""
     shape_name = "__WeldBoneShape"
-    
+
     # Check if it already exists
     if shape_name in bpy.data.objects:
         return bpy.data.objects[shape_name]
-    
+
     # Create a simple line curve
     curve_data = bpy.data.curves.new(name=shape_name, type='CURVE')
     curve_data.dimensions = '3D'
-    
+
     # Create a simple straight line spline
     spline = curve_data.splines.new('POLY')
     spline.points.add(1)  # Start with 1 point, add 1 more = 2 points total
     spline.points[0].co = (0, 0, 0, 1)
     spline.points[1].co = (0, 1, 0, 1)  # Line along Y axis (bone direction)
-    
+
     # Create the object
     shape_obj = bpy.data.objects.new(shape_name, curve_data)
-    
+
     # Don't link to any collection - it's just for bone display
     shape_obj.hide_viewport = True
     shape_obj.hide_render = True
-    
+
     return shape_obj
 
 
 def _configure_weld_bones(armature_obj):
     """Configure weld bones: custom shape, lock transforms, gray color."""
     amt = armature_obj.data
-    
+
     settings = bpy.context.scene.rbx_anim_settings
     hide_welds = getattr(settings, "rbx_hide_weld_bones", False)
     weld_shape = _get_or_create_weld_bone_shape()
-    
+
     _safe_mode_set("POSE", armature_obj)
-    
+
     # Blender 4.0+ uses bone collections, 3.x uses bone.hide
     try:
         collections = amt.collections
@@ -3885,34 +2446,34 @@ def _configure_weld_bones(armature_obj):
         weld_coll = collections.get(weld_coll_name)
         if weld_coll is None:
             weld_coll = collections.new(weld_coll_name)
-    
+
     for bone in amt.bones:
         joint_type = bone.get("rbx_joint_type", "Motor6D")
-        if joint_type in ("Weld", "WeldConstraint"):
+        if joint_type in ("Weld", "WeldConstraint", "RigidConstraint", "Snap"):
             pose_bone = armature_obj.pose.bones.get(bone.name)
             if pose_bone:
                 pose_bone.custom_shape = weld_shape
                 pose_bone.use_custom_shape_bone_size = True
-                
+
                 pose_bone.lock_location = (True, True, True)
                 pose_bone.lock_rotation = (True, True, True)
                 pose_bone.lock_rotation_w = True
                 pose_bone.lock_scale = (True, True, True)
-                
+
                 if hasattr(pose_bone, "color"):
                     pose_bone.color.palette = 'CUSTOM'
                     pose_bone.color.custom.normal = (0.3, 0.3, 0.3)
                     pose_bone.color.custom.select = (0.5, 0.5, 0.5)
                     pose_bone.color.custom.active = (0.6, 0.6, 0.6)
-            
+
             if use_collections:
                 weld_coll.assign(bone)
             else:
                 bone.hide = hide_welds
-    
+
     if use_collections:
         weld_coll.is_visible = not hide_welds
-    
+
     _safe_mode_set("OBJECT", armature_obj)
 
 
@@ -3957,8 +2518,9 @@ def create_rig(rigging_type, rig_meta_obj_name):
 
     # --- Deletion of old Armature ---
     # Find and delete any existing armature within this rig's master collection
+    # (all_objects recurses into the Rig/Parts subcollections).
     old_armature = None
-    for obj in master_collection.objects:
+    for obj in master_collection.all_objects:
         if obj.type == "ARMATURE":
             old_armature = obj
             break
@@ -3993,6 +2555,33 @@ def create_rig(rigging_type, rig_meta_obj_name):
 
     match_ctx["fingerprint_object_map"] = fp_map
 
+    def _build_inst_ref_to_bone(node, result=None, jname_to_ref=None):
+        """Walk the rig tree and map rbxm instance referent to deform bone name.
+
+        Also populates jname_to_ref with the authoritative instance referent for
+        each joint name so meshToBone entries can resolve to their exact mesh.
+        """
+        if result is None:
+            result = {}
+        if jname_to_ref is None:
+            jname_to_ref = {}
+        if not isinstance(node, dict):
+            return result, jname_to_ref
+        jname = node.get("jname")
+        inst_ref = node.get("inst_ref")
+        joint_type = node.get("jointType")
+        # Deform bones are Motor6D/AnimationConstraint nodes (or the root).
+        is_deform = inst_ref is not None and (
+            joint_type in ("Motor6D", "AnimationConstraint") or node.get("pname") is None
+        )
+        if is_deform and jname:
+            result[int(inst_ref)] = jname
+        if jname and inst_ref is not None:
+            jname_to_ref[jname] = int(inst_ref)
+        for child in node.get("children") or []:
+            _build_inst_ref_to_bone(child, result, jname_to_ref)
+        return result, jname_to_ref
+
     # Pre-populate authoritative mesh->bone constraints from Studio export.
     # This bypasses all name-based matching when the Studio plugin explicitly
     # tells us which mesh belongs to which bone. Essential for duplicate-named
@@ -4000,12 +2589,57 @@ def create_rig(rigging_type, rig_meta_obj_name):
     mesh_to_bone = meta_loaded.get("meshToBone") or {}
     if mesh_to_bone:
         print(f"[RigCreate] meshToBone mapping present ({len(mesh_to_bone)} entries), pre-constraining...")
+
+        # Build an inst_ref -> bone_name map from the rig tree so rbxm-sourced
+        # meshes can be matched authoritatively regardless of Blender object
+        # renaming or duplicate part names.
+        inst_ref_to_bone = {}
+        jname_to_inst_ref = {}
+        rig_def = meta_loaded.get("rig")
+        if isinstance(rig_def, dict):
+            inst_ref_to_bone, jname_to_inst_ref = _build_inst_ref_to_bone(rig_def)
+
+        # Index imported meshes by their rbxm instance referent for O(1) lookup.
+        inst_ref_to_obj = {}
+        for candidate in parts_collection.objects:
+            ref = candidate.get("RBXInstRef")
+            if ref is not None:
+                inst_ref_to_obj[int(ref)] = candidate
+
         for mesh_name, bone_name in mesh_to_bone.items():
-            mesh_obj = parts_collection.objects.get(mesh_name)
+            mesh_obj = None
+            # Try authoritative inst_ref lookup first: the rig tree tells us
+            # exactly which instance corresponds to this jname.
+            preferred_ref = jname_to_inst_ref.get(mesh_name)
+            if preferred_ref is not None:
+                obj = inst_ref_to_obj.get(preferred_ref)
+                if obj is not None and obj not in match_ctx["used"]:
+                    mesh_obj = obj
+                    print(
+                        f"[RigCreate] meshToBone resolved '{mesh_name}' by inst_ref #{preferred_ref} -> mesh '{obj.name}'")
+
+            # Fallback: any unused mesh whose inst_ref maps to the same bone.
+            if mesh_obj is None:
+                for ref, obj in inst_ref_to_obj.items():
+                    if inst_ref_to_bone.get(ref) == bone_name and obj not in match_ctx["used"]:
+                        mesh_obj = obj
+                        print(f"[RigCreate] meshToBone resolved '{mesh_name}' by inst_ref #{ref} -> mesh '{obj.name}'")
+                        break
+
+            if mesh_obj is None:
+                mesh_obj = parts_collection.objects.get(mesh_name)
             if mesh_obj is None:
                 stripped = _strip_suffix(mesh_name)
                 for candidate in parts_collection.objects:
                     if _strip_suffix(candidate.name) == stripped:
+                        mesh_obj = candidate
+                        break
+            if mesh_obj is None:
+                # Studio-style names ("<Model>.model/Head.MeshPart") — compare
+                # by stem so the rig-tree part name ("Head") still resolves.
+                stem = _match_stem(mesh_name)
+                for candidate in parts_collection.objects:
+                    if _match_stem(candidate.name) == stem:
                         mesh_obj = candidate
                         break
             if mesh_obj is None:
@@ -4022,12 +2656,17 @@ def create_rig(rigging_type, rig_meta_obj_name):
                 dedup.add(key)
                 pending.append((mesh_obj, bone_name))
                 print(f"[RigCreate] meshToBone PRE-CONSTRAINED: mesh '{mesh_obj.name}' -> bone '{bone_name}'")
-        if pending:
-            print(f"[RigCreate] meshToBone pre-constrained {len([x for x in pending if x[0] in match_ctx['used']])} meshes")
+        pending_constraints = match_ctx.get("pending_constraints") or []
+        if pending_constraints:
+            print(
+                f"[RigCreate] meshToBone pre-constrained {len([x for x in pending_constraints if x[0] in match_ctx['used']])} meshes")
+
+        # Stash the inst_ref -> bone map for the fallback constraint pass.
+        match_ctx["inst_ref_to_bone"] = inst_ref_to_bone
 
     # Collect all bone names once so AUX filtering is consistent across rename + constraint passes
     all_bone_names = _collect_all_bone_names(meta_loaded["rig"])
-    
+
     # Try to restore correct part names using fingerprinting before building constraints.
     _apply_fingerprint_renames(
         meta_loaded["rig"],
@@ -4048,10 +2687,17 @@ def create_rig(rigging_type, rig_meta_obj_name):
     ao = bpy.context.object
     ao.show_in_front = True
 
-    # Move the new armature into the master collection
+    # Move the new armature into the rig's collection (the "<model> Rig"
+    # subcollection when present, else the master collection itself).
+    # Accept Blender's dedup suffixes ("xsixx.model Rig.001").
+    rig_coll = None
+    for child in master_collection.children:
+        if re.match(r".+ Rig(?:\.\d+)?$", child.name):
+            rig_coll = child
+            break
     for coll in ao.users_collection:
         coll.objects.unlink(ao)
-    master_collection.objects.link(ao)
+    (rig_coll or master_collection).objects.link(ao)
 
     # Set a unique name for the armature based on the rig name
     rig_name = meta_loaded.get("rigName", "Rig")
@@ -4089,17 +2735,17 @@ def create_rig(rigging_type, rig_meta_obj_name):
             f"{len(stored_payload.get('face_bone_names') or [])} face bone(s) and "
             f"{len(stored_payload.get('face_control_names') or [])} control(s)"
         )
-    
+
     # Apply pending constraints now that we're in object mode
     from .constraints import link_object_to_bone_rigid, auto_constraint_parts
-    
+
     # Track objects that were constrained via authoritative fingerprint mapping
     # These should NOT be touched by auto_constraint_parts
     authoritatively_constrained = set()
-    
+
     pending = match_ctx.get("pending_constraints", [])
     print(f"[RigCreate] Applying {len(pending)} pending constraints...")
-    
+
     for obj, bone_name in pending:
         bone = ao.data.bones.get(bone_name)
         if bone:
@@ -4108,19 +2754,24 @@ def create_rig(rigging_type, rig_meta_obj_name):
             print(f"[RigCreate] AUTHORITATIVE: mesh '{obj.name}' -> bone '{bone_name}'")
         else:
             print(f"[RigCreate] WARNING: bone '{bone_name}' not found for mesh '{obj.name}'")
-    
+
     # Auto-constraint ONLY parts that were NOT authoritatively constrained
     # This handles any parts that weren't in the fingerprint map (legacy/fallback)
     bpy.context.view_layer.update()
     skip_objects = set(authoritatively_constrained)
     skip_objects.update(skinned_mesh_bindings.keys())
-    ok, msg = auto_constraint_parts(ao.name, skip_objects=skip_objects)
+    ok, msg = auto_constraint_parts(
+        ao.name,
+        skip_objects=skip_objects,
+        inst_ref_to_bone=match_ctx.get("inst_ref_to_bone"),
+    )
 
     # If no parts matched via fallback, retry once (but STILL skip authoritative ones)
     if ok and msg and "No matching parts found" in msg:
         # Capture the set in closure
         _skip_set = skip_objects
         _ao_name = ao.name
+
         def _retry_auto_constraint():
             try:
                 auto_constraint_parts(_ao_name, skip_objects=_skip_set)
@@ -4132,7 +2783,7 @@ def create_rig(rigging_type, rig_meta_obj_name):
             bpy.app.timers.register(_retry_auto_constraint, first_interval=0.0)
         except Exception:
             pass
-    
+
     # Configure weld bones with custom display and lock them from animation
     _configure_weld_bones(ao)
 

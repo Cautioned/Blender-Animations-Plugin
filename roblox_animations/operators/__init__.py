@@ -6,6 +6,7 @@ This module contains all Blender operators (actions) for the addon.
 
 from .import_ops import (
     OBJECT_OT_ImportModel,
+    OBJECT_OT_ImportRbxm,
     OBJECT_OT_ImportFbxAnimation,
     OBJECT_OT_ConfirmWeaponTarget,
     OBJECT_OT_ApplyWeaponImport,
@@ -53,9 +54,6 @@ from .validation_ops import (
     OBJECT_OT_ValidateMotionPaths,
     OBJECT_OT_ClearMotionPathValidation,
 )
-from .test_ops import (
-    OBJECT_OT_RunTests,
-)
 from .auth_ops import (
     OBJECT_OT_RbxOAuthLogin,
     OBJECT_OT_RbxOAuthCancelLogin,
@@ -65,6 +63,7 @@ from .auth_ops import (
 __all__ = [
     # Import operators
     "OBJECT_OT_ImportModel",
+    "OBJECT_OT_ImportRbxm",
     "OBJECT_OT_ImportFbxAnimation",
     "OBJECT_OT_ConfirmWeaponTarget",
     "OBJECT_OT_ApplyWeaponImport",
@@ -104,8 +103,6 @@ __all__ = [
     # Server operators
     "StartServerOperator",
     "StopServerOperator",
-    # Test operators
-    "OBJECT_OT_RunTests",
     # OAuth operators
     "OBJECT_OT_RbxOAuthLogin",
     "OBJECT_OT_RbxOAuthCancelLogin",

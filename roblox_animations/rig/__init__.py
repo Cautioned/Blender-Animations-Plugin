@@ -1,7 +1,9 @@
 """
 Rig module for the Roblox Animations Blender Addon.
 
-This module handles rig creation, bone management, and constraint operations.
+Rig creation, bone management and constraints, plus the asset-side
+subsystems: FileMesh fetching, terrain meshing, texture/material
+construction, and skin binding.
 """
 
 from .creation import (

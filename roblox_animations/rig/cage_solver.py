@@ -43,6 +43,29 @@ def _round_pos_key(position: Sequence[float], precision: int = 6) -> Vec3:
     return tuple(round(float(component), precision) for component in position)
 
 
+_NUMPY = None
+_NUMPY_CHECKED = False
+
+
+def _load_numpy():
+    global _NUMPY, _NUMPY_CHECKED
+    if _NUMPY_CHECKED:
+        return _NUMPY
+    _NUMPY_CHECKED = True
+    try:
+        import numpy as numpy_module  # noqa: PLC0415
+
+        _NUMPY = numpy_module
+    except Exception:
+        _NUMPY = None
+    return _NUMPY
+
+
+def numpy_available() -> bool:
+    """True when numpy is importable (always the case inside Blender)."""
+    return _load_numpy() is not None
+
+
 def _build_vertex_adjacency(faces: Optional[Sequence[Sequence[int]]], vertex_count: int) -> List[set]:
     adjacency = [set() for _ in range(max(vertex_count, 0))]
     if not faces:
@@ -91,13 +114,15 @@ def _uv_sequence_distance(left: Sequence[Optional[Vec2]], right: Sequence[Option
     return distance
 
 
-def _build_vertex_topology(vertices: Sequence[dict], faces: Optional[Sequence[Sequence[int]]], precision: int = 4) -> Dict[int, dict]:
+def _build_vertex_topology(
+        vertices: Sequence[dict], faces: Optional[Sequence[Sequence[int]]], precision: int = 4) -> Dict[int, dict]:
     adjacency = _build_vertex_adjacency(faces, len(vertices))
     topology: Dict[int, dict] = {}
     for vertex_index, neighbors in enumerate(adjacency):
         neighbor_indices = sorted(neighbors)
         neighbor_uvs = sorted(
-            (_round_uv_key(vertices[neighbor_index].get("uv"), precision=precision) for neighbor_index in neighbor_indices),
+            (_round_uv_key(vertices[neighbor_index].get("uv"), precision=precision)
+             for neighbor_index in neighbor_indices),
             key=lambda value: (value is None, value),
         )
         edge_lengths = sorted(
@@ -180,7 +205,8 @@ def _match_uv_bucket(
             if source_info and target_info:
                 valence_score = abs(source_info["valence"] - target_info["valence"])
                 topology_score = _uv_sequence_distance(source_info["neighbor_uvs"], target_info["neighbor_uvs"])
-                edge_score = _sequence_distance(source_info["edge_lengths"], target_info["edge_lengths"], missing_cost=0.25)
+                edge_score = _sequence_distance(source_info["edge_lengths"],
+                                                target_info["edge_lengths"], missing_cost=0.25)
             position_score, normal_score = _vertex_match_score(source_vertex, target_vertex)
             score = (topology_score, valence_score, edge_score, normal_score)
             if use_position_score:
@@ -210,7 +236,8 @@ def _match_position_bucket(
             edge_score = 0.0
             if source_info and target_info:
                 valence_score = abs(source_info["valence"] - target_info["valence"])
-                edge_score = _sequence_distance(source_info["edge_lengths"], target_info["edge_lengths"], missing_cost=0.25)
+                edge_score = _sequence_distance(source_info["edge_lengths"],
+                                                target_info["edge_lengths"], missing_cost=0.25)
             _, normal_score = _vertex_match_score(source_vertex, target_vertex)
             score = (valence_score, edge_score, normal_score, source_index, target_index)
             pair_scores.append((score, source_index, target_index))
@@ -409,7 +436,8 @@ def link_targets_to_sources_by_position(
             edge_score = 0.0
             if source_info and target_info:
                 valence_score = abs(source_info["valence"] - target_info["valence"])
-                edge_score = _sequence_distance(source_info["edge_lengths"], target_info["edge_lengths"], missing_cost=0.25)
+                edge_score = _sequence_distance(source_info["edge_lengths"],
+                                                target_info["edge_lengths"], missing_cost=0.25)
 
             position_score, normal_score = _vertex_match_score(source_vertex, target_vertex)
             score = (position_score, valence_score, edge_score, normal_score, source_index)
@@ -456,7 +484,8 @@ def _deduplicate_controls(
     return deduped_positions, deduped_targets
 
 
-def _solve_linear_system(matrix: Sequence[Sequence[float]], targets: Sequence[Vec3], regularization: float = 1e-8) -> Optional[List[Vec3]]:
+def _solve_linear_system(matrix: Sequence[Sequence[float]], targets: Sequence[Vec3],
+                         regularization: float = 1e-8) -> Optional[List[Vec3]]:
     size = len(matrix)
     if size == 0:
         return []
@@ -522,6 +551,89 @@ def _evaluate_rbf(point: Vec3, control_positions: Sequence[Vec3], weights: Seque
     return result
 
 
+def _predict_global_rbf_numpy(
+    np,
+    points: Sequence[Vec3],
+    control_positions: Sequence[Vec3],
+    target_positions: Sequence[Vec3],
+    exact_targets: Dict[Vec3, Vec3],
+    regularization: float,
+) -> Optional[List[Vec3]]:
+    """Global linear RBF solve via numpy, augmented with the affine
+    (polynomial) tail so the field reproduces rigid/affine motion exactly.
+
+    The bare phi(r)=r solve (what MaximumADHD's CageSolver.SolveRbf does)
+    collapses/shears rigid limb rotation between control rings — which is
+    what skews jackets/pants when the body re-proportions. The augmented
+    system [[K P],[P^T 0]] makes f affine-exact while remaining exact at
+    the controls, so a limb that only rotated/translated/scaled stays rigid."""
+    size = len(control_positions)
+    try:
+        controls = np.asarray(control_positions, dtype=np.float64).reshape(size, 3)
+        targets = np.asarray(target_positions, dtype=np.float64).reshape(size, 3)
+    except Exception:
+        return None
+
+    cx = controls[:, 0]
+    cy = controls[:, 1]
+    cz = controls[:, 2]
+    matrix = (cx[:, None] - cx[None, :]) ** 2
+    matrix += (cy[:, None] - cy[None, :]) ** 2
+    matrix += (cz[:, None] - cz[None, :]) ** 2
+    np.sqrt(matrix, out=matrix)
+    matrix[np.diag_indices_from(matrix)] += regularization
+
+    # Poly block P = [x y z 1]; augmented system solves for [weights, coeffs].
+    poly = np.concatenate([controls, np.ones((size, 1), dtype=np.float64)], axis=1)
+    top = np.concatenate([matrix, poly], axis=1)
+    bottom = np.concatenate([poly.T, np.zeros((4, 4), dtype=np.float64)], axis=1)
+    augmented = np.concatenate([top, bottom], axis=0)
+    rhs = np.concatenate([targets, np.zeros((4, 3), dtype=np.float64)], axis=0)
+
+    # Exact solve first (highest fidelity); only fall back to the
+    # minimum-norm lstsq when the control set is degenerate (co-planar /
+    # co-linear cages make the augmented system singular).
+    solution = None
+    try:
+        solution = np.linalg.solve(augmented, rhs)
+    except Exception:
+        try:
+            solution = np.linalg.lstsq(augmented, rhs, rcond=None)[0]
+        except Exception:
+            return None
+    if solution is None:
+        return None
+    weights = solution[:size]
+    coeffs = solution[size:]
+
+    predicted: List[Optional[Vec3]] = [None] * len(points)
+    unresolved: List[int] = []
+    for index, point in enumerate(points):
+        exact = exact_targets.get(_round_pos_key(point))
+        if exact is not None:
+            predicted[index] = exact
+        else:
+            unresolved.append(index)
+
+    if unresolved:
+        query = np.asarray([points[index] for index in unresolved], dtype=np.float64).reshape(len(unresolved), 3)
+        chunk_size = 512
+        resolved_chunks = []
+        for start in range(0, len(query), chunk_size):
+            block = query[start:start + chunk_size]
+            distances = (block[:, None, 0] - cx[None, :]) ** 2
+            distances += (block[:, None, 1] - cy[None, :]) ** 2
+            distances += (block[:, None, 2] - cz[None, :]) ** 2
+            np.sqrt(distances, out=distances)
+            block_poly = np.concatenate([block, np.ones((len(block), 1), dtype=np.float64)], axis=1)
+            resolved_chunks.append(distances @ weights + block_poly @ coeffs)
+        resolved = np.vstack(resolved_chunks)
+        for row, index in enumerate(unresolved):
+            predicted[index] = (float(resolved[row, 0]), float(resolved[row, 1]), float(resolved[row, 2]))
+
+    return predicted  # type: ignore[return-value]
+
+
 def _predict_points_with_rbf(
     points: Sequence[Vec3],
     control_positions: Sequence[Vec3],
@@ -546,6 +658,19 @@ def _predict_points_with_rbf(
     }
 
     if len(control_positions) <= global_threshold:
+        np = _load_numpy()
+        if np is not None:
+            predicted = _predict_global_rbf_numpy(
+                np,
+                points,
+                control_positions,
+                target_positions,
+                position_to_target,
+                regularization,
+            )
+            if predicted is not None:
+                return predicted, "global-rbf"
+
         weights = _solve_linear_system(
             _build_rbf_matrix(control_positions),
             target_positions,
@@ -656,6 +781,8 @@ def solve_two_stage_cage_deformation(
     precision: int = 4,
     inner_neighbors: int = 8,
     outer_neighbors: int = 8,
+    inner_global_threshold: int = 96,
+    outer_global_threshold: int = 96,
     reference_inner_faces: Optional[Sequence[Sequence[int]]] = None,
     current_inner_faces: Optional[Sequence[Sequence[int]]] = None,
 ) -> Optional[dict]:
@@ -674,11 +801,13 @@ def solve_two_stage_cage_deformation(
         inner_solution["control_positions"],
         inner_solution["target_positions"],
         neighbor_count=inner_neighbors,
+        global_threshold=inner_global_threshold,
     )
 
     outer_control_positions = [vertex["position"] for vertex in source_outer_vertices]
     outer_target_positions = list(predicted_outer_positions)
-    outer_control_positions, outer_target_positions = _deduplicate_controls(outer_control_positions, outer_target_positions)
+    outer_control_positions, outer_target_positions = _deduplicate_controls(
+        outer_control_positions, outer_target_positions)
     if not outer_control_positions:
         return None
 
@@ -687,6 +816,7 @@ def solve_two_stage_cage_deformation(
         outer_control_positions,
         outer_target_positions,
         neighbor_count=outer_neighbors,
+        global_threshold=outer_global_threshold,
     )
 
     return {

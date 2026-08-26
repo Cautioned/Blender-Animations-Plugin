@@ -466,13 +466,15 @@ def facs_payload_from_mesh_data(mesh_data) -> Optional[dict]:
 
 
 def merge_facs_payloads(payloads) -> Optional[dict]:
-    payloads = [facs_payload_from_mesh_data(payload) if payload and "facs_data" in payload else _coerce_facs_payload(payload) for payload in payloads or []]
+    payloads = [facs_payload_from_mesh_data(payload) if payload and "facs_data" in payload else _coerce_facs_payload(
+        payload) for payload in payloads or []]
     payloads = [payload for payload in payloads if payload]
     if not payloads:
         return None
 
     merged = copy.deepcopy(payloads[0])
-    merged["face_bone_names"] = _ordered_unique(merged.get("face_bone_names") or merged.get("bone_pose_transforms", {}).keys())
+    merged["face_bone_names"] = _ordered_unique(merged.get(
+        "face_bone_names") or merged.get("bone_pose_transforms", {}).keys())
 
     for payload in payloads[1:]:
         for field in ("face_control_names", "facs_pose_names", "two_pose_correctives", "three_pose_correctives"):
@@ -647,7 +649,8 @@ def apply_facs_snapshot_to_armature(armature_obj, control_state=None, payload=No
         runtime.get("control_names") or [],
         control_state if control_state is not None else load_facs_control_state_from_armature(armature_obj, payload),
     )
-    state_signature = tuple(normalized_state.get(control_name, 0.0) for control_name in (runtime.get("control_names") or ()))
+    state_signature = tuple(normalized_state.get(control_name, 0.0)
+                            for control_name in (runtime.get("control_names") or ()))
     return _apply_runtime_solution(
         armature_obj,
         payload,

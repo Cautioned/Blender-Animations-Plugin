@@ -203,6 +203,12 @@ def _make_name_table():
     return b"Root\0Jaw\0"
 
 
+def _make_reordered_name_table():
+    # Bones use name_index=0 ("Jaw") and name_index=5 ("Root"). Pad so
+    # "Root" lands at byte offset 5, matching _make_bone(5).
+    return b"Jaw\0\0Root\0"
+
+
 def _flatten_matrix_rows(rows):
     return [value for row in rows for value in row]
 
@@ -274,8 +280,8 @@ def _make_quantized_transforms_block():
     )
 
 
-def _make_v4_mesh():
-    name_table = _make_name_table()
+def _make_v4_mesh(name_table=None):
+    name_table = name_table if name_table is not None else _make_name_table()
     header = struct.pack("<HHIIHHIHBB", 24, 0, 2, 1, 1, 2, len(name_table), 1, 0, 0)
     body = b"".join(
         [
@@ -291,6 +297,10 @@ def _make_v4_mesh():
         ]
     )
     return b"version 4.00\n" + header + body
+
+
+def _make_v4_mesh_with_reordered_name_table():
+    return _make_v4_mesh(name_table=_make_reordered_name_table())
 
 
 def _make_v5_facs_block():
@@ -319,8 +329,8 @@ def _make_v5_facs_block():
     )
 
 
-def _make_v5_mesh():
-    name_table = _make_name_table()
+def _make_v5_mesh(name_table=None):
+    name_table = name_table if name_table is not None else _make_name_table()
     facs_block = _make_v5_facs_block()
     header = struct.pack(
         "<HHIIHHIHBBII",
@@ -389,8 +399,8 @@ def _make_v5_mesh_with_invalid_facs_format():
     return b"version 5.00\n" + header + body
 
 
-def _make_v6_mesh():
-    name_table = _make_name_table()
+def _make_v6_mesh(name_table=None):
+    name_table = name_table if name_table is not None else _make_name_table()
     coremesh = b"".join(
         [
             struct.pack("<I", 2),
@@ -420,6 +430,10 @@ def _make_v6_mesh():
         ]
     )
     return b"version 6.00\n" + chunks
+
+
+def _make_v6_mesh_with_reordered_name_table():
+    return _make_v6_mesh(name_table=_make_reordered_name_table())
 
 
 def _make_lods_chunk(lod_type=1, num_high_quality_lods=1, lod_offsets=(0,)):
@@ -500,8 +514,44 @@ def _make_v6_mesh_with_facs():
     return b"version 6.00\n" + chunks
 
 
-def _make_v7_mesh():
-    name_table = _make_name_table()
+def _make_v6_mesh_with_facs_reordered():
+    name_table = _make_reordered_name_table()
+    facs_block = _make_v5_facs_block()
+    coremesh = b"".join(
+        [
+            struct.pack("<I", 2),
+            _make_vertex(0.0, 0.0, 0.0),
+            _make_vertex(1.0, 0.0, 0.0),
+            struct.pack("<I", 1),
+            _make_faces_block(),
+        ]
+    )
+    skinning = b"".join(
+        [
+            struct.pack("<I", 2),
+            _make_skinning_block(),
+            struct.pack("<I", 2),
+            _make_bone(0),
+            _make_bone(5),
+            struct.pack("<I", len(name_table)),
+            name_table,
+            struct.pack("<I", 1),
+            _make_subset(),
+        ]
+    )
+    facs_chunk = struct.pack("<I", len(facs_block)) + facs_block
+    chunks = b"".join(
+        [
+            b"COREMESH" + struct.pack("<II", 1, len(coremesh)) + coremesh,
+            b"SKINNING" + struct.pack("<II", 1, len(skinning)) + skinning,
+            b"FACS\0\0\0\0" + struct.pack("<II", 1, len(facs_chunk)) + facs_chunk,
+        ]
+    )
+    return b"version 6.00\n" + chunks
+
+
+def _make_v7_mesh(name_table=None):
+    name_table = name_table if name_table is not None else _make_name_table()
     coremesh = struct.pack("<I", 4) + b"DRCO"
     skinning = b"".join(
         [
@@ -557,6 +607,105 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(extract_asset_id("https://www.roblox.com/asset/?id=456"), 456)
         self.assertEqual(extract_asset_id("789"), 789)
 
+    def test_parse_v1_ascii_comma_separated_groups(self):
+        # Old v1.00 assets (e.g. the classic "Spiky Hair Mesh", asset
+        # 16627529) pack one comma-separated triplet per bracket group:
+        # "[x,y,z][nx,ny,nz][u,v,0]".  The tokenizer must split each group
+        # on commas or every value is silently dropped and the mesh parses
+        # to zero geometry.  Spec quirks also apply: v1.00 positions are
+        # halved and tex_V is flipped.
+        data = (
+            b"version 1.00\n"
+            b"1\n"
+            b"[0,0,0][0,0,1][0,0,0]"
+            b"[1,0,0][0,0,1][1,0,0]"
+            b"[0,1,0][0,0,1][0,1,0]\n"
+        )
+        parsed = parse_filemesh(data)
+        self.assertEqual(parsed["num_vertices"], 3)
+        self.assertEqual(len(parsed["faces"]), 1)
+        self.assertEqual(parsed["positions"][1], (0.5, 0.0, 0.0))
+        self.assertEqual(parsed["uvs"][2], (0.0, 0.0))
+        self.assertEqual(parsed["normals"][1], (0.0, 0.0, 1.0))
+
+    def test_parse_v1_ascii_single_float_groups(self):
+        # The even older layout wraps EACH float in its own brackets.
+        data = (
+            b"version 1.00\n"
+            b"1\n"
+            b"[0][0][0][0][0][1][0][0][0]"
+            b"[1][0][0][0][0][1][1][0][0]"
+            b"[0][1][0][0][0][1][0][1][0]\n"
+        )
+        parsed = parse_filemesh(data)
+        self.assertEqual(parsed["num_vertices"], 3)
+        self.assertEqual(len(parsed["faces"]), 1)
+        self.assertEqual(parsed["positions"][2], (0.0, 0.5, 0.0))
+        self.assertEqual(parsed["uvs"][0], (0.0, 1.0))
+        self.assertEqual(parsed["normals"][2], (0.0, 0.0, 1.0))
+
+    def test_parse_v1_01_keeps_scale_and_flips_v(self):
+        # v1.01 corrected the 2x size quirk but kept the upside-down tex_V.
+        data = (
+            b"version 1.01\n"
+            b"1\n"
+            b"[0,0,0][0,0,1][0,0,0]"
+            b"[2,0,0][0,0,1][1,0,0]"
+            b"[0,2,0][0,0,1][0,1,0]\n"
+        )
+        parsed = parse_filemesh(data)
+        self.assertEqual(parsed["num_vertices"], 3)
+        self.assertEqual(len(parsed["faces"]), 1)
+        self.assertEqual(parsed["positions"][1], (2.0, 0.0, 0.0))
+        self.assertEqual(parsed["uvs"][1], (1.0, 1.0))
+        self.assertEqual(parsed["normals"][0], (0.0, 0.0, 1.0))
+
+    def test_bundled_rbxasset_meshes_resolve_without_install(self):
+        # Every builtin uri the pipeline synthesizes must resolve to the
+        # addon's bundled copy (no local Roblox install required).
+        uris = [
+            "rbxasset://fonts/head.mesh",
+            "rbxasset://fonts/torso.mesh",
+            "rbxasset://fonts/leftarm.mesh",
+            "rbxasset://fonts/rightarm.mesh",
+            "rbxasset://fonts/leftleg.mesh",
+            "rbxasset://fonts/rightleg.mesh",
+            "rbxasset://avatar/compositing/R15CompositTorsoBase.mesh",
+            "rbxasset://avatar/compositing/R15CompositLeftArmBase.mesh",
+            "rbxasset://avatar/compositing/R15CompositRightArmBase.mesh",
+            "rbxasset://avatar/compositing/CompositTorsoBase.mesh",
+            "rbxasset://avatar/compositing/CompositLeftArmBase.mesh",
+            "rbxasset://avatar/compositing/CompositRightArmBase.mesh",
+            "rbxasset://avatar/compositing/CompositLeftLegBase.mesh",
+            "rbxasset://avatar/compositing/CompositRightLegBase.mesh",
+            "rbxasset://avatar/compositing/CompositShirtTemplate.mesh",
+            "rbxasset://avatar/compositing/CompositPantsTemplate.mesh",
+            "rbxasset://textures/face.png",
+        ]
+        for uri in uris:
+            path = filemesh._resolve_rbxasset_path(uri)
+            self.assertIsNotNone(path, f"no bundled copy for {uri}")
+            self.assertTrue(path.is_file(), f"bundled copy missing for {uri}")
+            self.assertIn("assets", path.parts)
+
+    def test_release_import_cache_discards_raw_and_parsed_meshes(self):
+        filemesh._FILEMESH_BYTES_CACHE["raw"] = b"mesh"
+        filemesh._FILEMESH_CACHE["parsed"] = {"vertices": [(0, 0, 0)]}
+        filemesh.release_import_cache()
+        self.assertFalse(filemesh._FILEMESH_BYTES_CACHE)
+        self.assertFalse(filemesh._FILEMESH_CACHE)
+
+    def test_imported_content_cannot_fetch_non_roblox_url(self):
+        self.assertTrue(filemesh.is_trusted_roblox_asset_url("https://tr.rbxcdn.com/asset"))
+        self.assertFalse(filemesh.is_trusted_roblox_asset_url("http://localhost/asset"))
+        self.assertFalse(filemesh.is_trusted_roblox_asset_url("https://roblox.com.evil.test/asset"))
+        with self.assertRaisesRegex(ValueError, "non-Roblox mesh URL"):
+            filemesh.fetch_filemesh_bytes("http://127.0.0.1:31337/private")
+        with self.assertRaisesRegex(ValueError, "local mesh path"):
+            filemesh.fetch_filemesh_bytes(
+                "file:///C:/not-a-roblox-mesh.mesh", allow_local_paths=False
+            )
+
     def test_fetch_url_response_retries_rate_limit_with_retry_after(self):
         opener = _FakeHttpOpener(
             [
@@ -584,6 +733,53 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(opener.calls, 1)
         sleep_mock.assert_not_called()
 
+    def test_authenticated_redirect_does_not_forward_bearer_to_cdn(self):
+        delivery = _FakeHttpOpener(
+            [_FakeHttpResponse(b"", {"Location": "https://cdn.example.test/mesh"})]
+        )
+        cdn = _FakeHttpOpener([_FakeHttpResponse(b"version 4.00\\n", {})])
+        openers = []
+
+        def build_opener(*handlers):
+            opener = delivery if handlers else cdn
+            openers.append((handlers, opener))
+            return opener
+
+        with mock.patch.object(filemesh.urllib.request, "build_opener", side_effect=build_opener):
+            data = filemesh._fetch_url_bytes(
+                "https://apis.roblox.com/asset-delivery-api/v1/assetId/123",
+                extra_headers={"Authorization": "Bearer secret"},
+            )
+
+        self.assertEqual(data, b"version 4.00\\n")
+        self.assertEqual(len(openers), 2)
+        self.assertTrue(openers[0][0])  # delivery request has redirects disabled
+        self.assertFalse(openers[1][0])  # signed CDN request is anonymous
+
+    def test_failed_authenticated_fetch_does_not_repeat_public_endpoints(self):
+        with mock.patch.object(
+            filemesh, "_try_delivery_urls", return_value=None
+        ) as delivery_mock:
+            with mock.patch.object(
+                filemesh, "_fetch_url_bytes", side_effect=RuntimeError("missing")
+            ):
+                with self.assertRaises(RuntimeError):
+                    filemesh.fetch_filemesh_bytes(
+                        "rbxassetid://123",
+                        auth_headers={"Authorization": "Bearer secret"},
+                    )
+
+        self.assertEqual(delivery_mock.call_count, 2)
+        first_urls = delivery_mock.call_args_list[0].args[0]
+        public_urls = delivery_mock.call_args_list[1].args[0]
+        self.assertEqual(first_urls, [
+            "https://apis.roblox.com/asset-delivery-api/v1/assetId/123"
+        ])
+        self.assertEqual(public_urls, [
+            "https://assetdelivery.roblox.com/v2/assetId/123",
+            "https://assetdelivery.roblox.com/v1/asset/?id=123",
+        ])
+
     def test_parse_v4_skinning(self):
         parsed = parse_filemesh(_make_v4_mesh())
         self.assertEqual(parsed["version"], "version 4.00")
@@ -601,6 +797,12 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
         self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
 
+    def test_parse_v4_skinning_uses_bone_array_index_not_name_table_order(self):
+        parsed = parse_filemesh(_make_v4_mesh_with_reordered_name_table())
+        self.assertEqual(parsed["bone_names"], ["Jaw", "Root"])
+        self.assertAlmostEqual(parsed["vertex_weights"][0]["Jaw"], 1.0)
+        self.assertAlmostEqual(parsed["vertex_weights"][1]["Root"], 1.0)
+
     def test_parse_v6_skinning_chunk(self):
         parsed = parse_filemesh(_make_v6_mesh())
         self.assertEqual(parsed["version"], "version 6.00")
@@ -610,6 +812,12 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(parsed["normals"][1], (0.0, 1.0, 0.0))
         self.assertAlmostEqual(parsed["vertex_weights"][0]["Root"], 1.0)
         self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
+
+    def test_parse_v6_skinning_uses_bone_array_index_not_name_table_order(self):
+        parsed = parse_filemesh(_make_v6_mesh_with_reordered_name_table())
+        self.assertEqual(parsed["bone_names"], ["Jaw", "Root"])
+        self.assertAlmostEqual(parsed["vertex_weights"][0]["Jaw"], 1.0)
+        self.assertAlmostEqual(parsed["vertex_weights"][1]["Root"], 1.0)
 
     def test_parse_v6_reads_lods_chunk_metadata(self):
         parsed = parse_filemesh(_make_v6_mesh_with_lods())
@@ -827,6 +1035,12 @@ class TestFileMeshParsing(unittest.TestCase):
             parsed["facs_data"]["bone_pose_transforms"]["FaceJaw"],
         )
 
+    def test_parse_v6_facs_chunk_keeps_name_keyed_weights_with_reordered_name_table(self):
+        parsed = parse_filemesh(_make_v6_mesh_with_facs_reordered())
+        self.assertEqual(parsed["bone_names"], ["Jaw", "Root"])
+        self.assertAlmostEqual(parsed["vertex_weights"][0]["Jaw"], 1.0)
+        self.assertAlmostEqual(parsed["vertex_weights"][1]["Root"], 1.0)
+
     def test_compute_facs_state_weights_matches_roblox_corrective_products(self):
         parsed = parse_filemesh(_make_v5_mesh())
         payload = facs_payload_from_mesh_data(parsed)
@@ -993,6 +1207,86 @@ class TestFileMeshParsing(unittest.TestCase):
         parsed = parse_filemesh(b"junk-prefix" + _make_v6_mesh())
         self.assertEqual(parsed["version"], "version 6.00")
         self.assertAlmostEqual(parsed["vertex_weights"][1]["Jaw"], 1.0)
+
+
+class TestContentDirDetection(unittest.TestCase):
+    """Cross-platform install-layout detection (no real Studio required)."""
+
+    def _content(self, base):
+        path = base / "content"
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "fonts").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def test_windows_newest_version_first(self):
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = self._content(root / "Roblox" / "Versions" / "old")
+            new = self._content(root / "Roblox" / "Versions" / "newer")
+            future = time.time() + 3600
+            os.utime(new.parent, (future, future))
+            candidates = filemesh._install_content_dirs(
+                "win32", root, {"LOCALAPPDATA": tmp}
+            )
+            self.assertEqual(candidates[0], new)
+            self.assertIn(old, candidates)
+
+    def test_linux_vinegar_versions(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = self._content(
+                root / ".vinegar" / "data" / "vinegar" / "versions" / "abc123"
+            )
+            candidates = filemesh._install_content_dirs("linux", root, {})
+            self.assertEqual(candidates[0], content)
+
+    def test_linux_bare_wine_users(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = self._content(
+                root / ".wine" / "drive_c" / "users" / "bob"
+                / "AppData" / "Local" / "Roblox" / "Versions" / "v"
+            )
+            candidates = filemesh._install_content_dirs("linux", root, {})
+            self.assertEqual(candidates[0], content)
+
+    def test_linux_grapejuice_prefixes(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = self._content(
+                root / ".local" / "share" / "grapejuice" / "prefixes" / "player"
+                / "drive_c" / "users" / "alice"
+                / "AppData" / "Local" / "Roblox" / "Versions" / "v"
+            )
+            candidates = filemesh._install_content_dirs("linux", root, {})
+            self.assertEqual(candidates[0], content)
+
+    def test_darwin_vinegar_versions(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = self._content(
+                root / "Library" / "Application Support" / "Vinegar"
+                / "Versions" / "abc"
+            )
+            candidates = filemesh._install_content_dirs("darwin", root, {})
+            self.assertIn(content, candidates)
 
 
 if __name__ == "__main__":

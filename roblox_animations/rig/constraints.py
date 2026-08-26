@@ -28,20 +28,42 @@ def link_object_to_bone_rigid(obj, ao, bone):
     constraint.inverse_matrix = (ao.matrix_world @ bone_mat).inverted()
 
 
-def auto_constraint_parts(armature_name, skip_objects=None):
+def _ensure_child_of_constraint(obj, armature, bone_name):
+    """Ensure obj has exactly one CHILD_OF constraint targeting the given bone."""
+    correct_constraint_found = False
+    for c in list(obj.constraints):
+        if c.type == "CHILD_OF":
+            is_correct_target = (c.target == armature)
+            is_correct_bone = (c.subtarget == bone_name)
+            if is_correct_target and is_correct_bone and not correct_constraint_found:
+                correct_constraint_found = True
+            else:
+                obj.constraints.remove(c)
+    if not correct_constraint_found:
+        constraint = obj.constraints.new(type="CHILD_OF")
+        constraint.target = armature
+        constraint.subtarget = bone_name
+
+
+def auto_constraint_parts(armature_name, skip_objects=None, inst_ref_to_bone=None):
     """Automatically constrain parts/meshes with matching bone names.
-    
+
     Uses position-based disambiguation when multiple bones share the same
     base name (e.g. "left hand", "left hand.001"). This prevents meshes
     from being constrained to the wrong bone on the opposite side of the rig.
-    
+
     Args:
         armature_name: Name of the armature to constrain parts to
         skip_objects: Set of objects to skip (already constrained authoritatively)
+        inst_ref_to_bone: Optional dict mapping rbxm instance referent to bone
+            name. When a mesh carries an RBXInstRef custom property, this map
+            is used authoritatively before any name-based fallback.
     """
     if skip_objects is None:
         skip_objects = set()
-        
+    if inst_ref_to_bone is None:
+        inst_ref_to_bone = {}
+
     armature = get_object_by_name(armature_name)
     if not armature:
         return False, f"Armature '{armature_name}' not found."
@@ -68,33 +90,54 @@ def auto_constraint_parts(armature_name, skip_objects=None):
     for bone in armature.data.bones:
         base = re.sub(r"\.\d+$", "", bone.name).lower()
         bone_groups[base].append(bone.name)
-    
+
     # Precompute bone head positions in world space for disambiguation
     bone_positions = {}
     for bone in armature.data.bones:
         bone_positions[bone.name] = armature.matrix_world @ bone.head_local
-    
+
     matched_parts = []
     used_bones = set()  # track which specific bones have been claimed
+
+    # Authoritative pass: rbxm instance referent -> bone name. This handles
+    # duplicate part names and renames that would confuse the name fallback.
+    if inst_ref_to_bone:
+        for obj in parts_collection.objects:
+            if obj.type != "MESH" or obj in skip_objects:
+                continue
+            ref = obj.get("RBXInstRef")
+            if ref is None:
+                continue
+            bone_name = inst_ref_to_bone.get(int(ref))
+            if not bone_name:
+                continue
+            if bone_name in used_bones:
+                continue
+            if bone_name not in armature.data.bones:
+                continue
+            used_bones.add(bone_name)
+            _ensure_child_of_constraint(obj, armature, bone_name)
+            matched_parts.append(obj.name)
+            skip_objects.add(obj)
 
     # Only process objects within this rig's parts collection
     for obj in parts_collection.objects:
         if obj.type == "MESH":
-            
+
             if obj in skip_objects:
                 continue
-                
+
             # Strip .001, .002 etc from name for matching
             base_name = re.sub(r"\.\d+$", "", obj.name).lower()
             bone_candidates = bone_groups.get(base_name)
             if not bone_candidates:
                 continue
-            
+
             # Filter out already-claimed bones
             available = [b for b in bone_candidates if b not in used_bones]
             if not available:
                 continue
-            
+
             # Pick the best bone: closest to the mesh's world center
             if len(available) == 1:
                 bone_name = available[0]
@@ -112,7 +155,7 @@ def auto_constraint_parts(armature_name, skip_objects=None):
                             max_co[i] = max(max_co[i], v.co[i])
                     local_center = Vector([(min_co[i] + max_co[i]) / 2.0 for i in range(3)])
                     mesh_center = obj.matrix_world @ local_center
-                
+
                 # Sort by distance to mesh center
                 def _bone_dist(bn):
                     return (bone_positions[bn] - mesh_center).length
@@ -120,25 +163,7 @@ def auto_constraint_parts(armature_name, skip_objects=None):
                 bone_name = available[0]
 
             used_bones.add(bone_name)
-
-            # Ensure exactly one correct Child Of constraint exists
-            correct_constraint_found = False
-            
-            for c in list(obj.constraints):
-                if c.type == "CHILD_OF":
-                    is_correct_target = (c.target == armature)
-                    is_correct_bone = (c.subtarget == bone_name)
-                    
-                    if is_correct_target and is_correct_bone and not correct_constraint_found:
-                        correct_constraint_found = True
-                    else:
-                        obj.constraints.remove(c)
-
-            if not correct_constraint_found:
-                constraint = obj.constraints.new(type="CHILD_OF")
-                constraint.target = armature
-                constraint.subtarget = bone_name
-            
+            _ensure_child_of_constraint(obj, armature, bone_name)
             matched_parts.append(obj.name)
 
     if not matched_parts:

@@ -48,6 +48,7 @@ local State = {
     animationData = nil :: { Types.KeyframeType }?,
     currentAnimTrack = nil :: Types.AnimationTrackType?,
     animationName = "KeyframeSequence",
+    animationDirty = Value(false),
 
     loadingEnabled = Value(false),
     loadingTitle = Value("Working"),
@@ -115,6 +116,12 @@ local State = {
     -- Animation simplifier
     simplifierEnabled = Value(false),
     simplifierStrength = Value(15),
+	mirrorAnimationEnabled = Value(false),
+	speedEnabled = Value(false),
+	speedMultiplier = Value(1),
+	resampleEnabled = Value(false),
+	resampleFps = Value(24),
+    animationModifierStack = Value({} :: { any }),
     lastRawAnimData = Value(nil :: any?),
     currentAnimationData = Value(nil :: any?),
     
@@ -126,6 +133,15 @@ local State = {
     
     -- Service references
     rigManager = nil :: any?,
+
+    -- Multi-rig session support. RigSessionManager owns the session table;
+    -- these values are the active-session compatibility view used by older services.
+    rigSessions = {} :: { [Instance]: any },
+    rigTabOrder = Value({} :: { Instance }),
+    activeSessionRig = Value(nil :: Instance?),
+    isAwaitingRigSelection = Value(false),
+    rigSessionRevision = Value(0),
+    rigSessionManager = nil :: any?,
 }
 
 State.displayWarnings = Computed(function()

@@ -9,7 +9,6 @@
 --!optimize 2
 
 local State = require(script.Parent.state)
-local Types = require(script.Parent.types)
 local PlaybackService = require(script.Parent.Services.PlaybackService)
 
 -- Import our new services
@@ -25,6 +24,8 @@ local RiggingTab = require(script.Parent.UI.Tabs.RiggingTab)
 local ToolsTab = require(script.Parent.UI.Tabs.ToolsTab)
 local MoreTab = require(script.Parent.UI.Tabs.MoreTab)
 local SharedComponents = require(script.Parent.UI.SharedComponents)
+local RigTabs = require(script.Parent.UI.Components.RigTabs)
+local RigSessionManager = require(script.Parent.RigSessionManager)
 
 local Plugin = plugin
 
@@ -56,20 +57,26 @@ local Children = Fusion.Children
 local OnEvent = Fusion.OnEvent
 local Value = Fusion.Value
 local Computed = Fusion.Computed
+local OnChange = Fusion.OnChange
 local Observer = Fusion.Observer
 
 local GLOBAL_HEADER_HEIGHT = 108
+local RIG_TABS_HEIGHT = 28  -- 0 when no rigs, 28 when rigs present
+-- Measured height of the auto-sizing global header (warnings can make it grow).
+local globalHeaderHeight = Value(GLOBAL_HEADER_HEIGHT)
 
 -- Initialize services
-local playbackService = PlaybackService.new(State, Types) :: any
+local playbackService = PlaybackService.new(State) :: any
 local cameraManager = CameraManager.new()
 local rigManager = RigManager.new(playbackService, cameraManager)
 local animationManager = AnimationManager.new(playbackService, Plugin)
-local exportManager = ExportManager.new()
+local exportManager = ExportManager.new(Plugin)
 local blenderSyncManager = BlenderSyncManager.new(playbackService, animationManager)
 
 
 State.rigManager = rigManager
+local rigSessionManager = RigSessionManager.new(State)
+State.rigSessionManager = rigSessionManager
 
 -- Create services object for passing to UI components
 local services = {
@@ -92,7 +99,7 @@ local function importAnimationFromClipboard()
 		return
 	end
 
-	services.playbackService:stopAnimationAndDisconnect()
+	services.playbackService:stopRigTrack(State.activeSessionRig:get())
 	local importScriptText = "Paste the animation data below this line"
 
 	services.exportManager:clearMetaParts()
@@ -128,14 +135,14 @@ end
 
 local function cleanupAll()
 	-- 1. Stop running processes (synchronously so it finishes before unload)
-	playbackService:stopAnimationAndDisconnect( { background = false } )
+	playbackService:stopAnimationAndDisconnect()
 	
 	blenderSyncManager:cleanup()
 
 	-- 2. Disconnect UI-related connections
 	cameraManager:cleanup()
 
-	-- 4. Reset state variables
+	-- 3. Reset state variables
 	State.loadingEnabled:set(false)
 	State.loadingTitle:set("Working")
 	State.loadingStatus:set("Please wait...")
@@ -159,82 +166,69 @@ local function cleanupAll()
 	State.activeRigExists:set(false)
 	State.isFinished:set(false)
 	rigManager:clearWarnings()
+
+	-- 4. Clear multi-rig sessions and playback tracks
+	playbackService._rigTracks = {}
+	rigSessionManager:clear()
+	State.rigTabOrder:set({})
+	State.isAwaitingRigSelection:set(false)
 end
 
-
-local function cleanupRigSelection()
-	-- This function is a subset of cleanupAll, intended for when a rig is deselected.
-	-- It resets rig-specific state without killing the Blender connection.
-	playbackService:stopAnimationAndDisconnect( { background = false } )
-
-	-- Reset state variables related to the rig
-	State.loadingEnabled:set(false)
-	State.loadingTitle:set("Working")
-	State.loadingStatus:set("Please wait...")
-	State.loadingDetail:set("")
-	State.loadingProgress:set(0)
-	State.loadingCanEstimate:set(false)
-	State.rigModelName:set("No Rig Selected")
-	State.keyframeStats:set({ count = 0, totalDuration = 0 })
-	State.playhead:set(0)
-	State.keyframeNames:set({})
-	State.savedAnimations:set({})
-	State.selectedSavedAnim:set(nil)
-	State.activeRigModel = nil
-	State.activeAnimator = nil
-	State.activeRig = nil
-	State.currentKeyframeSequence = nil
-	State.isPlaying:set(false)
-	State.isReversed:set(false)
-	State.animationData = nil
-	State.activeRigExists:set(false)
-	State.isFinished:set(false)
-	rigManager:clearWarnings()
-end
 
 -- Function to update the active rig based on the current selection in Studio
 local function updateActiveRigFromSelection()
 	if State.widgetsEnabled:get(true) and not State.isSelectionLocked:get() then
-		local selectedRig = false
 		local selection = Selection:Get()
-		if #selection > 0 and not selectedRig then
-			local selectedObject = selection[1] -- Consider the first object in the selection
+		if #selection > 0 then
+			local selectedObject = selection[1]
 
 			if rigManager:isKeyframeSequence(selectedObject) then
-				-- Set the flag if a KeyframeSequence is selected and do nothing
 				State.lastSelectionWasKeyframeSequence = true
 				return
 			end
 
 			if rigManager:isValidRig(selectedObject) then
 				if State.lastSelectionWasKeyframeSequence then
-					-- If the last selection was a KeyframeSequence, do not update the rig
 					State.lastSelectionWasKeyframeSequence = false
 					return
 				end
 
-				if State.activeRigModel ~= selectedObject then
-					-- Proceed to set the rig only if it is valid, not a KeyframeSequence, and different from the current rig
-					State.animationLength:set(0)
-					State.animationData = nil
-					State.activeRigExists:set(true)
-					rigManager:clearWarnings()
-					State.loadingEnabled:set(true) -- Enable loading indicator
-					State.activeRigModel = selectedObject
-					State.activeRig = nil
-					task.spawn(function()
-						rigManager:setRig(selectedObject)
-					end)
+				if rigSessionManager:contains(selectedObject) then
+					RigTabs._switchToRig(services, selectedObject)
+					return
 				end
-				selectedRig = true
-			else
-				cleanupRigSelection()
+
+				local currentRig = State.activeSessionRig:get()
+				if currentRig and not State.isAwaitingRigSelection:get() then
+					-- Outside explicit multi-rig selection, replace the sole session.
+					playbackService:stopRigTrack(currentRig)
+					rigSessionManager:remove(currentRig)
+					State.rigTabOrder:set({})
+					State.activeSessionRig:set(nil)
+				end
+
+				rigSessionManager:createAndActivate(selectedObject)
+				RigTabs.addRigTab(selectedObject)
+				State.isAwaitingRigSelection:set(false)
+				State.animationLength:set(0)
+				State.animationData = nil
+				State.animationDirty:set(false)
+				State.activeRigExists:set(true)
+				rigManager:clearWarnings()
+				State.loadingEnabled:set(true)
+				State.activeRigModel = selectedObject
+				State.activeRig = nil
+				rigSessionManager:saveActive()
+
+				task.spawn(function()
+					rigManager:setRig(selectedObject)
+					if State.activeSessionRig:get() == selectedObject then
+						rigSessionManager:saveActive()
+					end
+				end)
 			end
 		elseif #selection == 0 then
 			State.lastSelectionWasKeyframeSequence = false
-			if State.activeRigModel then
-				cleanupRigSelection()
-			end
 		end
 	end
 end
@@ -320,18 +314,6 @@ do -- Creates the plugin
 		end,
 	})
 	
-	local helpButton = ToolbarButton({
-		Plugin = Plugin,
-		Toolbar = pluginToolbar,
-		ClickableWhenViewportHidden = true,
-		Name = "READ!!!",
-		ToolTip = "Open Help Widget",
-		Image = "rbxassetid://112326668147130",
-
-		[OnEvent("Click")] = function()
-			(State.helpWidgetEnabled :: any):set(not (State.helpWidgetEnabled :: any):get())
-		end,
-	})
 	
 	-- Add observer for toolbar button image changes
 	table.insert(State.observers, Observer(State.toolbarButtonImage):onChange(function()
@@ -378,16 +360,7 @@ do -- Creates the plugin
 			end) :: any
 	)
 	
-	-- Handle help widget enabled/disabled
-	table.insert(
-		State.observers,
-		(Observer(State.helpWidgetEnabled :: any) :: any):onChange(function(isEnabled: boolean)
-				if helpButton and helpButton.Parent then
-					helpButton:SetActive(isEnabled)
-				end
-				return nil
-			end) :: any
-	)
+
 
 	-- Load saved settings
     local savedDockSide = plugin:GetSetting("DockSide")
@@ -629,6 +602,12 @@ do -- Creates the plugin
 		More = MoreTab.create(services),
 	}
 
+	-- Build rig tabs bar once
+	local rigTabsBar = RigTabs.create(services)
+
+	-- Dynamic Y offset (rig tabs bar is always present with at least the + button)
+	local rigTabsOffset = RIG_TABS_HEIGHT
+
 	local function makeTabFrame(tabName: string, children)
 		local tabChildren = {
 			_UIListLayout = New("UIListLayout")({
@@ -692,6 +671,40 @@ do -- Creates the plugin
 
 	-- Create the main widget
 	local function pluginWidget()
+		-- The header auto-sizes with its content (warnings can add lines), so
+		-- the scroll area below offsets by the measured height instead of a
+		-- fixed constant; otherwise long warnings overflow the header box.
+		local globalHeaderFrame = nil :: any
+		local globalHeader = New("Frame")({
+			Name = "GlobalHeader",
+			ZIndex = 1,
+			Size = UDim2.new(1, -40, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			Position = Computed(function()
+				return if State.dockSide:get() == Enum.InitialDockState.Left
+					then UDim2.fromOffset(40, rigTabsOffset)
+					else UDim2.fromOffset(0, rigTabsOffset)
+			end),
+			BackgroundTransparency = 1,
+			[Children] = {
+				SharedComponents.createHeaderUI(services),
+				New("Frame")({
+					Name = "HeaderDivider",
+					AnchorPoint = Vector2.new(0, 1),
+					Position = UDim2.new(0, 0, 1, 0),
+					Size = UDim2.new(1, 0, 0, 1),
+					BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Border),
+					BorderSizePixel = 0,
+				}),
+			},
+			[OnChange("AbsoluteSize")] = function()
+				if globalHeaderFrame then
+					globalHeaderHeight:set((globalHeaderFrame :: Frame).AbsoluteSize.Y)
+				end
+			end,
+		})
+		globalHeaderFrame = globalHeader
+
 		return Widget({
 			Plugin = Plugin,
 			Id = "BlenderAnimationsMain",
@@ -707,10 +720,11 @@ do -- Creates the plugin
 				BackgroundTransparency = 1,
 				[Children] = {
 					createTabsUI(),
+					-- Horizontal rig tabs (multi-rig support)
 					New("Frame")({
-						Name = "GlobalHeader",
-						ZIndex = 1,
-						Size = UDim2.new(1, -40, 0, GLOBAL_HEADER_HEIGHT),
+						Name = "RigTabsContainer",
+						ZIndex = 2,
+						Size = UDim2.new(1, -40, 0, RIG_TABS_HEIGHT),
 						Position = Computed(function()
 							return if State.dockSide:get() == Enum.InitialDockState.Left
 								then UDim2.fromOffset(40, 0)
@@ -718,24 +732,19 @@ do -- Creates the plugin
 						end),
 						BackgroundTransparency = 1,
 						[Children] = {
-							SharedComponents.createHeaderUI(services),
-							New("Frame")({
-								Name = "HeaderDivider",
-								AnchorPoint = Vector2.new(0, 1),
-								Position = UDim2.new(0, 0, 1, 0),
-								Size = UDim2.new(1, 0, 0, 1),
-								BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.Border),
-								BorderSizePixel = 0,
-							}),
+							rigTabsBar,
 						},
 					}),
+					globalHeader,
 					ScrollFrame({
 						ZIndex = 1,
-						Size = UDim2.new(1, -40, 1, -GLOBAL_HEADER_HEIGHT),
+						Size = Computed(function()
+							return UDim2.new(1, -40, 1, -(globalHeaderHeight:get() + rigTabsOffset))
+						end),
 						Position = Computed(function()
 							return if State.dockSide:get() == Enum.InitialDockState.Left
-								then UDim2.fromOffset(40, GLOBAL_HEADER_HEIGHT)
-								else UDim2.fromOffset(0, GLOBAL_HEADER_HEIGHT)
+								then UDim2.fromOffset(40, globalHeaderHeight:get() + rigTabsOffset)
+								else UDim2.fromOffset(0, globalHeaderHeight:get() + rigTabsOffset)
 						end),
 						BackgroundTransparency = 1,
 						AutomaticCanvasSize = Enum.AutomaticSize.Y,
@@ -768,74 +777,7 @@ do -- Creates the plugin
 		handleMainWidgetEnabledChanged(false)
 	end)
 	
-	-- Create the help widget
-	local helpWidget = Widget({
-		Plugin = Plugin,
-		Id = "BlenderAnimationsHelp",
-		Name = "IMPORTANT READ ME!!!",
-		InitialDockTo = Enum.InitialDockState.Float,
-		InitialEnabled = false,
-		ForceInitialEnabled = false,
-		FloatingSize = Vector2.new(400, 500),
-		MinimumSize = Vector2.new(400, 500),
-		Enabled = State.helpWidgetEnabled,
-		[Children] = {
-			New("UIPadding")({
-				PaddingLeft = UDim.new(0, 10),
-				PaddingRight = UDim.new(0, 10),
-				PaddingTop = UDim.new(0, 16),
-				PaddingBottom = UDim.new(0, 16),
-			}),
-			New("UIListLayout")({
-				SortOrder = Enum.SortOrder.LayoutOrder,
-				Padding = UDim.new(0, 8),
-			}),
-			VerticalCollapsibleSection({
-				Text = "MAJOR UPDATE AVAILABLE!",
-				Collapsed = false,
-				LayoutOrder = 2,
-				[Children] = {
-					New("Frame")({
-						Size = UDim2.new(1, 0, 0, 64),
-						BackgroundTransparency = 1,
-						LayoutOrder = 1,
-						[Children] = {
-							New("ImageLabel")({
-								Size = UDim2.new(0, 64, 0, 64),
-								Position = UDim2.new(0.5, 0, 0.5, 0),
-								AnchorPoint = Vector2.new(0.5, 0.5),
-								BackgroundTransparency = 1,
-								Image = "rbxassetid://92189642379919",
-							}),
-						},
-					}),
-					Label({
-						LayoutOrder = 1,
-						Text = "Please download the new Blender addon from Blender or Github to use this plugin. There has been a major update as you can probably tell. It is way more stable, fixes nearly all of the previous bugs, and has a lot of new features you will enjoy. This addon will continue to be free forever. I strongly recommend you update, and I hope you like the new logo. If you still wish to use clipboard and file export, you can still do so by enabling them in the More tab, HOWEVER the Server Sync has additional features that you would really miss out on. Also the new addon supports up to Blender 5.0+, godspeed my fellow animators. \n\n —Cautioned",
-						TextWrapped = true,
-					}),
-					TextInput({
-						LayoutOrder = 2,
-						Text = "https://extensions.blender.org/approval-queue/roblox-animations-importer-exporter/",
-					}),
-					TextInput({
-						LayoutOrder = 3,
-						Text = "https://github.com/Cautioned/Blender-Animations-Plugin/releases",
-					}),
-					TextInput({
-						LayoutOrder = 4,
-						Text = "Copy and paste the URL into your browser to download the addon.",
-					}),
-				},
-			}),
-		},
-	})
-	table.insert(State.connections, helpWidget:GetPropertyChangedSignal("Enabled"):Connect(function()
-		handleHelpWidgetEnabledChanged(helpWidget.Enabled)
-	end))
-	helpWidget:BindToClose(function()
-		handleHelpWidgetEnabledChanged(false)
-	end)
+
 end
 
 if not State.selectionConnection or not State.selectionConnection.Connected then

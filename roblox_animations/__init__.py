@@ -1,8 +1,8 @@
 """
-Roblox Animations Blender Addon - Modular Version
+Roblox Animations Blender Addon.
 
-This addon provides tools for importing Roblox rigs and exporting animations
-with live sync capabilities to Roblox Studio.
+Import Roblox rigs/places (.rbxm/.rbxl) and export animations back to
+Roblox Studio, with optional live sync and OAuth-based Studio auth.
 """
 
 import bpy
@@ -17,8 +17,80 @@ class RbxAnimationsPreferences(AddonPreferences):
 
     bl_idname = __name__
 
+    roblox_content_path: bpy.props.StringProperty(
+        name="Roblox Content Folder",
+        description=(
+            "Path to Roblox's 'content' folder (or a version/Versions folder "
+            "containing it). Used for builtin meshes, fonts, and clothing "
+            "compositing guides. Leave empty to derive it from the Roblox "
+            "Studio install location automatically, or press Auto-Detect to "
+            "fill it in."
+        ),
+        subtype="DIR_PATH",
+        default="",
+    )
+
     def draw(self, context):
-        pass
+        layout = self.layout
+        row = layout.row(align=True)
+        row.prop(self, "roblox_content_path")
+        row.operator(
+            "preferences.rbxanims_auto_detect_content",
+            text="Auto-Detect",
+        )
+        if not self.roblox_content_path:
+            try:
+                from .rig.filemesh import detect_roblox_content_dir
+
+                detected = detect_roblox_content_dir()
+            except Exception:
+                detected = None
+            if detected:
+                layout.label(
+                    text=f"Detected: {detected}", icon="CHECKMARK"
+                )
+            else:
+                layout.label(
+                    text="No Roblox Studio install found; the import falls "
+                    "back to install-derived detection automatically.",
+                    icon="INFO",
+                )
+
+
+class RbxAnimationsAutoDetectContent(bpy.types.Operator):
+    """Derive the Roblox content folder from the Studio install location."""
+
+    bl_idname = "preferences.rbxanims_auto_detect_content"
+    bl_label = "Auto-Detect Roblox Content Folder"
+    bl_description = (
+        "Fill the Roblox content folder from the Roblox Studio install "
+        "location (newest version wins)"
+    )
+    bl_options = {"REGISTER", "INTERNAL"}
+
+    def execute(self, context):
+        from .rig.filemesh import detect_roblox_content_dir
+
+        found = detect_roblox_content_dir()
+        prefs = None
+        package = (__name__ or "").split(".")
+        for end in range(len(package), 0, -1):
+            addon = context.preferences.addons.get(".".join(package[:end]))
+            prefs = getattr(addon, "preferences", None) if addon else None
+            if prefs is not None:
+                break
+        if prefs is None:
+            self.report({"ERROR"}, "Could not locate the addon preferences.")
+            return {"CANCELLED"}
+        if not found:
+            self.report(
+                {"ERROR"},
+                "No Roblox Studio install found; set the folder manually.",
+            )
+            return {"CANCELLED"}
+        prefs.roblox_content_path = found
+        self.report({"INFO"}, f"Roblox content folder: {found}")
+        return {"FINISHED"}
 
 
 # Define bl_info directly to avoid import issues
@@ -26,7 +98,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (2, 6, 3),
+    "version": (3, 0, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -58,6 +130,7 @@ _classes = [
     ),  # must register before ImportModel uses it
     _resolve_operator_class("OBJECT_OT_ApplyWeaponImport", fallback_module="import_ops"),
     _resolve_operator_class("OBJECT_OT_ImportModel", fallback_module="import_ops"),
+    _resolve_operator_class("OBJECT_OT_ImportRbxm", fallback_module="import_ops"),
     _resolve_operator_class("OBJECT_OT_ImportFbxAnimation", fallback_module="import_ops"),
     # Rig operators
     _resolve_operator_class("OBJECT_OT_GenRig"),
@@ -89,7 +162,6 @@ _classes = [
     _resolve_operator_class("OBJECT_OT_Bake_File"),
     _resolve_operator_class("OBJECT_OT_ValidateMotionPaths"),
     _resolve_operator_class("OBJECT_OT_ClearMotionPathValidation"),
-    _resolve_operator_class("OBJECT_OT_RunTests"),
     # Constraint operators
     _resolve_operator_class("OBJECT_OT_AutoConstraint"),
     _resolve_operator_class("OBJECT_OT_ManualConstraint"),
@@ -105,8 +177,9 @@ _classes = [
     _resolve_operator_class("OBJECT_OT_RbxOAuthLogout", fallback_module="auth_ops"),
     # UI panels
     getattr(ui, "OBJECT_PT_RbxAnimations", None),
-    getattr(ui, "OBJECT_PT_RbxAnimations_Tool", None),
+  
     # Addon preferences (must be last so bl_idname resolves correctly)
+    RbxAnimationsAutoDetectContent,
     RbxAnimationsPreferences,
 ]
 CLASSES = tuple(cls for cls in _classes if cls is not None)
@@ -221,14 +294,14 @@ def unregister():
             cleanup_validation_draw_handlers()
         except Exception:
             pass
-        
+
         # Clean up physics handlers and data
         try:
             from .rig.physics import cleanup_physics
             cleanup_physics()
         except Exception:
             pass
-        
+
         # Clean up COM visualization
         try:
             from .rig.com import (

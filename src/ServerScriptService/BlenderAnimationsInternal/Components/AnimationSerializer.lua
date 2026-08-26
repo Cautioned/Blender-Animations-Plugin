@@ -90,7 +90,9 @@ function AnimationSerializer:serialize(keyframeSequence: KeyframeSequence, rig: 
 				local pose = descendants[j]
 				if pose:IsA("Pose") then
 					local weight = (pose :: any).Weight
-					if type(weight) == "number" and weight > 0 then
+					local isStructuralDeformRoot = isDeformRig
+						and pose:GetAttribute("BlenderAnimationsStructuralRoot") == true
+					if not isStructuralDeformRoot and type(weight) == "number" and weight > 0 then
 						state[pose.Name] = {
 							components = { pose.CFrame:GetComponents() },
 							easingStyle = pose.EasingStyle.Name,

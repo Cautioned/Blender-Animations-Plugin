@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "source": "TemplateR15.rbxm",
+  "coordinate_space": "Roblox studs, relative to HumanoidRootPart",
+  "bones": [
+    {"name": "HumanoidRootPart", "parent": null, "position": [0.0, 0.0, 0.0]},
+    {"name": "LowerTorso", "parent": "HumanoidRootPart", "position": [0.0, -0.800028, 0.0]},
+    {"name": "UpperTorso", "parent": "LowerTorso", "position": [0.0, 0.199983, 0.0]},
+    {"name": "Head", "parent": "UpperTorso", "position": [0.0, 1.5, 0.0]},
+    {"name": "LeftUpperArm", "parent": "UpperTorso", "position": [-1.5, 0.368673, 0.0]},
+    {"name": "LeftLowerArm", "parent": "LeftUpperArm", "position": [-1.5, -0.224072, 0.0]},
+    {"name": "LeftHand", "parent": "LeftLowerArm", "position": [-1.5, -0.850046, 0.0]},
+    {"name": "RightUpperArm", "parent": "UpperTorso", "position": [1.500001, 0.368673, 0.0]},
+    {"name": "RightLowerArm", "parent": "RightUpperArm", "position": [1.5, -0.224072, 0.0]},
+    {"name": "RightHand", "parent": "RightLowerArm", "position": [1.5, -0.850046, 0.0]},
+    {"name": "LeftUpperLeg", "parent": "LowerTorso", "position": [-0.5, -1.420782, 0.0]},
+    {"name": "LeftLowerLeg", "parent": "LeftUpperLeg", "position": [-0.5, -2.200903, 0.0]},
+    {"name": "LeftFoot", "parent": "LeftLowerLeg", "position": [-0.5, -2.85, 0.0]},
+    {"name": "RightUpperLeg", "parent": "LowerTorso", "position": [0.5, -1.420782, 0.000048]},
+    {"name": "RightLowerLeg", "parent": "RightUpperLeg", "position": [0.5, -2.200903, 0.0]},
+    {"name": "RightFoot", "parent": "RightLowerLeg", "position": [0.5, -2.85, 0.0]}
+  ]
+}

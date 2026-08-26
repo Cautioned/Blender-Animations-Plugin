@@ -13,39 +13,40 @@ from ..core.utils import pose_bone_set_hidden
 
 def has_ik_constraint(ao: "bpy.types.Object", pose_bone: "bpy.types.PoseBone") -> bool:
     """Check if the given pose bone has an IK constraint applied to it.
-    
+
     Also checks if this bone is an IK target/pole bone (created by our IK system).
     """
     # Check if this bone has an IK constraint
     for constraint in pose_bone.constraints:
         if constraint.type == "IK":
             return True
-    
+
     # Check if this is an IK target or pole bone we created
     bone_name = pose_bone.name
     if bone_name.endswith("-IKTarget") or bone_name.endswith("-IKPole"):
         return True
-    
+
     # Check if any bone in the armature has an IK constraint targeting this bone
     for other_bone in ao.pose.bones:
         for constraint in other_bone.constraints:
             if constraint.type == "IK":
                 if constraint.subtarget == bone_name or constraint.pole_subtarget == bone_name:
                     return True
-    
+
     return False
 
 
-def get_ik_constraint(ao: "bpy.types.Object", pose_bone: "bpy.types.PoseBone") -> Optional["bpy.types.KinematicConstraint"]:
+def get_ik_constraint(ao: "bpy.types.Object",
+                      pose_bone: "bpy.types.PoseBone") -> Optional["bpy.types.KinematicConstraint"]:
     """Get the IK constraint for the given pose bone.
-    
+
     If the bone is an IK target/pole, finds the constraint that uses it.
     """
     # Check if this bone has an IK constraint directly
     for constraint in pose_bone.constraints:
         if constraint.type == "IK":
             return constraint
-    
+
     # If this is an IK target or pole bone, find the bone that uses it
     bone_name = pose_bone.name
     if bone_name.endswith("-IKTarget") or bone_name.endswith("-IKPole"):
@@ -54,7 +55,7 @@ def get_ik_constraint(ao: "bpy.types.Object", pose_bone: "bpy.types.PoseBone") -
                 if constraint.type == "IK":
                     if constraint.subtarget == bone_name or constraint.pole_subtarget == bone_name:
                         return constraint
-    
+
     return None
 
 
@@ -64,7 +65,7 @@ def update_pole_axis(
     target_axis: Vector
 ) -> None:
     """Update the pole bone position to change the IK bend direction.
-    
+
     This repositions the pole bone to face the specified axis direction,
     which changes which way the IK chain bends. The pole is positioned
     perpendicular to the chain, offset in the target axis direction.
@@ -73,12 +74,12 @@ def update_pole_axis(
     ik_constraint = get_ik_constraint(ao, pose_bone)
     if not ik_constraint:
         return
-    
+
     # Get the pole bone name
     pole_bone_name = ik_constraint.pole_subtarget
     if not pole_bone_name:
         return
-    
+
     # Get the bone that has the IK constraint (the chain end)
     constrained_bone = None
     for bone in ao.pose.bones:
@@ -88,13 +89,13 @@ def update_pole_axis(
                 break
         if constrained_bone:
             break
-    
+
     if not constrained_bone:
         return
-    
+
     # Ensure depsgraph is up-to-date before reading bone properties
     bpy.context.view_layer.update()
-    
+
     # Gather chain bones
     chain_count = ik_constraint.chain_count
     chain_bones = [constrained_bone]
@@ -102,10 +103,10 @@ def update_pole_axis(
     while current and len(chain_bones) < chain_count:
         chain_bones.append(current)
         current = current.parent
-    
+
     if len(chain_bones) < 2:
         return
-    
+
     # Calculate chain geometry using rest-space coordinates (bone.head_local/tail_local)
     # NOT pose-space PoseBone.head/.tail, which include current pose transforms
     # and would produce wrong results when the rig isn't in rest pose.
@@ -113,22 +114,22 @@ def update_pole_axis(
     chain_start = chain_bones[-1].bone.head_local.copy()  # Start of chain (e.g., hip)
     chain_vector = chain_end - chain_start
     chain_length = chain_vector.length
-    
+
     # Find the middle joint (elbow/knee) - this is where the bend happens
     if len(chain_bones) >= 2:
         middle_joint = chain_bones[-1].bone.tail_local.copy()  # Joint between upper and lower
     else:
         middle_joint = (chain_start + chain_end) / 2
-    
+
     # Calculate pole position: offset from middle joint in the target axis direction
     # Use a distance proportional to the chain length for visibility
     pole_distance = chain_length * 0.5
     new_pole_head = middle_joint + target_axis.normalized() * pole_distance
-    
+
     # Switch to edit mode to move the pole bone
     bpy.context.view_layer.objects.active = ao
     bpy.ops.object.mode_set(mode="EDIT")
-    
+
     amt = ao.data
     pole_edit_bone = amt.edit_bones.get(pole_bone_name)
     if pole_edit_bone:
@@ -136,9 +137,9 @@ def update_pole_axis(
         pole_tail_offset = target_axis.normalized() * 0.3
         pole_edit_bone.head = new_pole_head
         pole_edit_bone.tail = new_pole_head + pole_tail_offset
-    
+
     bpy.ops.object.mode_set(mode="POSE")
-    
+
     # Adjust the pole angle to match the new direction
     # This helps the IK solver understand the intended bend direction
     ik_constraint.pole_angle = _calculate_pole_angle(
@@ -148,44 +149,44 @@ def update_pole_axis(
 
 def _calculate_pole_angle(
     chain_start: Vector,
-    middle_joint: Vector, 
+    middle_joint: Vector,
     chain_end: Vector,
     pole_pos: Vector
 ) -> float:
     """Calculate the optimal pole angle for the given chain and pole position.
-    
+
     This ensures the IK chain bends toward the pole correctly.
     """
     # Vector from start to end (the "straight" chain direction)
     chain_dir = (chain_end - chain_start).normalized()
-    
+
     # Vector from middle joint to pole
     to_pole = (pole_pos - middle_joint).normalized()
-    
+
     # Project to_pole onto the plane perpendicular to the chain
     # This gives us the "bend direction"
     to_pole_projected = to_pole - chain_dir * to_pole.dot(chain_dir)
     if to_pole_projected.length < 0.0001:
         return -math.pi * 0.5  # Default angle
     to_pole_projected.normalize()
-    
+
     # Calculate the current bend direction from the chain geometry
     upper_bone_dir = (middle_joint - chain_start).normalized()
     current_bend = upper_bone_dir - chain_dir * upper_bone_dir.dot(chain_dir)
     if current_bend.length < 0.0001:
         return -math.pi * 0.5
     current_bend.normalize()
-    
+
     # Calculate angle between current bend and desired pole direction
     dot = current_bend.dot(to_pole_projected)
     dot = max(-1.0, min(1.0, dot))  # Clamp for numerical stability
     angle = math.acos(dot)
-    
+
     # Determine sign using cross product
     cross = current_bend.cross(to_pole_projected)
     if cross.dot(chain_dir) < 0:
         angle = -angle
-    
+
     return angle - math.pi * 0.5
 
 
@@ -204,7 +205,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
         while current and len(chain_bones) < chain_count:
             chain_bones.append(current)
             current = current.parent
-        
+
         # Remove stretch drivers from chain bones
         for bone in chain_bones:
             pose_bone = ao.pose.bones.get(bone.name)
@@ -214,20 +215,20 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                     pose_bone.driver_remove("scale", 1)
                 except Exception:
                     pass
-        
+
         # Remove IK constraint influence driver (from IK-FK switch)
         try:
             constraint.driver_remove("influence")
         except Exception:
             pass
-        
+
         # Remove Copy Rotation/Location constraints and their drivers from child bones (foot/hand)
         if tail_bone.children:
             child_bone = tail_bone.children[0]
             constraints_to_remove = [
-                c for c in child_bone.constraints 
+                c for c in child_bone.constraints
                 if c.name in ("IK_CopyRotation", "IK_CopyLocation") or
-                   (c.type in ("COPY_ROTATION", "COPY_LOCATION") and 
+                (c.type in ("COPY_ROTATION", "COPY_LOCATION") and
                     c.subtarget and c.subtarget.endswith("-IKTarget"))
             ]
             for c in constraints_to_remove:
@@ -237,7 +238,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                 except Exception:
                     pass
                 child_bone.constraints.remove(c)
-            
+
             # Unhide the child bone if it was hidden by IK setup
             if constraints_to_remove:
                 child_data_bone = ao.data.bones.get(child_bone.name)
@@ -245,7 +246,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                     child_pose_bone = ao.pose.bones.get(child_bone.name)
                     if child_pose_bone:
                         pose_bone_set_hidden(child_pose_bone, False)
-    
+
     to_clear = []
     ik_target_names = []
     ik_pole_names = []
@@ -256,7 +257,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
         if constraint.pole_target and constraint.pole_subtarget:
             to_clear.append((constraint.pole_target, constraint.pole_subtarget))
             ik_pole_names.append(constraint.pole_subtarget)
-        
+
         # Also check for stretch bone
         ik_target_name = constraint.subtarget
         if ik_target_name:
@@ -265,7 +266,7 @@ def remove_ik_config(ao: "bpy.types.Object", tail_bone: "bpy.types.PoseBone") ->
                 to_clear.append((ao, stretch_bone_name))
 
         tail_bone.constraints.remove(constraint)
-    
+
     # Remove hide drivers from IK target and pole bones (from IK-FK switch)
     for name in ik_target_names + ik_pole_names:
         bone = ao.data.bones.get(name)
@@ -295,10 +296,10 @@ def setup_ik_stretch(
     max_stretch: float = 1.05,
 ) -> None:
     """Set up stretch drivers for IK chain to prevent knee/elbow popping.
-    
+
     Uses a dedicated stretch bone that spans from chain root to IK target.
     The stretch bone's Y scale is used to drive the chain bones' scale.
-    
+
     Args:
         ao: The armature object.
         chain_bones: List of pose bones in the IK chain (from tail to root).
@@ -308,17 +309,17 @@ def setup_ik_stretch(
     """
     if len(chain_bones) < 2:
         return
-    
+
     # Calculate the total rest length of the chain
     total_rest_length = 0
     for bone in chain_bones:
         total_rest_length += bone.bone.length
-    
+
     # Get the stretch bone
     stretch_bone = ao.pose.bones.get(stretch_bone_name)
     if not stretch_bone:
         return
-    
+
     # Add Stretch To constraint to the stretch bone so it always points to IK target
     stretch_constraint = stretch_bone.constraints.new(type='STRETCH_TO')
     stretch_constraint.target = ao
@@ -328,7 +329,7 @@ def setup_ik_stretch(
     stretch_constraint.bulge = 0  # No volume preservation
     stretch_constraint.keep_axis = 'PLANE_X'
     stretch_constraint.volume = 'NO_VOLUME'  # Don't scale X/Z, only Y
-    
+
     # For each bone in the chain, add a driver that reads the stretch bone's scale
     for pose_bone in chain_bones:
         # Add driver to scale Y (bone length axis)
@@ -336,15 +337,15 @@ def setup_ik_stretch(
             pose_bone.driver_remove("scale", 1)
         except Exception:
             pass
-        
+
         driver = pose_bone.driver_add("scale", 1)
         if not driver:
             continue
-            
+
         fcurve = driver
         drv = fcurve.driver
         drv.type = 'SCRIPTED'
-        
+
         # Variable: Y scale of the stretch bone
         var_scale = drv.variables.new()
         var_scale.name = "s"
@@ -353,7 +354,7 @@ def setup_ik_stretch(
         var_scale.targets[0].bone_target = stretch_bone_name
         var_scale.targets[0].transform_type = 'SCALE_Y'
         var_scale.targets[0].transform_space = 'LOCAL_SPACE'
-        
+
         # Smooth IK stretch formula with no hard threshold:
         # Uses a smooth blend that:
         # - Returns ~1.0 when s < 1.0 (chain not fully extended)
@@ -365,7 +366,7 @@ def setup_ik_stretch(
         # This is C1 continuous (smooth derivative) at all points
         max_s = max_stretch
         soft = 0.02  # Controls how quickly it ramps up (lower = sharper)
-        
+
         # Expression: smooth quadratic blend
         # x = max(0, s - 1)  -- how far past full extension
         # blend = x*x / (soft + x*x)  -- smooth 0->1 as x increases
@@ -384,12 +385,12 @@ def setup_ik_fk_switch(
     copy_rot_bone_name: Optional[str] = None,
 ) -> None:
     """Set up an IK-FK switch with a custom property and drivers.
-    
+
     Creates an 'IK_FK' custom property on the IK target bone that controls:
     - IK constraint influence (1 = IK, 0 = FK)
     - Copy Rotation/Location constraint influences
     - IK target and pole bone visibility
-    
+
     Args:
         ao: The armature object.
         ik_target_name: Name of the IK target bone.
@@ -400,27 +401,27 @@ def setup_ik_fk_switch(
     ik_target_pose = ao.pose.bones.get(ik_target_name)
     if not ik_target_pose:
         return
-    
+
     # Add custom property for IK-FK switch
     # 1.0 = Full IK, 0.0 = Full FK
     ik_target_pose["IK_FK"] = 1.0
-    
+
     # Set up property with min/max and description
     id_props = ik_target_pose.id_properties_ui("IK_FK")
-    id_props.update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0, 
+    id_props.update(min=0.0, max=1.0, soft_min=0.0, soft_max=1.0,
                     description="IK-FK Blend (1=IK, 0=FK)")
-    
+
     # Get the bone with IK constraint
     constrained_pose_bone = ao.pose.bones.get(constrained_bone_name)
     if not constrained_pose_bone:
         return
-    
+
     # Find the IK constraint and add driver to its influence
     for constraint in constrained_pose_bone.constraints:
         if constraint.type == "IK":
             _add_ikfk_driver(ao, constraint, "influence", ik_target_name)
             break
-    
+
     # Add drivers to Copy Rotation/Location constraints if they exist
     if copy_rot_bone_name:
         copy_rot_pose_bone = ao.pose.bones.get(copy_rot_bone_name)
@@ -428,12 +429,12 @@ def setup_ik_fk_switch(
             for constraint in copy_rot_pose_bone.constraints:
                 if constraint.name in ("IK_CopyRotation", "IK_CopyLocation"):
                     _add_ikfk_driver(ao, constraint, "influence", ik_target_name)
-    
+
     # Add driver to hide IK target bone when in FK mode
     ik_target_bone = ao.data.bones.get(ik_target_name)
     if ik_target_bone:
         _add_ikfk_hide_driver(ao, ik_target_bone, ik_target_name)
-    
+
     # Add driver to hide pole bone when in FK mode
     if ik_pole_name:
         ik_pole_bone = ao.data.bones.get(ik_pole_name)
@@ -452,14 +453,14 @@ def _add_ikfk_driver(
         constraint.driver_remove(prop_name)
     except Exception:
         pass
-    
+
     driver = constraint.driver_add(prop_name)
     if not driver:
         return
-    
+
     drv = driver.driver
     drv.type = 'AVERAGE'  # Simple copy of the value
-    
+
     var = drv.variables.new()
     var.name = "ikfk"
     var.type = 'SINGLE_PROP'
@@ -478,21 +479,21 @@ def _add_ikfk_hide_driver(
         bone.driver_remove("hide")
     except Exception:
         pass
-    
+
     driver = bone.driver_add("hide")
     if not driver:
         return
-    
+
     drv = driver.driver
     drv.type = 'SCRIPTED'
-    
+
     var = drv.variables.new()
     var.name = "ikfk"
     var.type = 'SINGLE_PROP'
     var.targets[0].id = ao
     safe_name = bpy.utils.escape_identifier(ik_target_name)
     var.targets[0].data_path = f'pose.bones["{safe_name}"]["IK_FK"]'
-    
+
     # Hide when IK_FK < 0.5 (FK mode)
     drv.expression = "ikfk < 0.5"
 
@@ -511,7 +512,7 @@ def create_ik_config(
     """create ik target (and optional pole) and apply an ik constraint.
 
     returns (ik_target_bone_name, ik_pole_bone_name_or_none).
-    
+
     Args:
         ao: The armature object.
         tail_bone: The bone at the end of the IK chain.
@@ -573,7 +574,7 @@ def create_ik_config(
 
     ik_pole_name: Optional[str] = None
     ik_stretch_name: Optional[str] = None
-    
+
     if create_pose_bone:
         # gather the actual chain bones up to chain_count
         chain_bones = [tail_bone]
@@ -616,7 +617,7 @@ def create_ik_config(
     if enable_stretch and len(chain_bones_edit) >= 2:
         chain_root = chain_bones_edit[-1]  # Root of chain (e.g., hip)
         chain_end = chain_bones_edit[0]    # End of chain (e.g., ankle)
-        
+
         ik_stretch = amt.edit_bones.new(ik_name_stretch)
         ik_stretch.head = chain_root.head.copy()
         ik_stretch.tail = chain_end.tail.copy()
@@ -637,7 +638,7 @@ def create_ik_config(
     if ik_target_pose:
         # Use a distinct color for IK target (yellow/gold)
         ik_target_pose.color.palette = 'THEME06'
-    
+
     if ik_pole_name:
         ik_pole_pose = ao.pose.bones.get(ik_pole_name)
         if ik_pole_pose:
@@ -673,7 +674,7 @@ def create_ik_config(
             # Apply to the first child of the tail bone
             copy_rot_bone = tail_pose_bone.children[0]
             copy_rot_bone_name = copy_rot_bone.name
-            
+
             # Copy Rotation - foot matches IK control orientation
             copy_rot = copy_rot_bone.constraints.new(type="COPY_ROTATION")
             copy_rot.name = "IK_CopyRotation"
@@ -682,7 +683,7 @@ def create_ik_config(
             copy_rot.mix_mode = 'REPLACE'
             copy_rot.owner_space = 'WORLD'
             copy_rot.target_space = 'WORLD'
-            
+
             # Copy Location - foot stays attached to IK control
             copy_loc = copy_rot_bone.constraints.new(type="COPY_LOCATION")
             copy_loc.name = "IK_CopyLocation"
@@ -691,7 +692,7 @@ def create_ik_config(
             copy_loc.head_tail = 0  # Use head of IK target
             copy_loc.owner_space = 'WORLD'
             copy_loc.target_space = 'WORLD'
-            
+
             # Hide the controlled bone since the IK target now represents it
             controlled_pose_bone = ao.pose.bones.get(copy_rot_bone_name)
             if controlled_pose_bone:
@@ -709,7 +710,7 @@ def create_ik_config(
                 chain_pose_bones.append(pb)
             current = current.parent
             count += 1
-        
+
         setup_ik_stretch(ao, chain_pose_bones, ik_name, ik_stretch_name, max_stretch=max_stretch)
 
     # Set up IK-FK switch if requested

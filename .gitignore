@@ -27,6 +27,7 @@ __pycache__/
 .ruff_cache
 .pytest_cache
 .mypy_cache
+.venv
 
 # OS specific
 .DS_Store
@@ -51,6 +52,8 @@ scripts/
 dist/
 build/
 tools/
+!tools/
+!tools/benchmark_niquests_http2.py
 
 # Temporary files
 *wally
@@ -65,3 +68,12 @@ tools/
 # IDE specific
 .vscode/settings.json
 .vscode/launch.json
+.agents
+
+*.rbxl
+*.rbxm
+parts.obj
+parts.mtl
+
+*pyrightconfig.json
+*ruff.toml

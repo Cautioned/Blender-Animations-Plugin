@@ -94,10 +94,19 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             row.operator(
                 "object.rbxanims_importmodel", text="Import Rig (.obj)", icon="IMPORT"
             )
+            row = setup_box.row()
+            row.operator(
+                "object.rbxanims_import_rbxm", text="Import Roblox (.rbxm/.rbxl)", icon="IMPORT"
+            )
         else:
             setup_box.operator(
                 "object.rbxanims_importmodel",
                 text="Import New Rig (.obj)",
+                icon="IMPORT",
+            )
+            setup_box.operator(
+                "object.rbxanims_import_rbxm",
+                text="Import Roblox (.rbxm/.rbxl)",
                 icon="IMPORT",
             )
 
@@ -129,8 +138,10 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         if auth.is_login_in_progress():
             account_box.label(text="Logging in…", icon="TIME")
             account_box.operator("rbx.oauth_cancel_login", text="Cancel", icon="CANCEL")
-        elif auth.is_logged_in():
-            account_box.label(text="Authenticated", icon="CHECKMARK")
+        elif auth.has_saved_login():
+            # Do not refresh tokens from panel drawing. Refresh is an implementation
+            # detail of the next authenticated request, not user-facing state.
+            account_box.label(text="Connected", icon="CHECKMARK")
             account_box.operator("rbx.oauth_logout", text="Log Out", icon="LOCKED")
         elif not online_access_allowed:
             account_box.label(text="Online access is disabled in Blender preferences.", icon="ERROR")
@@ -231,18 +242,18 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                     # Check if this is an IK target bone with IK_FK property
                     if b.name.endswith("-IKTarget") and "IK_FK" in b:
                         selected_ik_target = b
-        
+
         if has_ik:
             ik_row.operator("object.rbxanims_modifyik", text="Modify IK")
         else:
             ik_row.operator("object.rbxanims_genik", text="Generate IK")
         ik_row.operator("object.rbxanims_removeik", text="Remove IK")
-        
+
         # World-space unparent/reparent
         ws_row = col.row(align=True)
         ws_row.operator("object.rbxanims_worldspace_unparent", text="Unparent")
         ws_row.operator("object.rbxanims_worldspace_reparent", text="Reparent")
-        
+
         # Show indicator if any bones are world-space unparented
         if selected_armature:
             ws_bones = [
@@ -255,7 +266,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                     text=f"{len(ws_bones)} bone(s) world-space",
                     icon="UNLINKED",
                 )
-        
+
         # Show IK-FK slider if an IK target with the property is selected
         if selected_ik_target:
             ikfk_box = col.box()
@@ -266,12 +277,12 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
             toggle_row = ikfk_box.row(align=True)
             toggle_row.operator("object.rbxanims_set_ikfk", text="IK").value = 1.0
             toggle_row.operator("object.rbxanims_set_ikfk", text="FK").value = 0.0
-        
+
         # --- Center of Mass Sub-section ---
         col.separator()
         com_row = col.row(align=True)
         com_row.label(text="Center of Mass:", icon="PIVOT_MEDIAN")
-        
+
         # Check if COM is enabled for THIS armature
         try:
             from ..rig.com import is_com_for_armature, is_com_grid_enabled
@@ -281,14 +292,14 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         except Exception:
             com_enabled = False
             grid_enabled = False
-        
+
         com_row.operator(
-            "object.rbxanims_toggle_com", 
-            text="", 
+            "object.rbxanims_toggle_com",
+            text="",
             icon="HIDE_OFF" if com_enabled else "HIDE_ON",
             depress=com_enabled
         )
-        
+
         # Grid toggle (only visible when COM is enabled)
         if com_enabled:
             com_row.operator(
@@ -297,12 +308,12 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                 icon="MESH_CIRCLE" if grid_enabled else "MESH_CIRCLE",
                 depress=grid_enabled
             )
-        
+
         com_actions = col.row(align=True)
-        
+
         # COM controls: only expose Weights editing (pivot control removed)
         com_actions.operator("object.rbxanims_edit_com_weights", text="Weights")
-        
+
         # # --- AutoPhysics Sub-section ---
         # col.separator()
         # physics_row = col.row(align=True)
@@ -381,13 +392,13 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         #         icon=state_icons.get(trajectory_summary.get("state"), "QUESTION"),
         #     )
         #     state_row.prop(settings, "rbx_physics_gravity", text="")
-            
+
         #     # COM manipulation tools
         #     col.separator()
         #     com_tools = col.row(align=True)
         #     com_tools.operator("rbx.com_gizmo_modal", text="Move COM", icon="ORIENTATION_CURSOR")
         #     com_tools.operator("rbx.snap_rig_to_ground", text="", icon="IMPORT")
-        
+
         # col.separator()
         # if is_skinned_rig:
         #     col.label(text="Mesh (Deform) Rig Detected", icon="BONE_DATA")
@@ -449,14 +460,13 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         # # # Add test button to setup section so it's always visible
         # dev_box.label(text="Developer Options", icon='SCRIPT')
         # dev_box.separator()
-        # dev_box.operator("object.rbxanims_run_tests", text="Run Tests", icon='SCRIPT')
 
         # --- Validation Sub-panel ---
         validation_box = inner_box.box()
         validation_box.label(text="UGC Emote Validation", icon="CHECKMARK")
         row = validation_box.row(align=True)
         if settings:
-            row.prop(settings, "rbx_max_studs_per_frame", text="Max studs/frame @30fps")
+            row.prop(settings, "rbx_max_studs_per_frame", text="Motion warning @30fps")
         row = validation_box.row(align=True)
         row.operator(
             "object.rbxanims_validate_motionpaths",
@@ -465,48 +475,3 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
         )
         row.operator("object.rbxanims_clear_motionpaths", text="Clear", icon="TRASH")
 
-
-class OBJECT_PT_RbxAnimations_Tool(bpy.types.Panel):
-    bl_label = "Rbx Animations"
-    bl_idname = "OBJECT_PT_RbxAnimations_Tool"
-    bl_category = "Tool"  # Add to the Tool tab
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-
-    @classmethod
-    def poll(cls, context):
-        # Always show the panel
-        return True
-
-    def draw(self, context):
-        layout = self.layout
-        scene = context.scene
-        settings = getattr(scene, "rbx_anim_settings", None)
-
-        # Essentials
-        layout.operator(
-            "object.rbxanims_importmodel", text="Import Rig (.obj)", icon="IMPORT"
-        )
-        layout.operator(
-            "object.rbxanims_genrig", text="Generate Armature", icon="ARMATURE_DATA"
-        )
-
-        layout.separator()
-
-        scene_objects = context.scene.objects if context.scene else []
-        armatures_exist = any(obj.type == "ARMATURE" for obj in scene_objects)
-        if not armatures_exist:
-            return
-
-        layout.prop(settings, "rbx_anim_armature", text="Rig")
-        selected_armature = (
-            get_object_by_name(settings.rbx_anim_armature) if settings else None
-        )
-
-        row = layout.row(align=True)
-        row.enabled = selected_armature is not None
-        row.operator("object.rbxanims_bake", text="Bake", icon="EXPORT")
-        row.operator("object.rbxanims_bake_file", text="Bake to File", icon="FILE_TICK")
-
-        layout.separator()
-        layout.label(text="See 'Rbx Animations' panel for more options")

@@ -80,4 +80,4 @@ class OBJECT_OT_RbxOAuthLogout(Operator):
     def poll(cls, context):
         from ..core import auth
 
-        return auth.is_logged_in()
+        return auth.has_saved_login()

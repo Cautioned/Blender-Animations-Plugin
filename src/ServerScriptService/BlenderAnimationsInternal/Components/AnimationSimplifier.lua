@@ -45,6 +45,50 @@ local function roundValue(v: number, places: number): number
 	return math.round(v * mult) / mult
 end
 
+local function roundNumberArray(values: any, places: number)
+	if type(values) ~= "table" then
+		return
+	end
+
+	for i = 1, #values do
+		if type(values[i]) == "number" then
+			values[i] = roundValue(values[i], places)
+		end
+	end
+end
+
+local function roundCFrameData(cframeData: any, places: number)
+	if type(cframeData) ~= "table" then
+		return
+	end
+
+	if type(cframeData.components) == "table" then
+		roundNumberArray(cframeData.components, places)
+	elseif type(cframeData[1]) == "table" then
+		roundNumberArray(cframeData[1], places)
+	else
+		roundNumberArray(cframeData, places)
+	end
+end
+
+local function roundFaceControlData(controlData: any, places: number)
+	if type(controlData) == "number" then
+		return roundValue(controlData, places)
+	end
+
+	if type(controlData) ~= "table" then
+		return controlData
+	end
+
+	if type(controlData.value) == "number" then
+		controlData.value = roundValue(controlData.value, places)
+	elseif type(controlData[1]) == "number" then
+		controlData[1] = roundValue(controlData[1], places)
+	end
+
+	return controlData
+end
+
 local function arrayEqualWithinTolerance(a: {number}, b: {number}, startIdx: number, endIdx: number, tolerance: number): boolean
 	for i = startIdx, endIdx do
 		if math.abs((a[i] or 0) - (b[i] or 0)) > tolerance then
@@ -259,21 +303,15 @@ function M.roundPrecision(keyframes: {any}, decimalPlaces: number?)
 		end
 		local pose = kf.kf
 		if pose then
-			for boneName, cframe in pairs(pose) do
-				if type(cframe) == "table" then
-					for j = 1, #cframe do
-						cframe[j] = roundValue(cframe[j], decimalPlaces)
-					end
-				end
+			for _, cframe in pairs(pose) do
+				roundCFrameData(cframe, decimalPlaces)
 			end
 		end
 
 		local fc = kf.fc
 		if fc then
 			for controlName, controlData in pairs(fc) do
-				if type(controlData) == "table" and type(controlData.value) == "number" then
-					controlData.value = roundValue(controlData.value, decimalPlaces)
-				end
+				fc[controlName] = roundFaceControlData(controlData, decimalPlaces)
 			end
 		end
 	end

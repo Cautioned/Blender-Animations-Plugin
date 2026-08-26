@@ -173,12 +173,14 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
             return
 
         elif self.path.startswith("/export_animation/"):
-            armature_name_encoded = self.path.split("/")[-1]
+            parsed_url = urllib.parse.urlparse(self.path)
+            armature_name_encoded = parsed_url.path.split("/")[-1]
             # Use quote_plus to handle both %20 and + for spaces consistently
             armature_name = urllib.parse.unquote_plus(armature_name_encoded)
             try:
                 task_id = str(time.time())
-                pending_requests.append(("export_animation", task_id, armature_name))
+                live_preview = urllib.parse.parse_qs(parsed_url.query).get("live_preview", ["0"])[0] == "1"
+                pending_requests.append(("export_animation", task_id, armature_name, None, live_preview))
 
                 # Process immediately to avoid timer delay
                 from .requests import process_pending_requests
@@ -217,7 +219,40 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Handle POST requests for importing animations from Roblox"""
-        if self.path.startswith("/export_animation/"):
+        if self.path.startswith("/export_animation_delta/"):
+            parsed_url = urllib.parse.urlparse(self.path)
+            armature_name = urllib.parse.unquote_plus(parsed_url.path.split("/")[-1])
+            try:
+                content_length = int(self.headers.get("Content-Length", 0) or 0)
+                request_data = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length else {}
+                target_bone_rest = request_data.get("target_bone_rest") if isinstance(request_data, dict) else None
+                base_hash = request_data.get("base_hash", "") if isinstance(request_data, dict) else ""
+                task_id = str(time.time())
+                pending_requests.append(("export_animation", task_id, armature_name,
+                                        target_bone_rest, False, base_hash))
+                from .requests import process_pending_requests
+                process_pending_requests()
+                start_time = time.time()
+                while task_id not in pending_responses:
+                    if time.time() - start_time > 5:
+                        self.send_detailed_error(408, "Request timeout")
+                        return
+                    time.sleep(0.01)
+                success, data = pending_responses.pop(task_id)
+                if not success:
+                    self.send_detailed_error(500, data)
+                    return
+                self.send_response(200)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as exc:
+                self.send_detailed_error(500, str(exc))
+                traceback.print_exc()
+
+        elif self.path.startswith("/export_animation/"):
             parsed_url = urllib.parse.urlparse(self.path)
             armature_name_encoded = parsed_url.path.split("/")[-1]
             armature_name = urllib.parse.unquote_plus(armature_name_encoded)
@@ -225,6 +260,7 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
             try:
                 content_length = int(self.headers.get("Content-Length", 0) or 0)
                 target_bone_rest = None
+                live_preview = urllib.parse.parse_qs(parsed_url.query).get("live_preview", ["0"])[0] == "1"
                 if content_length > 0:
                     post_data = self.rfile.read(content_length)
                     request_data = json.loads(post_data.decode("utf-8"))
@@ -233,7 +269,7 @@ class AnimationHandler(http.server.BaseHTTPRequestHandler):
 
                 task_id = str(time.time())
                 pending_requests.append(
-                    ("export_animation", task_id, armature_name, target_bone_rest)
+                    ("export_animation", task_id, armature_name, target_bone_rest, live_preview)
                 )
 
                 from .requests import process_pending_requests

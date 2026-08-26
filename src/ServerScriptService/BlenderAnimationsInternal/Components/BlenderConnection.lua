@@ -82,7 +82,7 @@ function BlenderConnection:ListArmatures(port: number)
 	return data.armatures
 end
 
-function BlenderConnection:ImportAnimation(port: number, armatureName: string, targetBoneRest: any?)
+function BlenderConnection:ImportAnimation(port: number, armatureName: string, targetBoneRest: any?, livePreview: boolean?)
 	if type(port) ~= "number" or port <= 0 then
 		warn("Invalid port for ImportAnimation")
 		return nil
@@ -94,6 +94,9 @@ function BlenderConnection:ImportAnimation(port: number, armatureName: string, t
 
 	local success, response = pcall(function()
 		local url = string.format("http://localhost:%d/export_animation/%s", port, self.HttpService:UrlEncode(armatureName))
+		if livePreview then
+			url ..= "?live_preview=1"
+		end
 		if targetBoneRest then
 			return self.HttpService:RequestAsync({
 				Url = url,
@@ -133,6 +136,31 @@ function BlenderConnection:ImportAnimation(port: number, armatureName: string, t
 		warn(errorMsg)
 		return nil
 	end
+end
+
+function BlenderConnection:ImportAnimationDelta(port: number, armatureName: string, targetBoneRest: any?, baseHash: string)
+	if type(port) ~= "number" or port <= 0 or type(armatureName) ~= "string" or armatureName == "" then
+		return nil
+	end
+	local success, response = pcall(function()
+		return self.HttpService:RequestAsync({
+			Url = string.format("http://localhost:%d/export_animation_delta/%s", port, self.HttpService:UrlEncode(armatureName)),
+			Method = "POST" :: HttpMethod,
+			Body = self.HttpService:JSONEncode({
+				target_bone_rest = targetBoneRest,
+				base_hash = baseHash,
+			}),
+			Headers = {
+				["Accept"] = "application/octet-stream",
+				["Content-Type"] = "application/json",
+			},
+			Compress = Enum.HttpCompression.None,
+		})
+	end)
+	if success and response and response.Success then
+		return response.Body
+	end
+	return nil
 end
 
 function BlenderConnection:ExportAnimation(port: number, animationData: any, targetArmature: string?)

@@ -100,8 +100,13 @@ local function addMotorNameAlias(self: any, aliasMap: { [string]: any }, aliasNa
 
 	local existingAlias = aliasMap[aliasName]
 	if existingAlias and existingAlias ~= rigPart then
-		if getAnimationChannelPriority(existingAlias) >= 2 and getAnimationChannelPriority(rigPart) >= 2 then
-			markAmbiguousAnimationChannel(self, aliasName)
+		-- Same-name joints are only ambiguous when they hang off the same
+		-- parent. Under different hierarchies the first one wins and the
+		-- channel resolves deterministically.
+		if existingAlias.parent == rigPart.parent then
+			if getAnimationChannelPriority(existingAlias) >= 2 and getAnimationChannelPriority(rigPart) >= 2 then
+				markAmbiguousAnimationChannel(self, aliasName)
+			end
 		end
 		return
 	end
@@ -620,40 +625,7 @@ local function buildFaceControlPose(
 		return exact
 	end
 
-	local prevTime: number? = nil
-	local nextTime: number? = nil
-	for poseTime, _ in pairs(controlTimeline) do
-		if poseTime < t then
-			if prevTime == nil or poseTime > prevTime then
-				prevTime = poseTime
-			end
-		elseif poseTime > t then
-			if nextTime == nil or poseTime < nextTime then
-				nextTime = poseTime
-			end
-		end
-	end
-
-	if prevTime == nil then
-		return nil
-	end
-
-	local prevPose = controlTimeline[prevTime]
-	if not prevPose then
-		return nil
-	end
-
-	local nextPose = nextTime and controlTimeline[nextTime] or nil
-	if prevPose.easingStyle == "Constant" or not nextPose or nextTime == nil then
-		return prevPose
-	end
-
-	local alpha = (t - prevTime) / (nextTime - prevTime)
-	return {
-		value = prevPose.value + ((nextPose.value - prevPose.value) * alpha),
-		easingStyle = prevPose.easingStyle,
-		easingDirection = prevPose.easingDirection,
-	}
+	return nil
 end
 
 local function createFaceControlsFolder(
@@ -688,6 +660,29 @@ local function createFaceControlsFolder(
 	end
 
 	return folder
+end
+
+local function findHeadPose(root: Instance): Pose?
+	for _, descendant in ipairs(root:GetDescendants()) do
+		if descendant:IsA("Pose") and descendant.Name == "Head" then
+			return descendant
+		end
+	end
+	return nil
+end
+
+local function getOrCreateHeadPose(keyframe: Keyframe): Pose
+	local existing = findHeadPose(keyframe)
+	if existing then
+		return existing
+	end
+
+	local headPose = Instance.new("Pose")
+	headPose.Name = "Head"
+	headPose.CFrame = CFrame.new()
+	headPose.Weight = 0
+	headPose.Parent = keyframe
+	return headPose
 end
 
 function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
@@ -826,7 +821,7 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 			if rigPart and poseData then
 				local cfc
 				local easingStyle = "Linear" -- Default
-				local easingDirection = "In" -- Default
+				local easingDirection = "Out" -- Default
 
                 -- Accept multiple formats:
                 -- 1) New array: [ [components], "EasingStyle"?, "EasingDirection"? ]
@@ -932,6 +927,114 @@ function Rig:LoadAnimation(data, progressCallback: LoadProgressCallback?)
 	end
 end
 
+function Rig:ApplyAnimationDelta(delta: any, data: any): boolean
+	if type(delta) ~= "table" or type(delta.upsert) ~= "table" or type(delta.remove) ~= "table" then
+		return false
+	end
+	local timeScale = 1
+	if type(data.export_info) == "table" and data.export_info.time_unit == "frames" then
+		local fps = tonumber(data.export_info.fps)
+		if fps and fps > 0 then
+			timeScale = 1 / fps
+		end
+	end
+
+	local function clearTime(rawTime: number)
+		local time = rawTime * timeScale
+		if self.root then
+			self.root:RemovePose(time)
+		end
+		for _, rigPart in pairs(self:GetRigParts()) do
+			rigPart:RemovePose(time)
+		end
+		for _, timeline in pairs(self.faceControls) do
+			timeline[time] = nil
+		end
+	end
+
+	for _, rawTime in ipairs(delta.remove) do
+		if type(rawTime) ~= "number" then
+			return false
+		end
+		clearTime(rawTime)
+	end
+
+	local dataIsDeformRig = data.is_deform_rig or data.is_deform_bone_rig
+	for _, keyframe in ipairs(delta.upsert) do
+		if type(keyframe) ~= "table" or type(keyframe.t) ~= "number" then
+			return false
+		end
+		clearTime(keyframe.t)
+		local time = keyframe.t * timeScale
+		local poses = if type(keyframe.kf) == "table" then keyframe.kf else {}
+		for partName, poseData in pairs(poses) do
+			if type(partName) ~= "string" or string.sub(partName, -7) == "_deform" then
+				continue
+			end
+			local rigPart = self:FindRigPart(partName)
+			if not rigPart or type(poseData) ~= "table" then
+				continue
+			end
+			local components = poseData
+			local easingStyle = "Linear"
+			local easingDirection = "Out"
+			if type(poseData[1]) == "table" then
+				components = poseData[1]
+				easingStyle = poseData[2] or easingStyle
+				easingDirection = poseData[3] or easingDirection
+			elseif type(poseData.components) == "table" then
+				components = poseData.components
+				easingStyle = poseData.easingStyle or easingStyle
+				easingDirection = poseData.easingDirection or easingDirection
+			end
+			if #components < 12 then
+				return false
+			end
+			local numeric = table.create(12)
+			for index = 1, 12 do
+				numeric[index] = tonumber(components[index])
+				if numeric[index] == nil then
+					return false
+				end
+			end
+			for axis = 0, 2 do
+				local x = numeric[4 + axis]
+				local y = numeric[7 + axis]
+				local z = numeric[10 + axis]
+				local lengthSq = x * x + y * y + z * z
+				if lengthSq > 1e-8 then
+					local invLength = 1 / math.sqrt(lengthSq)
+					numeric[4 + axis] = x * invLength
+					numeric[7 + axis] = y * invLength
+					numeric[10 + axis] = z * invLength
+				elseif axis == 0 then
+					numeric[4], numeric[7], numeric[10] = 1, 0, 0
+				elseif axis == 1 then
+					numeric[5], numeric[8], numeric[11] = 0, 1, 0
+				else
+					numeric[6], numeric[9], numeric[12] = 0, 0, 1
+				end
+			end
+			local isDeform = keyframe.kf[partName .. "_deform"] ~= nil
+				or (dataIsDeformRig and rigPart.part:IsA("Bone"))
+			rigPart:AddPose(time, CFrame.new(unpack(numeric)), isDeform, easingStyle, easingDirection)
+		end
+		if type(keyframe.fc) == "table" then
+			for controlName, faceData in pairs(keyframe.fc) do
+				local value, easingStyle, easingDirection = decodeFaceControlState(faceData)
+				self.faceControls[controlName] = self.faceControls[controlName] or {}
+				self.faceControls[controlName][time] = {
+					value = value,
+					easingStyle = easingStyle,
+					easingDirection = easingDirection,
+				}
+			end
+		end
+	end
+	self.animTime = data.t * timeScale
+	return true
+end
+
 function Rig:ToRobloxAnimation(progressCallback: LoadProgressCallback?)
 	if not self.root then
 		return nil
@@ -1035,7 +1138,7 @@ function Rig:ToRobloxAnimation(progressCallback: LoadProgressCallback?)
 
 		local faceFolder = createFaceControlsFolder(self.faceControls, t)
 		if faceFolder then
-			faceFolder.Parent = kf
+			faceFolder.Parent = getOrCreateHeadPose(kf)
 		end
 
 		if progressCallback and (keyframeCount % LOAD_KEYFRAME_YIELD_INTERVAL == 0 or keyframeCount == #sortedTimes) then

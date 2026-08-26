@@ -180,7 +180,8 @@ class OBJECT_OT_Bake(bpy.types.Operator):
             )
             self.report(
                 {"INFO"},
-                f"Baked {rig_type} animation data exported to clipboard ({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS).",
+                f"Baked {rig_type} animation data exported to clipboard "
+                f"({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS).",
             )
         except Exception as e:
             self.report({"ERROR"}, f"Error during baking: {str(e)}")
@@ -258,7 +259,8 @@ class OBJECT_OT_Bake_File(Operator, ExportHelper):
             )
             self.report(
                 {"INFO"},
-                f"Baked {rig_type} animation data exported to {filepath} ({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS).",
+                f"Baked {rig_type} animation data exported to {filepath} "
+                f"({num_keyframes} keyframes, {duration:.2f} seconds, {desired_fps} FPS).",
             )
             return {"FINISHED"}
         except Exception as e:

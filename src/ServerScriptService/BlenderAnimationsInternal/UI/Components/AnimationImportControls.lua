@@ -53,7 +53,7 @@ local function createLegacyImportSection(services: any, layoutOrder: number, sel
 					return State.activeRigExists:get() and State.enableClipboardExport:get()
 				end),
 				Activated = function(): nil
-					services.playbackService:stopAnimationAndDisconnect()
+					services.playbackService:stopRigTrack(State.activeSessionRig:get())
 					local importScriptText = "Paste the animation data below this line"
 
 					services.exportManager:clearMetaParts()

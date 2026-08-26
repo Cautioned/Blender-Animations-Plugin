@@ -10,8 +10,9 @@ local BaseXX = require(script.Parent.Parent.Components.BaseXX)
 local ExportManager = {}
 ExportManager.__index = ExportManager
 
-function ExportManager.new()
+function ExportManager.new(pluginRef: Plugin?)
 	local self = setmetatable({}, ExportManager)
+	self._plugin = pluginRef
 	return self
 end
 
@@ -550,6 +551,45 @@ function ExportManager:generateMetadataLegacy(
 		meshToBone = meshToBoneData,
 		version = "1.6",
 	}
+end
+
+-- Export the active rig as a binary .rbxm via Studio's save dialog.
+-- The Blender addon's .rbxm importer reads the joint tree directly from the
+-- binary, so no meta parts / fingerprints are needed. This is the supported
+-- rig export path; the meta-part exporters below are discontinued.
+function ExportManager:exportRigRbxm()
+	local rigModel = State.activeRigModel or State.lastKnownRigModel
+	if not rigModel then
+		warn("[ExportManager] No rig selected.")
+		return
+	end
+
+	if State.setRigOrigin:get(true) then
+		local primaryPart = rigModel.PrimaryPart :: BasePart?
+		if primaryPart then
+			local currentCFrame = primaryPart.CFrame
+			primaryPart.CFrame = CFrame.new(0, currentCFrame.Position.Y, 0) * CFrame.Angles(currentCFrame:ToOrientation())
+			task.wait()
+		end
+	end
+
+	focusCurrentCameraOnRigPrimaryPart()
+	game.Selection:Set({ rigModel })
+
+	local pluginRef = self._plugin
+	if not pluginRef then
+		warn("[ExportManager] RBXM export unavailable: no plugin reference.")
+		return
+	end
+
+	local ok, saved = pcall(function()
+		return pluginRef:PromptSaveSelectionAsync(rigModel.Name)
+	end)
+	if not ok then
+		warn(('[ExportManager] RBXM export failed: %s'):format(tostring(saved)))
+	elseif saved then
+		print(('[ExportManager] Exported rig "%s" as .rbxm'):format(rigModel.Name))
+	end
 end
 
 function ExportManager:exportRig()
@@ -1294,6 +1334,186 @@ function ExportManager:exportWeapon()
 		:format(gripData.weaponName, partCount, hasMotor6Ds and "with" or "no", attachmentCount))
 	waitBeforeExportSelectionIfNeeded(weaponClone)
 	PluginManager():ExportSelection()
+end
+
+-- Find joints connecting weapon parts to the active rig. Returns
+-- { joint, characterPart, weaponPart } entries in rig-root order.
+function ExportManager:findWeaponConnections(weaponContainer: Instance?, weaponRoot: BasePart): { any }
+	local rigModel = State.activeRigModel or State.lastKnownRigModel
+	if not rigModel then
+		return {}
+	end
+
+	local weaponPartSet: { [Instance]: boolean } = {}
+	local weaponSearchRoot = weaponContainer or weaponRoot
+	if weaponSearchRoot:IsA("BasePart") then
+		weaponPartSet[weaponSearchRoot] = true
+	end
+	for _, desc in ipairs(weaponSearchRoot:GetDescendants()) do
+		if desc:IsA("BasePart") then
+			weaponPartSet[desc] = true
+		end
+	end
+
+	local searchRoots: { Instance } = { rigModel }
+	if weaponContainer and weaponContainer ~= rigModel then
+		table.insert(searchRoots, weaponContainer)
+	elseif weaponRoot.Parent and weaponRoot.Parent ~= rigModel then
+		table.insert(searchRoots, weaponRoot)
+	end
+
+	local seenJoints: { [Instance]: boolean } = {}
+	local seenWeaponParts: { [Instance]: boolean } = {}
+	local entries: { any } = {}
+	for _, root in ipairs(searchRoots) do
+		for _, desc in ipairs(root:GetDescendants()) do
+			if seenJoints[desc] then continue end
+			if desc:IsA("Motor6D") or desc:IsA("Weld") or desc:IsA("WeldConstraint") then
+				seenJoints[desc] = true
+				local j = desc :: any
+				local p0, p1 = j.Part0, j.Part1
+				if not p0 or not p1 then continue end
+				if weaponPartSet[p0] and p1:IsDescendantOf(rigModel) and not weaponPartSet[p1] then
+					if not seenWeaponParts[p0] then
+						seenWeaponParts[p0] = true
+						table.insert(entries, { joint = desc, characterPart = p1, weaponPart = p0 })
+					end
+				elseif weaponPartSet[p1] and p0:IsDescendantOf(rigModel) and not weaponPartSet[p0] then
+					if not seenWeaponParts[p1] then
+						seenWeaponParts[p1] = true
+						table.insert(entries, { joint = desc, characterPart = p0, weaponPart = p1 })
+					end
+				end
+			end
+		end
+	end
+	return entries
+end
+
+-- Export the slotted weapon as a native binary .rbxm via Studio's save
+-- dialog, mirroring exportRigRbxm. The Blender addon's .rbxm importer reads
+-- the Motor6D/Weld tree straight from the file, so no meta parts or
+-- fingerprints are needed. This supersedes the meta-part exportWeapon flow.
+function ExportManager:exportWeaponRbxm()
+	local weaponInst = State.selectedWeapon:get()
+	if not weaponInst then
+		local selection = game.Selection:Get()
+		if #selection > 0 then
+			weaponInst = selection[1]
+		else
+			warn("[ExportManager] No weapon slotted and nothing selected.")
+			return
+		end
+	end
+
+	local weaponContainer, weaponRoot = self:resolveWeapon(weaponInst)
+	if not weaponRoot then
+		warn("[ExportManager] Could not find a weapon root part.")
+		return
+	end
+
+	local pluginRef = self._plugin
+	if not pluginRef then
+		warn("[ExportManager] Weapon RBXM export unavailable: no plugin reference.")
+		return
+	end
+
+	local exportName = weaponContainer and weaponContainer.Name or weaponRoot.Name
+
+	-- Clone the weapon so grip attributes never touch the original, and so
+	-- rig-side joints stay out of the saved file.
+	local cloneSource: Instance = weaponContainer or weaponRoot
+	local wasArchivable = cloneSource.Archivable
+	cloneSource.Archivable = true
+	local weaponClone = cloneSource:Clone()
+	cloneSource.Archivable = wasArchivable
+
+	if not weaponClone then
+		warn("[ExportManager] Failed to clone weapon.")
+		return
+	end
+
+	weaponClone.Parent = game.Workspace
+	-- NB: do not set Archivable to false on the clone.  The selection save
+	-- path (PromptSaveSelectionAsync) skips non-archivable roots and writes
+	-- an empty file.
+
+	-- Strip anything that should not travel with a weapon file.
+	for _, desc in ipairs(weaponClone:GetDescendants()) do
+		if desc:IsA("Humanoid") or desc:IsA("AnimationController") then
+			desc:Destroy()
+		end
+	end
+
+	-- Stamp grip metadata as attributes: the grip joint itself references
+	-- the rig hand (outside this file), so the connection travels as data
+	-- instead of a dangling joint reference.  String attributes keep the
+	-- Blender-side rbxm parser simple.  (No RBX-prefixed names: that
+	-- namespace is reserved for CoreScripts.)
+	local connections = self:findWeaponConnections(weaponContainer, weaponRoot)
+	weaponClone:SetAttribute("BlenderGripCount", tostring(#connections))
+	weaponClone:SetAttribute("BlenderGripVersion", "1")
+	for index, entry in ipairs(connections) do
+		local j = entry.joint :: any
+		local charIsPart0 = (j.Part0 == entry.characterPart)
+		local c0: CFrame
+		local c1: CFrame
+		if j:IsA("Motor6D") or j:IsA("Weld") then
+			if charIsPart0 then
+				c0 = j.C0
+				c1 = j.C1
+			else
+				c0 = j.C1
+				c1 = j.C0
+			end
+		else -- WeldConstraint
+			c0 = entry.characterPart.CFrame:ToObjectSpace(entry.weaponPart.CFrame)
+			c1 = CFrame.new()
+		end
+		local prefix = ("BlenderGrip%d_"):format(index - 1)
+		weaponClone:SetAttribute(prefix .. "Root", entry.weaponPart.Name)
+		weaponClone:SetAttribute(prefix .. "Bone", entry.characterPart.Name)
+		weaponClone:SetAttribute(prefix .. "JointType", entry.joint.ClassName)
+		weaponClone:SetAttribute(prefix .. "JointName", entry.joint.Name)
+		weaponClone:SetAttribute(prefix .. "C0", table.concat(cfComponents(c0), ","))
+		weaponClone:SetAttribute(prefix .. "C1", table.concat(cfComponents(c1), ","))
+	end
+	if #connections > 0 then
+		print(("[ExportManager] Stamped %d grip connection(s) as attributes"):format(#connections))
+	end
+
+	game.Selection:Set({ weaponClone })
+
+	local ok, saved = pcall(function()
+		return pluginRef:PromptSaveSelectionAsync(exportName)
+	end)
+
+	local function cleanupClone()
+		if weaponClone.Parent then
+			weaponClone:Destroy()
+		end
+	end
+
+	if not ok then
+		warn(('[ExportManager] Weapon RBXM export failed: %s'):format(tostring(saved)))
+		cleanupClone()
+	elseif saved then
+		print(('[ExportManager] Exported weapon "%s" as .rbxm'):format(exportName))
+		-- Let Studio's serializer settle for a few frames before tearing
+		-- the clone down; wall-clock delays drift under load, heartbeats
+		-- do not.
+		local beats = 0
+		local heartbeat
+		heartbeat = game:GetService("RunService").Heartbeat:Connect(function()
+			beats += 1
+			if beats >= 3 then
+				heartbeat:Disconnect()
+				cleanupClone()
+			end
+		end)
+	else
+		cleanupClone()
+	end
 end
 
 function ExportManager:exportRigLegacy()

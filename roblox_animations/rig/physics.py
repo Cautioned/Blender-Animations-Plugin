@@ -85,7 +85,7 @@ _physics_data = {
     "armature_name": None,
     "fps": 30.0,
     "gravity": DEFAULT_GRAVITY,
-    
+
     # Frame analysis data
     "frame_states": {},  # frame -> "grounded" | "airborne" | "invalid"
     "com_positions": {},  # frame -> Vector
@@ -93,7 +93,7 @@ _physics_data = {
     "bone_positions": {},  # frame -> bone name -> (head_world, tail_world)
     "foot_positions": {},  # frame -> side -> Vector
     "foot_velocities": {},  # frame -> side -> Vector
-    
+
     # Fulcrum detection
     "fulcrum_frames": set(),  # Frames where character has ground contact
     "fulcrum_positions": {},  # frame -> list of contact points
@@ -101,7 +101,7 @@ _physics_data = {
     "contact_tracks": {"left": [], "right": []},
     "contact_state": {},  # frame -> side -> "plant" | "slide" | "swing"
     "contact_confidence": {},  # frame -> confidence 0..1
-    
+
     # Ballistic trajectory
     "trajectory_start_frame": None,
     "trajectory_start_pos": None,
@@ -115,17 +115,17 @@ _physics_data = {
     "invalid_frames": set(),
     "worst_frame": None,
     "worst_error": 0.0,
-    
+
     # Ground detection
     "detected_ground_level": 0.0,
     "com_to_feet_offset": 1.0,
-    
+
     # Ghost visualization
     "show_ghost": True,
     "show_com_marker": True,
     "show_ground_plane": True,
     "ghost_color": (0.0, 1.0, 0.5, 0.5),  # Green, semi-transparent
-    
+
     # Visual settings
     "trajectory_color": (1.0, 0.5, 0.0, 0.9),  # Orange
     "actual_path_color": (0.3, 0.8, 1.0, 0.8),  # Cyan
@@ -148,10 +148,10 @@ _physics_draw_handler = None
 
 def analyze_animation(armature: "bpy.types.Object", start_frame: int = None, end_frame: int = None):
     """Analyze the animation for physics validity.
-    
+
     Calculates COM positions, velocities, detects fulcrum points,
     and determines frame states (grounded/airborne/invalid).
-    
+
     Args:
         armature: The armature to analyze.
         start_frame: Start frame (defaults to scene start).
@@ -159,15 +159,15 @@ def analyze_animation(armature: "bpy.types.Object", start_frame: int = None, end
     """
     if not armature or armature.type != "ARMATURE":
         return
-    
+
     scene = bpy.context.scene
     original_frame = scene.frame_current
-    
+
     if start_frame is None:
         start_frame = scene.frame_start
     if end_frame is None:
         end_frame = scene.frame_end
-    
+
     fps = get_scene_fps()
     if fps <= 0:
         fps = 30.0
@@ -176,7 +176,7 @@ def analyze_animation(armature: "bpy.types.Object", start_frame: int = None, end
     _physics_data["gravity"] = get_gravity()  # Store current gravity setting
     _physics_data["start_frame"] = start_frame
     _physics_data["end_frame"] = end_frame
-    
+
     # Clear ALL previous data completely
     _physics_data["com_positions"] = {}
     _physics_data["com_velocities"] = {}
@@ -193,7 +193,7 @@ def analyze_animation(armature: "bpy.types.Object", start_frame: int = None, end
     _physics_data["contact_tracks"] = {"left": [], "right": []}
     _physics_data["contact_state"] = {}
     _physics_data["contact_confidence"] = {}
-    
+
     # Reset trajectory tracking
     _physics_data["trajectory_start_frame"] = None
     _physics_data["trajectory_start_pos"] = None
@@ -206,41 +206,41 @@ def analyze_animation(armature: "bpy.types.Object", start_frame: int = None, end
     _physics_data["worst_error"] = 0.0
     _physics_data["detected_ground_level"] = 0.0
     _physics_data["com_to_feet_offset"] = 1.0
-    
+
     # Detect ground level from the lowest foot/toe position in the animation
     ground_level = _detect_ground_level(armature, start_frame, end_frame, scene)
     _physics_data["detected_ground_level"] = ground_level
-    
+
     # First pass: collect COM positions and contact info
     for frame in range(start_frame, end_frame + 1):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
-        
+
         com = calculate_com(armature)
         _physics_data["com_positions"][frame] = com.copy()
         _physics_data["bone_positions"][frame] = _capture_bone_positions(armature)
         foot_points = _get_foot_points(armature)
         _physics_data["foot_positions"][frame] = foot_points
-        
+
         # Detect fulcrum points (feet on ground)
         fulcrums = _contacts_from_foot_points(foot_points)
         _physics_data["contact_count"][frame] = len(fulcrums)
         if fulcrums:
             _physics_data["fulcrum_frames"].add(frame)
             _physics_data["fulcrum_positions"][frame] = fulcrums
-    
+
     # Second pass: calculate smoothed velocities
     _calculate_smoothed_velocities(start_frame, end_frame, fps)
     _calculate_foot_velocities(start_frame, end_frame, fps)
     _analyze_contact_tracks(start_frame, end_frame)
-    
+
     # Third pass: determine frame states and calculate predictions
     _analyze_frame_states(start_frame, end_frame, fps)
     _calculate_constraint_proposals(start_frame, end_frame)
-    
+
     # Restore original frame
     scene.frame_set(original_frame)
-    
+
     # Force viewport redraw to show new analysis
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
@@ -249,53 +249,53 @@ def analyze_animation(armature: "bpy.types.Object", start_frame: int = None, end
 
 def _calculate_smoothed_velocities(start_frame: int, end_frame: int, fps: float):
     """Calculate smoothed velocities using a moving window average.
-    
+
     This reduces noise in velocity estimation which improves trajectory prediction.
     """
     half_window = VELOCITY_SMOOTHING_WINDOW // 2
-    
+
     for frame in range(start_frame, end_frame + 1):
         # Gather positions in the window
         positions = []
         frames_in_window = []
-        
+
         for offset in range(-half_window, half_window + 1):
             f = frame + offset
             if f in _physics_data["com_positions"]:
                 positions.append(_physics_data["com_positions"][f])
                 frames_in_window.append(f)
-        
+
         if len(positions) < 2:
             _physics_data["com_velocities"][frame] = Vector((0, 0, 0))
             continue
-        
+
         # Use linear regression to find best-fit velocity
         # This is more robust than simple differences
         n = len(positions)
-        
+
         # Calculate means
         mean_t = sum(frames_in_window) / n
         mean_pos = Vector((0, 0, 0))
         for p in positions:
             mean_pos += p
         mean_pos /= n
-        
+
         # Calculate slope (velocity)
         numerator = Vector((0, 0, 0))
         denominator = 0.0
-        
+
         for i, (f, p) in enumerate(zip(frames_in_window, positions)):
             t_diff = f - mean_t
             pos_diff = p - mean_pos
             numerator += pos_diff * t_diff
             denominator += t_diff * t_diff
-        
+
         if denominator > 0.0001:
             # Velocity in units per frame, convert to units per second
             vel = numerator / denominator * fps
         else:
             vel = Vector((0, 0, 0))
-        
+
         _physics_data["com_velocities"][frame] = vel
 
 
@@ -358,7 +358,8 @@ def detect_trajectory_ik_controls(armature: "bpy.types.Object") -> Dict[str, Dic
                 continue
 
             target_object = constraint.target
-            target_bone = target_object.pose.bones.get(constraint.subtarget) if constraint.subtarget and getattr(target_object, "pose", None) else None
+            target_bone = target_object.pose.bones.get(
+                constraint.subtarget) if constraint.subtarget and getattr(target_object, "pose", None) else None
             if constraint.subtarget and target_bone is None:
                 continue
 
@@ -409,13 +410,13 @@ def _contacts_from_foot_points(foot_points: Dict[str, Vector]) -> List[Tuple[Vec
 
 def detect_fulcrum_points(armature: "bpy.types.Object") -> List[Tuple[Vector, str]]:
     """Detect ground contact points for the current pose.
-    
+
     Looks for foot bones that are close to their minimum height,
     accounting for the fact that ankle joints are above the ground.
-    
+
     Args:
         armature: The armature to check.
-        
+
     Returns:
         List of (world_position, side) tuples where side is "left" or "right".
     """
@@ -576,20 +577,20 @@ def _median_number(values: List[float]) -> Optional[float]:
 
 def _detect_ground_level(armature: "bpy.types.Object", start_frame: int, end_frame: int, scene) -> float:
     """Detect the ground level from the stable low band of foot/toe heights.
-    
+
     This accounts for the fact that ankle joints are above the actual ground plane.
     """
     foot_heights = []
-    
+
     sample_step = 1
-    
+
     for frame in range(start_frame, end_frame + 1, sample_step):
         scene.frame_set(frame)
         bpy.context.view_layer.update()
-        
+
         for pos in _get_foot_points(armature).values():
             foot_heights.append(pos.z)
-    
+
     # If we couldn't find foot bones, default to 0
     if not foot_heights:
         return GROUND_LEVEL
@@ -631,7 +632,7 @@ def _median_vector(values: List[Vector]) -> Optional[Vector]:
 
 def _analyze_frame_states(start_frame: int, end_frame: int, fps: float):
     """Analyze frame states and calculate ballistic predictions with ground collision.
-    
+
     Determines whether each frame is grounded, airborne, or physically invalid,
     and calculates predicted positions during airborne phases.
     The ghost simulation includes ground collision - once it lands, it stays on ground.
@@ -640,7 +641,7 @@ def _analyze_frame_states(start_frame: int, end_frame: int, fps: float):
     gravity = _physics_data.get("gravity", DEFAULT_GRAVITY)
     dt = 1.0 / max(fps, 1.0)
     landing_friction = 0.8 ** (30.0 / max(fps, 1.0))
-    
+
     com_to_feet_offset = _resolve_com_to_feet_offset(start_frame, ground_level)
     _physics_data["com_to_feet_offset"] = com_to_feet_offset
     min_com_z = ground_level + com_to_feet_offset
@@ -721,7 +722,7 @@ def _analyze_frame_states(start_frame: int, end_frame: int, fps: float):
         else:
             _physics_data["frame_states"][frame] = "invalid"
             _physics_data["invalid_frames"].add(frame)
-    
+
     for frame in range(start_frame, end_frame + 1):
         actual = _physics_data["com_positions"].get(frame)
         if actual is None:
@@ -769,11 +770,11 @@ def _analyze_frame_states(start_frame: int, end_frame: int, fps: float):
 
         _physics_data["predicted_positions"][frame] = predicted.copy()
         record_error(frame, actual, predicted)
-    
+
     if ghost_active and ghost_pos is not None:
         extra_frame = end_frame + 1
         max_extra_frames = int(fps * 5)
-        
+
         while extra_frame <= end_frame + max_extra_frames:
             predicted = step_ghost(extra_frame)
             if predicted is None:
@@ -781,7 +782,7 @@ def _analyze_frame_states(start_frame: int, end_frame: int, fps: float):
 
             _physics_data["predicted_positions"][extra_frame] = predicted.copy()
             _physics_data["frame_states"][extra_frame] = "extrapolated"
-            
+
             if ghost_landed:
                 for slide_frame in range(extra_frame + 1, extra_frame + int(fps * 2) + 1):
                     predicted = step_ghost(slide_frame)
@@ -790,7 +791,7 @@ def _analyze_frame_states(start_frame: int, end_frame: int, fps: float):
                     _physics_data["predicted_positions"][slide_frame] = predicted.copy()
                     _physics_data["frame_states"][slide_frame] = "extrapolated"
                 break
-            
+
             extra_frame += 1
 
 
@@ -888,7 +889,8 @@ def _control_world_position(control: Dict[str, object]) -> Optional[Vector]:
     return target_object.matrix_world.translation.copy()
 
 
-def _set_pose_bone_head_world(armature: "bpy.types.Object", pose_bone: "bpy.types.PoseBone", world_position: Vector, frame: int) -> bool:
+def _set_pose_bone_head_world(armature: "bpy.types.Object", pose_bone: "bpy.types.PoseBone",
+                              world_position: Vector, frame: int) -> bool:
     if all(getattr(pose_bone, "lock_location", (False, False, False))):
         return False
 
@@ -1028,18 +1030,18 @@ def get_trajectory_ik_assist_summary(armature: Optional["bpy.types.Object"] = No
 
 def get_ghost_offset(frame: int) -> Vector:
     """Calculate the offset needed to move character to physics-correct position.
-    
+
     Args:
         frame: The frame to calculate offset for.
-        
+
     Returns:
         World-space offset vector (predicted - actual).
     """
     if frame not in _physics_data["predicted_positions"]:
         return Vector((0, 0, 0))
-    
+
     predicted = _physics_data["predicted_positions"][frame]
-    
+
     # For frames within animation range, use actual COM
     if frame in _physics_data["com_positions"]:
         actual = _physics_data["com_positions"][frame]
@@ -1051,7 +1053,7 @@ def get_ghost_offset(frame: int) -> Vector:
             actual = _physics_data["com_positions"][end_frame]
         else:
             return Vector((0, 0, 0))
-    
+
     return predicted - actual
 
 
@@ -1081,7 +1083,8 @@ def _get_bone_snapshot(frame: int) -> Optional[Dict[str, Tuple[Vector, Vector]]]
     return snapshots[nearest_frame]
 
 
-def _offset_bone_snapshot(source_bones: Dict[str, Tuple[Vector, Vector]], offset: Vector) -> Dict[str, Tuple[Vector, Vector]]:
+def _offset_bone_snapshot(source_bones: Dict[str, Tuple[Vector, Vector]],
+                          offset: Vector) -> Dict[str, Tuple[Vector, Vector]]:
     ghost_bones = {}
     ground_level = _physics_data.get("detected_ground_level", GROUND_LEVEL)
     min_bone_z = float('inf')
@@ -1106,14 +1109,15 @@ def _offset_bone_snapshot(source_bones: Dict[str, Tuple[Vector, Vector]], offset
     return ghost_bones
 
 
-def calculate_ghost_bones(armature: "bpy.types.Object", offset: Vector, frame: Optional[int] = None) -> Dict[str, Tuple[Vector, Vector]]:
+def calculate_ghost_bones(armature: "bpy.types.Object", offset: Vector,
+                          frame: Optional[int] = None) -> Dict[str, Tuple[Vector, Vector]]:
     """Calculate ghost bone positions by offsetting a sampled pose.
-    
+
     Args:
         armature: The armature object.
         offset: World-space offset to apply.
         frame: Animation frame whose pose should be ghosted. Defaults to current pose.
-        
+
     Returns:
         Dict mapping bone name to (head_world, tail_world) tuple.
     """
@@ -1180,33 +1184,33 @@ def _draw_physics_callback():
     """OpenGL callback to draw physics visualization."""
     if not _physics_data["enabled"]:
         return
-    
+
     armature_name = _physics_data.get("armature_name")
     if not armature_name:
         return
-    
+
     armature = get_object_by_name(armature_name)
     if not armature or armature.type != "ARMATURE":
         _physics_data["enabled"] = False
         return
-    
+
     frame = bpy.context.scene.frame_current
-    
+
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     gpu.state.blend_set('ALPHA')
-    
+
     # Draw ground plane reference
     if _physics_data.get("show_ground_plane", True):
         _draw_ground_plane(shader)
-    
+
     # Draw ballistic trajectory
     _draw_trajectory(shader, frame)
     _draw_trajectory_landmarks(shader)
-    
+
     # Draw COM marker on current position
     if _physics_data.get("show_com_marker", True):
         _draw_com_marker(shader, frame)
-    
+
     # Draw ghost character
     if _physics_data["show_ghost"]:
         _draw_ghost_guides(shader, armature, frame)
@@ -1214,22 +1218,22 @@ def _draw_physics_callback():
         offset = get_ghost_offset(frame)
         if offset.length > 0.01:
             _draw_error_line(shader, frame, offset)
-    
+
     # Draw fulcrum points
     _draw_fulcrum_points(shader, frame)
-    
+
     gpu.state.blend_set('NONE')
 
 
 def _draw_ground_plane(shader):
     """Draw a reference grid at ground level."""
     ground_level = _physics_data.get("detected_ground_level", GROUND_LEVEL)
-    
+
     # Draw a simple grid
     size = 2.0
     divisions = 4
     step = size / divisions
-    
+
     vertices = []
     for i in range(-divisions, divisions + 1):
         # Lines along X
@@ -1242,7 +1246,7 @@ def _draw_ground_plane(shader):
             (i * step, -size, ground_level),
             (i * step, size, ground_level),
         ])
-    
+
     if vertices:
         batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
         shader.bind()
@@ -1255,17 +1259,17 @@ def _draw_com_marker(shader, frame: int):
     """Draw a marker at the current COM position."""
     if frame not in _physics_data["com_positions"]:
         return
-    
+
     pos = _physics_data["com_positions"][frame]
     size = 0.08
-    
+
     # Draw a 3D cross
     vertices = [
         (pos.x - size, pos.y, pos.z), (pos.x + size, pos.y, pos.z),
         (pos.x, pos.y - size, pos.z), (pos.x, pos.y + size, pos.z),
         (pos.x, pos.y, pos.z - size), (pos.x, pos.y, pos.z + size),
     ]
-    
+
     batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
     shader.bind()
     shader.uniform_float("color", _physics_data["com_marker_color"])
@@ -1278,15 +1282,15 @@ def _draw_error_line(shader, frame: int, offset: Vector):
     """Draw a line showing the physics error (actual to predicted)."""
     if frame not in _physics_data["com_positions"]:
         return
-    
+
     actual = _physics_data["com_positions"][frame]
     predicted = actual + offset
-    
+
     vertices = [
         (actual.x, actual.y, actual.z),
         (predicted.x, predicted.y, predicted.z),
     ]
-    
+
     # Color based on error magnitude
     error = offset.length
     if error < TRAJECTORY_ERROR_WARN:
@@ -1295,7 +1299,7 @@ def _draw_error_line(shader, frame: int, offset: Vector):
         color = _physics_data["airborne_color"]  # Orange - medium error
     else:
         color = _physics_data["invalid_color"]  # Red - large error
-    
+
     batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
     shader.bind()
     shader.uniform_float("color", color)
@@ -1493,51 +1497,51 @@ def _draw_trajectory(shader, current_frame: int):
     """Draw the ballistic trajectory curves - both actual and predicted."""
     if not _physics_data["predicted_positions"]:
         return
-    
+
     # Draw trajectory for frames around current (extended range to show landing)
     frames = sorted(_physics_data["predicted_positions"].keys())
     view_behind = TRAJECTORY_VIEW_BEHIND
     view_ahead = TRAJECTORY_VIEW_AHEAD
-    
+
     # Draw ACTUAL COM path (white/cyan)
     actual_vertices = []
     for i, frame in enumerate(frames):
         if frame < current_frame - view_behind or frame > current_frame + view_ahead:
             continue
-        
+
         pos = _physics_data["com_positions"].get(frame)
         if pos is None:
             continue
-            
-        if i > 0 and frames[i-1] >= current_frame - view_behind:
-            prev_pos = _physics_data["com_positions"].get(frames[i-1])
+
+        if i > 0 and frames[i - 1] >= current_frame - view_behind:
+            prev_pos = _physics_data["com_positions"].get(frames[i - 1])
             if prev_pos is not None:
-                actual_vertices.extend([(prev_pos.x, prev_pos.y, prev_pos.z), 
+                actual_vertices.extend([(prev_pos.x, prev_pos.y, prev_pos.z),
                                        (pos.x, pos.y, pos.z)])
-    
+
     if actual_vertices:
         _draw_line_vertices(shader, actual_vertices, _physics_data["actual_path_color"], 2.0)
-    
+
     # Draw predicted physics path as a traffic-light arc.
     predicted_by_color = {}
     for i, frame in enumerate(frames):
         if frame < current_frame - view_behind or frame > current_frame + view_ahead:
             continue
-            
+
         pos = _physics_data["predicted_positions"][frame]
-        
-        if i > 0 and frames[i-1] >= current_frame - view_behind:
-            prev_pos = _physics_data["predicted_positions"].get(frames[i-1])
+
+        if i > 0 and frames[i - 1] >= current_frame - view_behind:
+            prev_pos = _physics_data["predicted_positions"].get(frames[i - 1])
             if prev_pos is not None and frames[i - 1] == frame - 1:
                 color = _trajectory_state_color(frame)
                 predicted_by_color.setdefault(color, []).extend([
                     (prev_pos.x, prev_pos.y, prev_pos.z),
                     (pos.x, pos.y, pos.z),
                 ])
-    
+
     for color, vertices in predicted_by_color.items():
         _draw_line_vertices(shader, vertices, color, 3.0)
-    
+
     gpu.state.line_width_set(1.0)
 
 
@@ -1574,17 +1578,17 @@ def _draw_ghost_guides(shader, armature: "bpy.types.Object", current_frame: int)
 def _draw_ghost_armature(shader, ghost_bones: Dict[str, Tuple[Vector, Vector]], color=None, line_width: float = 3.0):
     """Draw the ghost armature as lines."""
     vertices = []
-    
+
     for bone_name, (head, tail) in ghost_bones.items():
         # Skip IK helper bones
         if any(s in bone_name for s in ["-IKTarget", "-IKPole", "-IKStretch"]):
             continue
-        
+
         vertices.extend([
             (head.x, head.y, head.z),
             (tail.x, tail.y, tail.z)
         ])
-    
+
     if vertices:
         batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
         shader.bind()
@@ -1598,10 +1602,10 @@ def _draw_fulcrum_points(shader, frame: int):
     """Draw fulcrum (ground contact) points."""
     if frame not in _physics_data["fulcrum_positions"]:
         return
-    
+
     contacts = _physics_data["fulcrum_positions"][frame]
     vertices = []
-    
+
     size = 0.1
     for contact in contacts:
         # Handle both old format (Vector) and new format (Vector, side)
@@ -1609,7 +1613,7 @@ def _draw_fulcrum_points(shader, frame: int):
             pos, side = contact
         else:
             pos = contact
-        
+
         # Draw small cross at contact point
         vertices.extend([
             (pos.x - size, pos.y, pos.z),
@@ -1617,7 +1621,7 @@ def _draw_fulcrum_points(shader, frame: int):
             (pos.x, pos.y - size, pos.z),
             (pos.x, pos.y + size, pos.z),
         ])
-    
+
     if vertices:
         batch = batch_for_shader(shader, 'LINES', {"pos": vertices})
         shader.bind()
@@ -1630,9 +1634,9 @@ def _draw_fulcrum_points(shader, frame: int):
 def enable_physics_visualization(enable: bool = True):
     """Enable or disable physics visualization."""
     global _physics_draw_handler
-    
+
     _physics_data["enabled"] = enable
-    
+
     if enable and _physics_draw_handler is None:
         _physics_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             _draw_physics_callback, (), 'WINDOW', 'POST_VIEW'
@@ -1641,7 +1645,7 @@ def enable_physics_visualization(enable: bool = True):
         bpy.types.SpaceView3D.draw_handler_remove(_physics_draw_handler, 'WINDOW')
         _physics_draw_handler = None
         _physics_data["armature_name"] = None
-        
+
         # Clear data to free memory when disabled
         _physics_data["com_positions"] = {}
         _physics_data["com_velocities"] = {}
@@ -1664,7 +1668,7 @@ def enable_physics_visualization(enable: bool = True):
         _physics_data["invalid_frames"] = set()
         _physics_data["worst_frame"] = None
         _physics_data["worst_error"] = 0.0
-    
+
     # Redraw viewports
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
@@ -1682,7 +1686,7 @@ def toggle_ghost(enable: Optional[bool] = None):
         _physics_data["show_ghost"] = not _physics_data["show_ghost"]
     else:
         _physics_data["show_ghost"] = enable
-    
+
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
@@ -1695,7 +1699,7 @@ def is_ghost_enabled() -> bool:
 
 def get_frame_state(frame: int) -> str:
     """Get the physics state of a frame.
-    
+
     Returns:
         "grounded", "airborne", "invalid", or "unknown"
     """
@@ -1704,7 +1708,7 @@ def get_frame_state(frame: int) -> str:
 
 def get_physics_error(frame: int) -> float:
     """Get the physics error (distance between actual and predicted) for a frame.
-    
+
     Returns:
         Error distance in Blender units, or 0 if no prediction.
     """
@@ -1712,10 +1716,10 @@ def get_physics_error(frame: int) -> float:
         return 0.0
     if frame not in _physics_data["com_positions"]:
         return 0.0
-    
+
     predicted = _physics_data["predicted_positions"][frame]
     actual = _physics_data["com_positions"][frame]
-    
+
     return (actual - predicted).length
 
 
@@ -1768,7 +1772,7 @@ def update_physics_frame():
     """Called on frame change to update visualization."""
     if not _physics_data["enabled"]:
         return
-    
+
     # Redraw viewports
     for area in bpy.context.screen.areas:
         if area.type == 'VIEW_3D':
@@ -1795,11 +1799,11 @@ def unregister_physics_frame_handler():
 
 def cleanup_physics():
     """Clean up all physics resources to prevent memory leaks.
-    
+
     Call this on addon unregister or when completely done with physics.
     """
     global _physics_draw_handler
-    
+
     # Remove draw handler
     if _physics_draw_handler is not None:
         try:
@@ -1807,10 +1811,10 @@ def cleanup_physics():
         except Exception:
             pass
         _physics_draw_handler = None
-    
+
     # Unregister frame handler
     unregister_physics_frame_handler()
-    
+
     # Clear all data to free memory
     _physics_data["enabled"] = False
     _physics_data["armature_name"] = None

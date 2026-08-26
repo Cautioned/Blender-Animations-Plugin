@@ -17,7 +17,7 @@ function Pose.new(rigPart: any, transform: CFrame, easingStyle: string?, easingD
 		rigPart = rigPart,
 		transform = transform,
 		easingStyle = easingStyle or "Linear",
-		easingDirection = easingDirection or "In",
+		easingDirection = easingDirection or "Out",
 	}
 	setmetatable(self, Pose)
 
