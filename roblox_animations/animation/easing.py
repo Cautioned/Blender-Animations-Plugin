@@ -71,9 +71,11 @@ def map_blender_to_roblox_easing(interpolation, easing):
         return "Constant", "Out"
 
     # If the style was supported, map the easing direction.
+    # PoseEasingDirection has the opposite In/Out convention to Blender and
+    # TweenService: Pose.Out is the forward (slow-start) curve.
     direction_map = {
-        "EASE_IN": "In",
-        "EASE_OUT": "Out",
+        "EASE_IN": "Out",
+        "EASE_OUT": "In",
         "EASE_IN_OUT": "InOut",
     }
     # Default to "Out" if the Blender easing type is something unexpected.

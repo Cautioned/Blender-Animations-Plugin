@@ -102,11 +102,11 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
             ):
                 root_bone_name = bone.name
                 break
-        
+
         # Fallback to first bone if no root found
         if not root_bone_name and armature_obj.data.bones:
             root_bone_name = armature_obj.data.bones[0].name
-        
+
         # Generate a basic rig structure based on the armature
         rig_structure = {
             "rigName": armature_obj.name.replace("__", "").replace("_Armature", "").replace(
@@ -160,7 +160,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
             selected_obj = get_object_by_name(self.pr_rig_meta_name, context.scene)
             if selected_obj and "RigMeta" in selected_obj:
                 # Existing case: rig meta object
-                result = create_rig(self.pr_rigging_type, self.pr_rig_meta_name)
+                create_rig(self.pr_rigging_type, self.pr_rig_meta_name)
                 self.report({"INFO"}, f"Rig rebuilt from {self.pr_rig_meta_name}.")
             elif (
                 selected_obj
@@ -172,7 +172,7 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
             ):
                 # New case: armature with Motor6D properties
                 meta_obj_name = self.create_rig_meta_from_armature(selected_obj)
-                result = create_rig(self.pr_rigging_type, meta_obj_name)
+                create_rig(self.pr_rigging_type, meta_obj_name)
                 # Clean up temporary meta object
                 meta_obj = get_object_by_name(meta_obj_name, bpy.context.scene)
                 if meta_obj:
@@ -349,20 +349,20 @@ class OBJECT_OT_ModifyIK(bpy.types.Operator):
     def do_update_pole_axis(self, context):
         """Update pole axis using the update_pole_axis function from ik module"""
         from mathutils import Vector
-        
+
         obj = context.active_object
         if not obj or obj.type != "ARMATURE":
             return
-        
+
         # Get selected bones
         selected_bones = [b for b in obj.pose.bones if pose_bone_selected(b)]
         if not selected_bones:
             if hasattr(context, 'active_pose_bone') and context.active_pose_bone:
                 selected_bones = [context.active_pose_bone]
-        
+
         if not selected_bones:
             return
-        
+
         # Map axis string to vector
         axis_map = {
             "+X": Vector((1, 0, 0)),
@@ -372,13 +372,13 @@ class OBJECT_OT_ModifyIK(bpy.types.Operator):
             "+Z": Vector((0, 0, 1)),
             "-Z": Vector((0, 0, -1)),
         }
-        
+
         target_axis = axis_map.get(self.pr_pole_axis, Vector((1, 0, 0)))
-        
+
         # Update pole for each selected bone with IK
         for pose_bone in selected_bones:
             update_pole_axis(obj, pose_bone, target_axis)
-        
+
         context.view_layer.update()
 
     @classmethod
@@ -458,13 +458,13 @@ class OBJECT_OT_SetIKFK(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         current_frame = context.scene.frame_current
-        
+
         for b in obj.pose.bones:
             if pose_bone_selected(b) and b.name.endswith("-IKTarget") and "IK_FK" in b:
                 b["IK_FK"] = self.value
                 # Insert keyframe for the IK_FK property
                 b.keyframe_insert(data_path='["IK_FK"]', frame=current_frame)
-        
+
         # Force update
         context.view_layer.update()
         return {"FINISHED"}
@@ -491,12 +491,12 @@ class OBJECT_OT_ToggleCOM(bpy.types.Operator):
             register_depsgraph_handler,
             unregister_depsgraph_handler,
         )
-        
+
         obj = context.active_object
-        
+
         # Check if COM is enabled for THIS armature specifically
         com_enabled_for_this = is_com_for_armature(obj)
-        
+
         if com_enabled_for_this:
             # Turn off COM for this armature
             enable_com_visualization(False)
@@ -510,7 +510,7 @@ class OBJECT_OT_ToggleCOM(bpy.types.Operator):
             register_depsgraph_handler()
             update_com_visualization(obj)
             self.report({"INFO"}, f"COM visualization enabled for '{obj.name}'")
-        
+
         return {"FINISHED"}
 
 
@@ -527,14 +527,12 @@ class OBJECT_OT_ToggleCOMGrid(bpy.types.Operator):
 
     def execute(self, context):
         from ..rig.com import toggle_com_grid, is_com_grid_enabled
-        
+
         toggle_com_grid()
         state = "enabled" if is_com_grid_enabled() else "disabled"
         self.report({"INFO"}, f"COM grid {state}")
-        
+
         return {"FINISHED"}
-
-
 
 
 class OBJECT_OT_EditCOMWeights(bpy.types.Operator):
@@ -554,7 +552,7 @@ class OBJECT_OT_EditCOMWeights(bpy.types.Operator):
 
     def invoke(self, context, event):
         from ..rig.com import get_bone_weight, COM_WEIGHT_PROP
-        
+
         # Initialize com_weight property on all bones BEFORE opening the dialog
         # This must be done here, not in draw(), because draw() doesn't allow writing
         obj = context.active_object
@@ -562,41 +560,41 @@ class OBJECT_OT_EditCOMWeights(bpy.types.Operator):
             for bone in obj.data.bones:
                 if COM_WEIGHT_PROP not in bone:
                     bone[COM_WEIGHT_PROP] = get_bone_weight(bone)
-        
+
         wm = context.window_manager
         return wm.invoke_props_dialog(self, width=400)
 
     def draw(self, context):
         from ..rig.com import COM_WEIGHT_PROP, DEFAULT_BONE_WEIGHTS
-        
+
         layout = self.layout
         obj = context.active_object
-        
+
         layout.label(text="Bone COM Weights:", icon="BONE_DATA")
         layout.separator()
-        
+
         # Categorize bones: custom weights, default weights (known), and zero/unknown
         custom_weight_bones = []
         default_weight_bones = []
         other_bones = []
-        
+
         for bone in obj.data.bones:
             # Skip IK helper bones
             if any(bone.name.endswith(s) for s in ("-IKTarget", "-IKPole", "-IKStretch")):
                 continue
-            
+
             has_custom = COM_WEIGHT_PROP in bone
             has_default = bone.name in DEFAULT_BONE_WEIGHTS or any(
                 k.lower() in bone.name.lower() for k in DEFAULT_BONE_WEIGHTS
             )
-            
+
             if has_custom:
                 custom_weight_bones.append(bone)
             elif has_default:
                 default_weight_bones.append(bone)
             else:
                 other_bones.append(bone)
-        
+
         # Custom weights section
         if custom_weight_bones:
             box = layout.box()
@@ -607,7 +605,7 @@ class OBJECT_OT_EditCOMWeights(bpy.types.Operator):
                 row.prop(bone, f'["{COM_WEIGHT_PROP}"]', text="")
                 op = row.operator("object.rbxanims_reset_bone_weight", text="", icon="LOOP_BACK")
                 op.bone_name = bone.name
-        
+
         # Default weight bones (main body parts)
         if default_weight_bones:
             box = layout.box()
@@ -618,23 +616,23 @@ class OBJECT_OT_EditCOMWeights(bpy.types.Operator):
                 row.prop(bone, f'["{COM_WEIGHT_PROP}"]', text="")
                 op = row.operator("object.rbxanims_reset_bone_weight", text="", icon="LOOP_BACK")
                 op.bone_name = bone.name
-        
+
         # Other bones (accessories, extra bones)
         if other_bones:
             box = layout.box()
             col = box.column()
             col.label(text=f"Other Bones ({len(other_bones)}):", icon="BONE_DATA")
-            
+
             for bone in other_bones[:15]:
                 row = col.row(align=True)
                 row.label(text=bone.name)
                 row.prop(bone, f'["{COM_WEIGHT_PROP}"]', text="")
                 op = row.operator("object.rbxanims_reset_bone_weight", text="", icon="LOOP_BACK")
                 op.bone_name = bone.name
-            
+
             if len(other_bones) > 15:
                 col.label(text=f"... and {len(other_bones) - 15} more bones")
-        
+
         layout.separator()
         row = layout.row(align=True)
         row.operator("object.rbxanims_apply_default_weights", text="Apply Defaults")
@@ -652,7 +650,7 @@ class OBJECT_OT_ResetBoneWeight(bpy.types.Operator):
 
     def execute(self, context):
         from ..rig.com import set_bone_weight, update_com_visualization, is_com_for_armature
-        
+
         obj = context.active_object
         if obj and obj.type == "ARMATURE" and self.bone_name:
             bone = obj.data.bones.get(self.bone_name)
@@ -661,7 +659,7 @@ class OBJECT_OT_ResetBoneWeight(bpy.types.Operator):
                 if is_com_for_armature(obj):
                     update_com_visualization(obj)
                 self.report({"INFO"}, f"Reset weight for {self.bone_name}")
-        
+
         return {"FINISHED"}
 
 
@@ -679,7 +677,7 @@ class OBJECT_OT_ApplyDefaultWeights(bpy.types.Operator):
 
     def execute(self, context):
         from ..rig.com import apply_default_weights, update_com_visualization, is_com_for_armature
-        
+
         obj = context.active_object
         applied = apply_default_weights(obj, overwrite=False)
         if applied <= 0:
@@ -689,7 +687,7 @@ class OBJECT_OT_ApplyDefaultWeights(bpy.types.Operator):
 
         if is_com_for_armature(obj):
             update_com_visualization(obj)
-        
+
         return {"FINISHED"}
 
 
@@ -707,13 +705,13 @@ class OBJECT_OT_ClearCOMWeights(bpy.types.Operator):
 
     def execute(self, context):
         from ..rig.com import clear_all_custom_weights, update_com_visualization, is_com_for_armature
-        
+
         obj = context.active_object
         clear_all_custom_weights(obj)
         if is_com_for_armature(obj):
             update_com_visualization(obj)
         self.report({"INFO"}, "Cleared custom COM weights")
-        
+
         return {"FINISHED"}
 
 
@@ -739,15 +737,15 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 
     def execute(self, context):
         from ..rig.com import set_bone_weight
-        
+
         obj = context.active_object
         count = 0
-        
+
         for pose_bone in obj.pose.bones:
             if pose_bone.bone.select:
                 set_bone_weight(pose_bone.bone, self.weight)
                 count += 1
-        
+
         self.report({"INFO"}, f"Set weight {self.weight:.3f} for {count} bones")
         return {"FINISHED"}
 
@@ -779,12 +777,12 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 #             register_physics_frame_handler,
 #             unregister_physics_frame_handler,
 #         )
-        
+
 #         obj = _resolve_autophysics_armature(context)
 #         if obj is None:
 #             self.report({"ERROR"}, "No armature selected for AutoPhysics")
 #             return {"CANCELLED"}
-        
+
 #         if is_physics_enabled():
 #             enable_physics_visualization(False)
 #             unregister_physics_frame_handler()
@@ -796,7 +794,7 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 #             enable_physics_visualization(True)
 #             register_physics_frame_handler()
 #             self.report({"INFO"}, "AutoPhysics enabled")
-        
+
 #         return {"FINISHED"}
 
 
@@ -813,18 +811,18 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 
 #     def execute(self, context):
 #         from ..rig.physics import analyze_animation, is_physics_enabled
-        
+
 #         obj = _resolve_autophysics_armature(context)
 #         if obj is None:
 #             self.report({"ERROR"}, "No armature selected for physics analysis")
 #             return {"CANCELLED"}
 #         analyze_animation(obj)
-        
+
 #         if is_physics_enabled():
 #             self.report({"INFO"}, "Physics analysis updated")
 #         else:
 #             self.report({"INFO"}, "Physics analyzed (enable AutoPhysics to visualize)")
-        
+
 #         return {"FINISHED"}
 
 
@@ -841,11 +839,11 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 
 #     def execute(self, context):
 #         from ..rig.physics import toggle_ghost, is_ghost_enabled
-        
+
 #         toggle_ghost()
 #         state = "enabled" if is_ghost_enabled() else "disabled"
 #         self.report({"INFO"}, f"Physics ghost {state}")
-        
+
 #         return {"FINISHED"}
 
 
@@ -955,11 +953,11 @@ class OBJECT_OT_SetSelectedBoneWeight(bpy.types.Operator):
 
 #     def execute(self, context):
 #         from ..rig.physics import toggle_angular_momentum, is_angular_momentum_enabled
-        
+
 #         toggle_angular_momentum()
 #         state = "enabled" if is_angular_momentum_enabled() else "disabled"
 #         self.report({"INFO"}, f"Rotation momentum {state}")
-        
+
 #         return {"FINISHED"}
 
 
@@ -979,23 +977,23 @@ class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
         settings = context.scene.rbx_anim_settings
         settings.rbx_hide_weld_bones = not settings.rbx_hide_weld_bones
         hide = settings.rbx_hide_weld_bones
-        
+
         armature = context.active_object
         if armature and armature.type == "ARMATURE":
             amt = armature.data
             count = 0
-            
+
             try:
                 collections = amt.collections
                 use_collections = True
             except Exception:
                 collections = None
                 use_collections = False
-            
+
             if use_collections:
                 weld_coll_name = "_WeldBones"
                 weld_coll = collections.get(weld_coll_name)
-                
+
                 if weld_coll is None:
                     weld_coll = collections.new(weld_coll_name)
                     for bone in amt.bones:
@@ -1005,7 +1003,7 @@ class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
                             count += 1
                 else:
                     count = len([b for b in amt.bones if b.get("rbx_joint_type") in ("Weld", "WeldConstraint")])
-                
+
                 weld_coll.is_visible = not hide
             else:
                 # Blender 3.x fallback
@@ -1014,10 +1012,10 @@ class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
                     if joint_type in ("Weld", "WeldConstraint"):
                         bone.hide = hide
                         count += 1
-            
+
             state = "hidden" if hide else "visible"
             self.report({"INFO"}, f"{count} weld bones now {state}")
-        
+
         return {"FINISHED"}
 
 
@@ -1565,4 +1563,3 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
             parts.append(f"{n_e} baked")
         self.report({"INFO"}, f"restored parent on {restored} bone(s) ({', '.join(parts)})")
         return {"FINISHED"}
-

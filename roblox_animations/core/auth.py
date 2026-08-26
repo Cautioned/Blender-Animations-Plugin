@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-from base64 import urlsafe_b64encode
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from secrets import token_urlsafe
@@ -46,7 +47,7 @@ _AUTH_URL = "https://apis.roblox.com/oauth/v1/authorize"
 _TOKEN_URL = "https://apis.roblox.com/oauth/v1/token"
 _REVOKE_URL = "https://apis.roblox.com/oauth/v1/token/revoke"
 _REDIRECT_PATH = "/oauth2/callback"
-_PORT = 31337  
+_PORT = 31337
 _HOSTED_REDIRECT_ENV = "RBX_OAUTH_REDIRECT_URI"
 # Asset delivery is documented under the legacy asset management scope even
 # though other Assets API endpoints use asset:read / asset:write.
@@ -65,6 +66,7 @@ class _TokenStore:
         self.access_token: str = ""
         self.expires_at: float = 0.0
         self.refresh_token: str = ""
+        self.id_token: str = ""
 
     @property
     def is_valid(self) -> bool:
@@ -75,9 +77,95 @@ class _TokenStore:
         self.access_token = ""
         self.expires_at = 0.0
         self.refresh_token = ""
+        self.id_token = ""
 
 
 _store = _TokenStore()
+_token_refresh_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Persistent token store (survives Blender restarts)
+# ---------------------------------------------------------------------------
+
+_TOKEN_FILE_NAME = "roblox_animations_auth.json"
+_store_loaded_from_disk = False
+
+
+def _token_file_path():
+    """Per-user, per-Blender-version config dir (portable across OSes)."""
+    try:
+        import bpy  # noqa: PLC0415
+
+        config_dir = bpy.utils.user_resource("CONFIG")
+    except Exception:
+        config_dir = None
+    if not config_dir:
+        config_dir = os.path.join(os.path.expanduser("~"), ".config", "roblox_animations")
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, _TOKEN_FILE_NAME)
+
+
+def _save_tokens_to_disk() -> None:
+    temp_path = None
+    try:
+        payload = {
+            "access_token": _store.access_token,
+            "expires_at": _store.expires_at,
+            "refresh_token": _store.refresh_token,
+            "id_token": _store.id_token,
+        }
+        path = _token_file_path()
+        directory = os.path.dirname(path)
+        descriptor, temp_path = tempfile.mkstemp(
+            prefix=".roblox_animations_auth_", suffix=".tmp", dir=directory
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except Exception as exc:
+        print(f"[RbxAuth] Failed to persist login: {exc}")
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _delete_tokens_from_disk() -> None:
+    try:
+        path = _token_file_path()
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _load_tokens_from_disk() -> None:
+    global _store_loaded_from_disk
+    if _store_loaded_from_disk:
+        return
+    _store_loaded_from_disk = True
+    try:
+        path = _token_file_path()
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        _store.access_token = str(payload.get("access_token") or "")
+        _store.expires_at = float(payload.get("expires_at") or 0.0)
+        _store.refresh_token = str(payload.get("refresh_token") or "")
+        _store.id_token = str(payload.get("id_token") or "")
+    except Exception as exc:
+        print(f"[RbxAuth] Failed to restore saved login: {exc}")
+
 
 # ---------------------------------------------------------------------------
 # Login background-thread state
@@ -195,6 +283,19 @@ def _apply_token_response(token_data: dict) -> None:
     new_rt = token_data.get("refresh_token")
     if new_rt:
         _store.refresh_token = new_rt
+    new_id = token_data.get("id_token")
+    if new_id:
+        _store.id_token = new_id
+    _save_tokens_to_disk()
+
+    # Auth state changed: drop caches so assets fetched (or failed) while
+    # anonymous are retried with credentials.
+    try:
+        from ..rig import textures  # noqa: PLC0415
+
+        textures.invalidate_texture_cache()
+    except Exception:
+        pass
 
 
 def _refresh_tokens(refresh_token: str) -> None:
@@ -219,10 +320,58 @@ def _refresh_tokens(refresh_token: str) -> None:
 
 
 def is_logged_in() -> bool:
-    """True if we have a valid access token or a session refresh token."""
-    if _store.is_valid:
-        return True
+    """True only while a usable OAuth bearer token is available locally."""
+    _load_tokens_from_disk()
+    return _store.is_valid
+
+
+def token_expiry_seconds():
+    """Seconds until the access token expires (30 s refresh margin
+    already subtracted), or None when no access token is loaded.
+
+    The value is a snapshot; a refresh can happen on the next private
+    asset fetch without any UI action.
+    """
+    _load_tokens_from_disk()
+    if not _store.access_token:
+        return None
+    return max(0.0, _store.expires_at - 30.0 - time.time())
+
+
+def logged_in_username():
+    """The logged-in account's display name from the id_token claims,
+    or None when unavailable.
+
+    The id_token payload is decoded locally for DISPLAY ONLY; no
+    signature verification is performed here (token authenticity is
+    established when Roblox's token endpoint issued it over HTTPS).
+    """
+    _load_tokens_from_disk()
+    if not _store.id_token:
+        return None
+    try:
+        segment = _store.id_token.split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        claims = json.loads(urlsafe_b64decode(segment).decode("utf-8"))
+        return (
+            claims.get("preferred_username")
+            or claims.get("nickname")
+            or claims.get("name")
+        )
+    except Exception:
+        return None
+
+
+def has_saved_login() -> bool:
+    """True when a refreshable saved session exists but is not yet verified."""
+    _load_tokens_from_disk()
     return bool(_store.refresh_token)
+
+
+def _discard_invalid_saved_login() -> None:
+    """Remove a refresh token Roblox has explicitly rejected."""
+    _store.clear()
+    _delete_tokens_from_disk()
 
 
 def is_login_in_progress() -> bool:
@@ -240,17 +389,28 @@ def get_auth_headers() -> dict:
 
     Call only from the Blender main thread.
     """
+    _load_tokens_from_disk()
     if _store.is_valid:
         return {"Authorization": f"Bearer {_store.access_token}"}
 
-    refresh_token = _store.refresh_token
-    if refresh_token:
-        try:
-            _refresh_tokens(refresh_token)
-            if _store.is_valid:
-                return {"Authorization": f"Bearer {_store.access_token}"}
-        except Exception as exc:
-            print(f"[RbxAuth] Token refresh failed: {exc}")
+    # A refresh response can rotate the refresh token. Serialize it even if a
+    # future caller accidentally reaches this accessor concurrently.
+    with _token_refresh_lock:
+        if _store.is_valid:
+            return {"Authorization": f"Bearer {_store.access_token}"}
+        refresh_token = _store.refresh_token
+        if refresh_token:
+            try:
+                _refresh_tokens(refresh_token)
+                if _store.is_valid:
+                    return {"Authorization": f"Bearer {_store.access_token}"}
+            except Exception as exc:
+                print(f"[RbxAuth] Token refresh failed: {exc}")
+                # A 400 from the OAuth token endpoint is an invalid/expired/revoked
+                # refresh grant, not a transient asset-delivery failure. Keeping it
+                # made the UI report an authenticated account forever.
+                if "Token request failed (400)" in str(exc):
+                    _discard_invalid_saved_login()
 
     return {}
 
@@ -259,6 +419,7 @@ def logout() -> None:
     """Revoke tokens server-side and clear all local state.  Main thread only."""
     refresh_token = _store.refresh_token
     _store.clear()
+    _delete_tokens_from_disk()
 
     if refresh_token:
         try:
@@ -399,7 +560,6 @@ def _login_timer_callback() -> Optional[float]:
     if "token_data" in _login_result:
         try:
             _apply_token_response(_login_result["token_data"])
-            print("[RbxAuth] Login successful.")
         except Exception as exc:
             print(f"[RbxAuth] Failed to store tokens: {exc}")
     elif "error" in _login_result:

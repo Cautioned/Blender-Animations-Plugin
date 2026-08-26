@@ -3,6 +3,7 @@ Request processing and task management for the animation server.
 """
 
 import json
+import math
 import traceback
 import zlib
 import bpy
@@ -23,15 +24,74 @@ from ..animation.serialization import (
     resolve_export_frame_range,
 )
 from ..animation.import_export import import_animation_preserve_ik
+from .live_sync_delta import animation_revision, create_delta
 
 
 # Global request queues
 pending_requests = []
 pending_responses = {}
+live_sync_snapshots = {}
 
 transform_to_blender = bpy_extras.io_utils.axis_conversion(
     from_forward="Z", from_up="Y", to_forward="-Y", to_up="Z"
 ).to_4x4()  # transformation matrix from Y-up to Z-up
+
+# Deform Pose CFrames use the exporter-specific (-x, y, -z) basis. This is a
+# 180-degree Y rotation and is its own inverse. It is deliberately not the
+# general Roblox-object Y-up -> Blender Z-up conversion used by Motor6D rigs.
+_DEFORM_DELTA_SWIZZLE = Matrix.Diagonal((-1.0, 1.0, -1.0, 1.0))
+
+
+def _roblox_deform_delta_to_blender(bone_transform, translation_scale=1.0):
+    converted = _DEFORM_DELTA_SWIZZLE @ bone_transform @ _DEFORM_DELTA_SWIZZLE
+    converted.translation = converted.to_translation() * float(translation_scale)
+    return converted
+
+
+def _resolve_deform_translation_scale(export_info):
+    """Recover the exact translation divisor used by deform serialization."""
+    explicit_scale = export_info.get("deform_translation_scale_factor")
+    if explicit_scale is not None:
+        candidate = explicit_scale
+    else:
+        candidate = export_info.get("deform_scale_factor", 1.0)
+        if export_info.get("deform_scale_mode") in {"auto", "auto_calibrated"}:
+            try:
+                candidate = float(candidate) * float(
+                    export_info.get("armature_object_scale", 1.0)
+                )
+            except (TypeError, ValueError):
+                return 1.0
+
+    try:
+        candidate = float(candidate)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(candidate) or abs(candidate) < 1e-8:
+        return 1.0
+    return candidate
+
+
+def _find_animation_pose_bone(armature, bone_name, is_deform_rig):
+    exact = armature.pose.bones.get(bone_name)
+    if not is_deform_rig:
+        return exact
+
+    deform_matches = []
+    for candidate in armature.pose.bones:
+        source_name = candidate.bone.get("rbx_source_name", candidate.name)
+        legacy_name_match = candidate.name == bone_name or candidate.name.startswith(
+            f"{bone_name}."
+        )
+        if (
+            candidate.bone.get("rbx_is_deform_bone", False)
+            and (source_name == bone_name or legacy_name_match)
+        ):
+            deform_matches.append(candidate)
+
+    if deform_matches:
+        return deform_matches[0]
+    return exact
 
 
 def _get_timeline_scene_for_armature(context_scene, armature):
@@ -77,15 +137,24 @@ def process_pending_requests():
             request_type = request[0]
 
             if request_type == "export_animation":
-                if len(request) >= 4:
+                if len(request) >= 6:
+                    _, task_id, armature_name, target_bone_rest, live_preview, delta_base_hash = request
+                elif len(request) >= 5:
+                    _, task_id, armature_name, target_bone_rest, live_preview = request
+                    delta_base_hash = None
+                elif len(request) >= 4:
                     _, task_id, armature_name, target_bone_rest = request
+                    live_preview = False
+                    delta_base_hash = None
                 else:
                     _, task_id, armature_name = request
                     target_bone_rest = None
+                    live_preview = False
+                    delta_base_hash = None
                 print(
                     f"Blender Addon: Dispatching export_animation task (task_id={task_id}, armature={armature_name})"
                 )
-                execute_in_main_thread(task_id, armature_name, target_bone_rest)
+                execute_in_main_thread(task_id, armature_name, target_bone_rest, live_preview, delta_base_hash)
             elif request_type == "list_armatures":
                 _, task_id = request
                 print(
@@ -187,7 +256,7 @@ def execute_list_armatures(task_id):
         )
 
 
-def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
+def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_preview=False, delta_base_hash=None):
     """Execute the animation export in the main thread"""
     try:
         if not armature_name:
@@ -205,7 +274,8 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
         if ao.type != "ARMATURE":
             pending_responses[task_id] = (
                 False,
-                f"Object '{armature_name}' is not an armature (type: {ao.type}). Please select a valid armature object.",
+                f"Object '{armature_name}' is not an armature "
+                f"(type: {ao.type}). Please select a valid armature object.",
             )
             return
 
@@ -252,6 +322,7 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
                 f"No animation data found on '{armature_name}' or its constraint targets. Please add keyframes or NLA strips.",
             )
             return
+
         # --- End pre-export validations ---
 
         timeline_scene = _get_timeline_scene_for_armature(context_scene, ao)
@@ -271,6 +342,12 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
                 getattr(timeline_scene, "frame_step", original_frame_step) or 1
             )
 
+        # Live preview deliberately samples dense/baked curves at 15 fps. A
+        # normal import remains lossless; this temporary scene value is restored.
+        if live_preview:
+            preview_step = max(1, int(round(desired_fps / 15.0)))
+            context_scene.frame_step = max(context_scene.frame_step, preview_step)
+
         serialized = None
         try:
             serialized = serialize(ao, target_bone_rest=target_bone_rest)
@@ -278,7 +355,7 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
             if changed_scene_timeline:
                 context_scene.frame_start = original_frame_start
                 context_scene.frame_end = original_frame_end
-                context_scene.frame_step = original_frame_step
+            context_scene.frame_step = original_frame_step
 
         if not serialized:
             pending_responses[task_id] = (
@@ -294,8 +371,31 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None):
             )
             return
 
-        encoded = json.dumps(serialized, separators=(",", ":"))
-        compressed = zlib.compress(encoded.encode("utf-8"))
+        if delta_base_hash is not None:
+            calibration_key = json.dumps(target_bone_rest, sort_keys=True,
+                                         separators=(",", ":")) if target_bone_rest else ""
+            cache_key = (armature_name, calibration_key)
+            previous = live_sync_snapshots.get(cache_key)
+            current_hash = animation_revision(serialized)
+            delta = create_delta(previous, serialized) if previous and animation_revision(
+                previous) == delta_base_hash else None
+            live_sync_snapshots[cache_key] = serialized
+            full_payload = {
+                "type": "animation_full",
+                "hash": current_hash,
+                "animation": serialized,
+            }
+            full_encoded = json.dumps(full_payload, separators=(",", ":")).encode("utf-8")
+            full_compressed = zlib.compress(full_encoded)
+            if delta is not None:
+                delta_encoded = json.dumps(delta, separators=(",", ":")).encode("utf-8")
+                delta_compressed = zlib.compress(delta_encoded)
+                compressed = delta_compressed if len(delta_compressed) < len(full_compressed) else full_compressed
+            else:
+                compressed = full_compressed
+        else:
+            encoded = json.dumps(serialized, separators=(",", ":"))
+            compressed = zlib.compress(encoded.encode("utf-8"))
 
         pending_responses[task_id] = (True, compressed)
 
@@ -370,8 +470,11 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
             else:
                 pass
 
-            fps = animation_data.get("export_info", {}).get("fps", get_scene_fps())
+            export_info = animation_data.get("export_info", {})
+            fps = export_info.get("fps", get_scene_fps())
             set_scene_fps(fps)
+
+            deform_translation_scale = _resolve_deform_translation_scale(export_info)
 
             scene = bpy.context.scene
             scene.frame_start = 0
@@ -412,20 +515,30 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 state = kf_data["kf"]
 
                 bones_to_process = []
-                for bone_name in state.keys():
-                    pose_bone = ao.pose.bones.get(bone_name)
+                for source_bone_name in state.keys():
+                    pose_bone = _find_animation_pose_bone(
+                        ao,
+                        source_bone_name,
+                        is_deform_rig,
+                    )
                     if pose_bone:
-                        bones_to_process.append(pose_bone)
+                        if (
+                            is_deform_rig
+                            and pose_bone.bone.get("rbx_is_deform_bone", False)
+                            and "rbx_source_name" not in pose_bone.bone
+                        ):
+                            pose_bone.bone["rbx_source_name"] = source_bone_name
+                        bones_to_process.append((pose_bone, source_bone_name))
 
-                bones_to_process.sort(key=lambda b: len(b.parent_recursive))
+                bones_to_process.sort(key=lambda item: len(item[0].parent_recursive))
 
                 # Simplified single-pass processing loop.
                 # By iterating through bones sorted by hierarchy (parents first), we ensure
                 # that when we calculate a child's matrix, the parent's matrix for the
                 # current frame has already been set.
-                for pose_bone in bones_to_process:
+                for pose_bone, source_bone_name in bones_to_process:
                     bone_name = pose_bone.name
-                    pose_data = state.get(bone_name)
+                    pose_data = state.get(source_bone_name)
                     if not pose_data:
                         continue
 
@@ -473,13 +586,29 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                         and "transform1" in pose_bone.bone
                     )
 
-                    if not has_motor6d_props:
-                        # Deform animation data is a local pose delta. Apply it to
-                        # matrix_basis so Blender composes it through the parent chain;
-                        # assigning matrix_local @ delta would treat child deltas as
-                        # armature-space targets and rotate them into the wrong axes.
+                    if is_deform_bone:
+                        # Bones built from .rbxm Bone instances have a rest frame
+                        # (matrix_local) that exactly matches the Roblox bone's
+                        # CFrame, so the Roblox-local delta maps directly onto
+                        # matrix_basis with no axis swizzle. Legacy/OBJ deform
+                        # bones use the (-x, y, -z) swizzle basis instead.
+                        if pose_bone.bone.get("rbx_joint_type") == "Bone" and "transform" in pose_bone.bone:
+                            basis = bone_transform.copy()
+                            if deform_translation_scale != 1.0:
+                                basis.translation = basis.to_translation() * float(deform_translation_scale)
+                            pose_bone.matrix_basis = basis
+                        else:
+                            pose_bone.matrix_basis = _roblox_deform_delta_to_blender(
+                                bone_transform,
+                                deform_translation_scale,
+                            )
+                    elif not has_motor6d_props:
+                        # Helper bones without Motor6D metadata retain the legacy
+                        # object-axis conversion.
                         pose_bone.matrix_basis = (
-                            transform_to_blender @ bone_transform @ transform_to_blender.inverted()
+                            transform_to_blender
+                            @ bone_transform
+                            @ transform_to_blender.inverted()
                         )
                     else:  # Motor6D rig
                         back_trans = transform_to_blender.inverted()

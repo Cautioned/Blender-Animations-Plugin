@@ -91,6 +91,79 @@ return function()
 			expect(rig:FindRigPart("RightShoulderPart")).to.be.ok()
 		end)
 
+		it("should allow same-name motor6ds under different parents during import", function()
+			local torso = mock_rig:FindFirstChild("Torso")
+			local head = mock_rig:FindFirstChild("Head")
+			expect(torso).to.be.ok()
+			expect(head).to.be.ok()
+
+			local neckA = Instance.new("Part")
+			neckA.Name = "NeckA"
+			neckA.Parent = mock_rig
+			local jointA = Instance.new("Motor6D")
+			jointA.Name = "Neck"
+			jointA.Part0 = torso
+			jointA.Part1 = neckA
+			jointA.Parent = torso
+
+			local neckB = Instance.new("Part")
+			neckB.Name = "NeckB"
+			neckB.Parent = mock_rig
+			local jointB = Instance.new("Motor6D")
+			jointB.Name = "Neck"
+			jointB.Part0 = head
+			jointB.Part1 = neckB
+			jointB.Parent = head
+
+			local rig = rig_module.new(mock_rig)
+			local success, loadError = pcall(function()
+				rig:LoadAnimation({
+					t = 1,
+					kfs = {
+						{ t = 0, kf = { Neck = { components = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 } } } },
+					},
+				})
+			end)
+			expect(success).to.equal(true)
+			if not success then
+				error(loadError)
+			end
+		end)
+
+		it("should still reject same-name motor6ds under the same parent", function()
+			local torso = mock_rig:FindFirstChild("Torso")
+			expect(torso).to.be.ok()
+
+			local partA = Instance.new("Part")
+			partA.Name = "SameParentA"
+			partA.Parent = mock_rig
+			local jointA = Instance.new("Motor6D")
+			jointA.Name = "DupJoint"
+			jointA.Part0 = torso
+			jointA.Part1 = partA
+			jointA.Parent = torso
+
+			local partB = Instance.new("Part")
+			partB.Name = "SameParentB"
+			partB.Parent = mock_rig
+			local jointB = Instance.new("Motor6D")
+			jointB.Name = "DupJoint"
+			jointB.Part0 = torso
+			jointB.Part1 = partB
+			jointB.Parent = torso
+
+			local rig = rig_module.new(mock_rig)
+			local success = pcall(function()
+				rig:LoadAnimation({
+					t = 1,
+					kfs = {
+						{ t = 0, kf = { DupJoint = { components = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 } } } },
+					},
+				})
+			end)
+			expect(success).to.equal(false)
+		end)
+
 		it("should build head chains connected by animationconstraints", function()
 			local head = mock_rig:FindFirstChild("Head")
 			local torso = mock_rig:FindFirstChild("Torso")
@@ -454,18 +527,65 @@ return function()
 			local keyframes = kfs:GetKeyframes()
 
 			expect(#keyframes).to.equal(2)
-			local faceControls0 = keyframes[1]:FindFirstChild("FaceControls")
+			local head0 = keyframes[1]:FindFirstChild("Head", true)
+			expect(head0).to.be.ok()
+			local faceControls0 = head0:FindFirstChild("FaceControls")
 			expect(faceControls0).to.be.ok()
 			local jawDrop0 = faceControls0:FindFirstChild("JawDrop")
 			expect(jawDrop0).to.be.ok()
 			expect(jawDrop0:IsA("NumberPose")).to.equal(true)
 			expect((jawDrop0 :: NumberPose).Value).to.be.near(0.25)
 
-			local faceControls1 = keyframes[2]:FindFirstChild("FaceControls")
+			local head1 = keyframes[2]:FindFirstChild("Head", true)
+			expect(head1).to.be.ok()
+			local faceControls1 = head1:FindFirstChild("FaceControls")
 			expect(faceControls1).to.be.ok()
 			local jawDrop1 = faceControls1:FindFirstChild("JawDrop")
 			expect(jawDrop1).to.be.ok()
 			expect((jawDrop1 :: NumberPose).Value).to.be.near(0.75)
+		end)
+
+		it("should only write face controls on explicit face keyframes", function()
+			local rig = rig_module.new(mock_rig)
+			local anim_data = {
+				t = 1,
+				kfs = {
+					{
+						t = 0,
+						kf = {},
+						fc = {
+							JawDrop = { value = 0.25, easingStyle = "Linear", easingDirection = "Out" },
+						},
+					},
+					{
+						t = 0.5,
+						kf = {
+							Head = { 0, 3, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 },
+						},
+					},
+					{
+						t = 1,
+						kf = {},
+						fc = {
+							JawDrop = { value = 0.75, easingStyle = "Linear", easingDirection = "Out" },
+						},
+					},
+				},
+			}
+
+			rig:LoadAnimation(anim_data)
+			local kfs = rig:ToRobloxAnimation()
+
+			local middleKeyframe = nil
+			for _, keyframe in ipairs(kfs:GetKeyframes()) do
+				if math.abs(keyframe.Time - 0.5) < 0.001 then
+					middleKeyframe = keyframe
+					break
+				end
+			end
+
+			expect(middleKeyframe).to.be.ok()
+			expect(middleKeyframe:FindFirstChild("FaceControls", true)).to.never.be.ok()
 		end)
 
 		it("should ignore deform marker keys while loading poses", function()

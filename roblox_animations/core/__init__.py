@@ -6,7 +6,6 @@ used throughout the addon.
 """
 
 from .constants import (
-    version,
     blender_version,
     get_blender_version,
     get_transform_to_blender,
@@ -38,7 +37,6 @@ from .utils import (
 
 __all__ = [
     # Constants
-    "version",
     "blender_version",
     "get_blender_version",
     "get_transform_to_blender",

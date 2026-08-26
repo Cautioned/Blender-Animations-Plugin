@@ -4,18 +4,86 @@ HTTP server setup and management for live sync functionality.
 
 import socket
 import socketserver
+import time
 import traceback
 from typing import Optional
 
 import bpy
 
 from .handler import AnimationHandler
+from .websocket import LiveSyncWebSocketServer
+from .requests import execute_in_main_thread, pending_responses
+from ..core.utils import get_armature_timeline_hash
 
 # Global server state managed via Blender timers
 server_instance: Optional["SafeTCPServer"] = None
 server_should_run: bool = False
 server_port: Optional[int] = None
 _timer_registered: bool = False
+websocket_server: Optional[LiveSyncWebSocketServer] = None
+_last_websocket_publish: float = 0.0
+_dirty_armatures: dict[str, float] = {}
+_processing_websocket_sync: bool = False
+
+
+def _live_sync_depsgraph_handler(_scene, depsgraph) -> None:
+    """Mark subscribed actions dirty without hashing them on every graph update."""
+    if websocket_server is None or _processing_websocket_sync:
+        return
+    subscribed = websocket_server.subscribed_armatures()
+    if not subscribed:
+        return
+    try:
+        action_changed = any(isinstance(update.id, bpy.types.Action) for update in depsgraph.updates)
+    except Exception:
+        action_changed = True
+    if action_changed:
+        dirty_at = time.monotonic()
+        for armature in subscribed:
+            _dirty_armatures[armature] = dirty_at
+
+
+def _register_live_sync_handler() -> None:
+    if _live_sync_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_live_sync_depsgraph_handler)
+
+
+def _unregister_live_sync_handler() -> None:
+    if _live_sync_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_live_sync_depsgraph_handler)
+
+
+def _process_websocket_sync_requests() -> None:
+    global _processing_websocket_sync
+    if websocket_server is None:
+        return
+    for client, request in websocket_server.drain_sync_requests():
+        request_id = request.get("request_id", "")
+        trigger_hash = request.get("trigger_hash", "")
+        armature = request.get("armature", "")
+        task_id = f"ws:{request_id}:{time.time_ns()}"
+        try:
+            _processing_websocket_sync = True
+            execute_in_main_thread(
+                task_id,
+                armature,
+                request.get("target_bone_rest"),
+                False,
+                request.get("base_hash", ""),
+            )
+            success, payload = pending_responses.pop(task_id)
+        except Exception as exc:
+            success, payload = False, str(exc)
+            traceback.print_exc()
+        finally:
+            _processing_websocket_sync = False
+        websocket_server.publish_sync_response(
+            client,
+            request_id,
+            trigger_hash,
+            success,
+            payload,
+        )
 
 
 def get_server_status() -> bool:
@@ -70,6 +138,25 @@ def _server_tick() -> Optional[float]:
             print(f"Blender Addon: Error in server request loop: {exc}")
             traceback.print_exc()
 
+    _process_websocket_sync_requests()
+
+    global _last_websocket_publish
+    if websocket_server is not None:
+        now = time.monotonic()
+        for armature in websocket_server.drain_new_subscriptions():
+            _dirty_armatures[armature] = now - 0.025
+        ready = [name for name, dirty_at in _dirty_armatures.items() if now - dirty_at >= 0.025]
+        for armature in ready:
+            _dirty_armatures.pop(armature, None)
+            websocket_server.publish_updates(
+                lambda name, expected=armature: get_armature_timeline_hash(name) if name == expected else ""
+            )
+        # Slow fallback covers initial subscriptions, timeline settings, and
+        # Blender builds that omit an Action dependency update.
+        if now - _last_websocket_publish >= 2.0:
+            _last_websocket_publish = now
+            websocket_server.publish_updates(get_armature_timeline_hash)
+
     # Re-run quickly so we remain responsive without blocking Blender
     return 0.01
 
@@ -120,19 +207,25 @@ def _unregister_server_timer() -> None:
 def handle_blend_file_loaded(_dummy=None) -> None:
     """Restore the server request timer after Blender opens another file."""
     if server_should_run and server_instance is not None:
+        _register_live_sync_handler()
         ensure_server_timer_running()
 
 
 def start_server(port: int = 31337) -> bool:
     """Start the live sync server using Blender timers instead of threads."""
-    global server_instance, server_should_run, server_port, _timer_registered
+    global server_instance, server_should_run, server_port, _timer_registered, websocket_server, _last_websocket_publish
 
     if server_instance is not None:
         stop_server()
 
     try:
+        _dirty_armatures.clear()
         server_instance = SafeTCPServer(("127.0.0.1", port), AnimationHandler)
         server_instance.timeout = 0  # Non-blocking select inside handle_request
+        websocket_server = LiveSyncWebSocketServer(port + 1)
+        websocket_server.start()
+        _register_live_sync_handler()
+        _last_websocket_publish = 0.0
         server_should_run = True
         server_port = port
 
@@ -150,6 +243,11 @@ def start_server(port: int = 31337) -> bool:
             except Exception:
                 pass
 
+        if websocket_server is not None:
+            websocket_server.stop()
+            websocket_server = None
+        _unregister_live_sync_handler()
+
         server_instance = None
         server_should_run = False
         server_port = None
@@ -161,17 +259,26 @@ def start_server(port: int = 31337) -> bool:
 
 def stop_server() -> None:
     """Stop the live sync server and clean up resources."""
-    global server_instance, server_should_run, server_port, _timer_registered
+    global server_instance, server_should_run, server_port, _timer_registered, websocket_server
 
     if server_instance is None:
         server_should_run = False
         server_port = None
+        _unregister_live_sync_handler()
+        if websocket_server is not None:
+            websocket_server.stop()
+            websocket_server = None
         _unregister_server_timer()
         return
 
     print("Blender Addon: Stop server called.")
 
     server_should_run = False
+    _dirty_armatures.clear()
+    _unregister_live_sync_handler()
+    if websocket_server is not None:
+        websocket_server.stop()
+        websocket_server = None
     try:
         try:
             server_instance.server_close()

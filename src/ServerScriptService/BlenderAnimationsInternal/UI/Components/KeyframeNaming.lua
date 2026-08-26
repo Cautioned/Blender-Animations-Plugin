@@ -39,6 +39,7 @@ function KeyframeNaming.addKeyframeName()
 	end)
 
 	State.keyframeNames:set(currentKeyframes)
+	State.animationDirty:set(true)
 	State.keyframeNameInput:set("Name")
 	State.keyframeValueInput:set("")
 end
@@ -47,6 +48,7 @@ function KeyframeNaming.removeKeyframeName(index)
 	local currentKeyframes = State.keyframeNames:get()
 	table.remove(currentKeyframes, index)
 	State.keyframeNames:set(currentKeyframes)
+	State.animationDirty:set(true)
 end
 
 function KeyframeNaming.createKeyframeNamingUI(services: any, layoutOrder: number?)

@@ -89,7 +89,7 @@ end
 
 local function refreshPlayback(services: any)
 	if services and services.playbackService then
-		services.playbackService:stopAnimationAndDisconnect()
+		-- playAllRigs handles stop internally; no need for a separate full stop here
 		local kfsOverride = State.currentKeyframeSequence
 
 		-- If we are replaying an existing sequence (e.g., a saved animation),
@@ -110,7 +110,7 @@ local function refreshPlayback(services: any)
 			end
 		end
 
-		services.playbackService:playCurrentAnimation(State.activeAnimator, kfsOverride)
+		services.playbackService:playAllRigs()
 	end
 end
 

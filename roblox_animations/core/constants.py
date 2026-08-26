@@ -2,8 +2,10 @@
 Constants and configuration for the Roblox Animations Blender Addon.
 """
 
-# Version number
-version = 2.63
+from typing import List, Optional
+
+from mathutils import Matrix
+
 
 # Blender version (will be set when needed)
 blender_version = None
@@ -20,28 +22,29 @@ def get_blender_version():
 
 
 # coordinate system transformation matrix (y-up to z-up)
-transform_to_blender = None
+transform_to_blender: Optional[Matrix] = None
 
 
-def get_transform_to_blender():
+def get_transform_to_blender() -> Matrix:
     """Get the transform matrix, initializing it if needed"""
     global transform_to_blender
     if transform_to_blender is None:
         try:
             import bpy_extras
 
-            transform_to_blender = bpy_extras.io_utils.axis_conversion(
+            converted = bpy_extras.io_utils.axis_conversion(
                 from_forward="Z", from_up="Y", to_forward="-Y", to_up="Z"
-            ).to_4x4()
+            )
+            transform_to_blender = (
+                converted.to_4x4() if converted is not None else Matrix.Identity(4)
+            )
         except ImportError:
-            from mathutils import Matrix
-
             transform_to_blender = Matrix.Identity(4)
     return transform_to_blender
 
 
 # Identity CFrame components matrix
-identity_cf = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1]
+identity_cf: List[float] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 
 # CFrame rounding settings
 cf_round = False  # round cframes before exporting? (reduce size)

@@ -61,7 +61,7 @@ def _on_gravity_update(self, context):
     """Callback when gravity is changed - re-analyze physics if enabled."""
     try:
         from ..rig.physics import is_physics_enabled, analyze_animation
-        
+
         if is_physics_enabled():
             # Find the armature being analyzed
             from ..rig.physics import _physics_data
@@ -227,12 +227,13 @@ class RobloxAnimationSettings(PropertyGroup):
     )
 
     rbx_max_studs_per_frame: FloatProperty(
-        name="Max studs/frame @30fps",
+        name="Motion warning threshold @30fps",
         description=(
-            "maximum allowed displacement benchmarked at 30 fps; the validator "
-            "scales this per frame to match the current scene fps"
+            "Per-frame displacement threshold benchmarked at 30 fps. The current "
+            "Roblox client-tracker default is 1.5 studs; the validator scales this "
+            "to match the current scene fps."
         ),
-        default=1.0,
+        default=1.5,
         min=0.0,
     )
 

@@ -351,8 +351,6 @@ class TestWorldSpaceUnparent(unittest.TestCase):
 
     def test_unparent_preserves_world_position(self):
         """World position at every frame stays the same after unparent."""
-        ao = self.armature_obj
-
         # record pre-unparent positions
         positions_before = {}
         for f in range(1, 21):

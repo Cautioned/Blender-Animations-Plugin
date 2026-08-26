@@ -1,9 +1,11 @@
+# pyright: reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
 """
 Utility functions for the Roblox Animations Blender Addon.
 """
 
 import bpy
 import hashlib
+import re
 import time
 from mathutils import Matrix, Vector
 from .constants import (
@@ -53,13 +55,13 @@ def get_animation_data_action_slot(animation_data, action=None):
 
 def get_action_fcurves(action, slot=None):
     """Return the channelbag F-Curves for an action (Blender 4.4+ API).
-    
+
     Handles legacy rigs imported into newer Blender versions by checking
     multiple sources for fcurves and preferring non-empty results.
     """
     blender_version = get_blender_version()
     channelbag = get_action_channelbag(action, slot=slot)
-    
+
     # Try channelbag fcurves first
     if channelbag and hasattr(channelbag, "fcurves"):
         channelbag_fcurves = channelbag.fcurves
@@ -72,7 +74,7 @@ def get_action_fcurves(action, slot=None):
     legacy_fcurves = getattr(action, "fcurves", None)
     if legacy_fcurves is not None and len(legacy_fcurves) > 0:
         return legacy_fcurves
-    
+
     # If channelbag exists but was empty, still return it (might be intentionally empty)
     if channelbag and hasattr(channelbag, "fcurves"):
         return channelbag.fcurves
@@ -151,7 +153,7 @@ def pose_bone_set_hidden(pose_bone, value):
 
 def get_action_channelbag(action, slot=None):
     """Return the ensured channelbag for an action slot, with legacy fallbacks.
-    
+
     Handles the case where older rigs imported into Blender 4.4+ may have
     empty legacy slots - this function will find a slot with actual animation data.
     """
@@ -169,7 +171,7 @@ def get_action_channelbag(action, slot=None):
             # This handles legacy rigs that may have empty slots from older Blender versions
             best_slot = None
             best_slot_fcurve_count = 0
-            
+
             for candidate_slot in slots_attr:
                 # Try to get fcurve count for this slot
                 fcurve_count = 0
@@ -182,7 +184,7 @@ def get_action_channelbag(action, slot=None):
                         fcurve_count = len(candidate_slot.fcurves)
                 except Exception:
                     pass
-                
+
                 # Prefer slot with more fcurves
                 if fcurve_count > best_slot_fcurve_count:
                     best_slot = candidate_slot
@@ -190,7 +192,7 @@ def get_action_channelbag(action, slot=None):
                 elif best_slot is None:
                     # If no slot has fcurves yet, at least pick the first one
                     best_slot = candidate_slot
-            
+
             if best_slot is not None:
                 target_slot = best_slot
             elif slots_attr:
@@ -398,6 +400,70 @@ def armature_items(self, context):
     return items
 
 
+COPY_RIG_CONSTRAINT_TYPES = frozenset(
+    {"COPY_TRANSFORMS", "COPY_LOCATION", "COPY_ROTATION"}
+)
+
+
+def _copy_constraint_target_counts(armature):
+    """Map external armature -> number of copy constraints on `armature`
+    pointing at it. Used to detect proxy/control rig wiring."""
+    target_counts = {}
+    if not armature or getattr(armature, "type", None) != "ARMATURE":
+        return target_counts
+    for pb in armature.pose.bones:
+        for constraint in pb.constraints:
+            if constraint.type not in COPY_RIG_CONSTRAINT_TYPES:
+                continue
+            target = getattr(constraint, "target", None)
+            if (
+                target is None
+                or getattr(target, "type", None) != "ARMATURE"
+                or target == armature
+            ):
+                continue
+            target_counts[target] = target_counts.get(target, 0) + 1
+            break  # one copy constraint per bone is enough
+    return target_counts
+
+
+def find_constraint_driven_armature(armature):
+    """Detect whether `armature` is a proxy/control rig driving another
+    armature via copy constraints.
+
+    Returns (source_armature, constraint_map) or (None, {}), where
+    source_armature is whichever external armature has the most copy
+    constraints pointing at it and constraint_map maps each driven bone
+    to (target_armature, subtarget_bone)."""
+    target_counts = _copy_constraint_target_counts(armature)
+    if not target_counts:
+        return None, {}
+    target = max(target_counts, key=lambda candidate: target_counts[candidate])
+    constraint_map = {}
+    for pb in armature.pose.bones:
+        for constraint in pb.constraints:
+            if constraint.type not in COPY_RIG_CONSTRAINT_TYPES:
+                continue
+            if getattr(constraint, "target", None) == target:
+                constraint_map[pb.name] = (target, constraint.subtarget or pb.name)
+                break
+    return target, constraint_map
+
+
+def find_armatures_driving(armature):
+    """Return armatures in the file whose copy constraints point at
+    `armature` (control rigs that drive it)."""
+    drivers = []
+    if not armature or getattr(armature, "type", None) != "ARMATURE":
+        return drivers
+    for obj in bpy.data.objects:
+        if obj == armature or getattr(obj, "type", None) != "ARMATURE":
+            continue
+        if _copy_constraint_target_counts(obj).get(armature, 0) > 0:
+            drivers.append(obj)
+    return drivers
+
+
 # Matrix and CFrame utilities
 def cf_to_mat(cf):
     """Convert CFrame to matrix"""
@@ -427,17 +493,29 @@ def mat_to_cf(mat):
     return r_mat
 
 
+def solve_equipped_joint_matrix(parent_mat, c0_cf, c1_cf):
+    """Solve the Roblox joint equation for the equipped part matrix.
+
+    ParentPart.CFrame * C0 = WeaponRoot.CFrame * C1
+    => WeaponRoot.CFrame = ParentPart.CFrame * C0 * C1^-1
+
+    `c0_cf` and `c1_cf` are 12-component CFrame lists (pos xyz +
+    row-major 3x3).  `parent_mat` is a mathutils Matrix.
+    """
+    return parent_mat @ cf_to_mat(c0_cf) @ cf_to_mat(c1_cf).inverted()
+
+
 def to_matrix(value):
     """Safely convert IDProperty value to Matrix"""
     if isinstance(value, Matrix):
         return value
-    
+
     # Handle IDPropertyArray or list
     if hasattr(value, "to_list"):
         value = value.to_list()
     elif hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
         value = list(value)
-    
+
     if isinstance(value, list):
         if len(value) == 4:
             # Assume list of lists (4x4)
@@ -452,12 +530,12 @@ def to_matrix(value):
             except Exception:
                 pass
         elif len(value) == 12:
-             # Assume CFrame list
+            # Assume CFrame list
             try:
                 return cf_to_mat(value)
             except Exception:
                 pass
-                
+
     return Matrix.Identity(4)
 
 
@@ -465,39 +543,39 @@ def get_rig_facing_direction(armature_obj):
     """
     Determine the facing direction of a rig by extracting the forward vector
     from the root bone's transform.
-    
+
     Args:
         armature_obj: The armature object (bpy.types.Object with type='ARMATURE')
-    
+
     Returns:
         tuple: (forward_vector, root_bone_name) where:
             - forward_vector: Vector in Blender space representing the forward direction
             - root_bone_name: Name of the root bone used, or None if not found
-    
+
     Returns None, None if the armature has no root bone or transform data.
     """
     if not armature_obj or armature_obj.type != "ARMATURE":
         return None, None
-    
+
     # Find root bone (no parent)
     root_bone = None
     for bone in armature_obj.data.bones:
         if not bone.parent:
             root_bone = bone
             break
-    
+
     if not root_bone:
         return None, None
-    
+
     t2b = get_transform_to_blender()
     forward_vector = None
-    
+
     # Try to get transform from Motor6D properties first
     if "transform" in root_bone:
         try:
             transform_data = root_bone["transform"]
             mat = to_matrix(transform_data)
-            
+
             # Extract forward direction: in Roblox space, forward is +Z
             # Convert to Blender space
             roblox_forward = Vector((0, 0, 1))
@@ -506,7 +584,7 @@ def get_rig_facing_direction(armature_obj):
         except (KeyError, TypeError, ValueError):
             # Fall through to using bone matrix
             pass
-    
+
     # Fallback: use bone's rest pose matrix (for deform rigs or if transform not available)
     if forward_vector is None:
         try:
@@ -518,13 +596,13 @@ def get_rig_facing_direction(armature_obj):
             forward_vector.normalize()
         except Exception:
             return None, None
-    
+
     # Transform to world space if we got it from bone matrix
     # (transform from Motor6D is already in world space after t2b conversion
     if forward_vector and "transform" not in root_bone:
         # Convert from armature object space to world space
         forward_vector = (armature_obj.matrix_world.to_3x3() @ forward_vector).normalized()
-    
+
     return forward_vector, root_bone.name
 
 
@@ -568,23 +646,67 @@ def iter_scene_objects(scene=None):
     return []
 
 
+def _is_master_collection_name(name):
+    """True for master collections: "RIG: <name>" or "<name>.model",
+    optionally with Blender's dedup suffix (".001", ".002", ...)."""
+    if name.startswith("RIG: "):
+        return True
+    return bool(re.match(r".+\.model(?:\.\d+)?$", name))
+
+
 def find_master_collection_for_object(obj):
-    """Find the top-level 'RIG: ' collection for a given object."""
+    """Find the top-level master collection for a given object.
+
+    Matches the legacy "RIG: <name>" layout and the Studio-style
+    "<name>.model" layout used by the rbxm importer, including Blender's
+    dedup suffixes ("Rig.model.001") that appear when several rigs share
+    a name.  When masters nest (file umbrella > per-rig master), both hold
+    the object through all_objects recursion; the SMALLEST (most specific)
+    master wins.
+    """
+    best = None
+    best_count = None
     for coll in bpy.data.collections:
-        if coll.name.startswith("RIG: ") and obj.name in [
-            o.name for o in coll.all_objects
-        ]:
-            return coll
-    return None
+        if not _is_master_collection_name(coll.name):
+            continue
+        if obj.name not in [o.name for o in coll.all_objects]:
+            continue
+        count = len(coll.all_objects)
+        if best_count is None or count < best_count:
+            best = coll
+            best_count = count
+    return best
+
+
+def _is_parts_collection_name(name):
+    """True for a Parts child, including Blender's dedup suffixes
+    ("xsixx.model Parts.001") that appear when a rig is re-imported."""
+    if name.startswith("Parts"):
+        return True
+    return bool(re.match(r".+ Parts(?:\.\d+)?$", name))
 
 
 def find_parts_collection_in_master(master_collection, create_if_missing=False):
-    """Finds the 'Parts' collection within a master rig collection. Optionally creates it."""
+    """Finds the 'Parts' collection within a master rig collection. Optionally creates it.
+
+    Matches both the legacy "Parts" child and the Studio-style
+    "<name>.model Parts" child, including Blender's dedup suffixes.  When
+    several candidates exist, the child named after THIS master wins.
+    """
     if not master_collection:
         return None
+    base = re.sub(r"\.\d+$", "", master_collection.name)
+    best = None
+    best_score = -1
     for child in master_collection.children:
-        if child.name.startswith("Parts"):
-            return child
+        if not _is_parts_collection_name(child.name):
+            continue
+        score = 2 if child.name.startswith(base + " Parts") else 1
+        if score > best_score:
+            best = child
+            best_score = score
+    if best is not None:
+        return best
     if create_if_missing:
         parts_coll = bpy.data.collections.new("Parts")
         master_collection.children.link(parts_coll)

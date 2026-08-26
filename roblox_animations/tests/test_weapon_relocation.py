@@ -8,8 +8,8 @@ from ..core import utils, constants
 importlib.reload(utils)
 importlib.reload(constants)
 
-from ..core.utils import cf_to_mat, mat_to_cf
-from ..core.constants import get_transform_to_blender
+from ..core.utils import cf_to_mat, mat_to_cf  # noqa: E402
+from ..core.constants import get_transform_to_blender  # noqa: E402
 
 
 def _make_cframe(x, y, z, rot_y_deg=0):

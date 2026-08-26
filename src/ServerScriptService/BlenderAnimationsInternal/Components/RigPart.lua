@@ -16,17 +16,47 @@ export type RigPart = {
 	isDeformBone: boolean,
 	jointParentIsPart0: boolean,
 	jointType: string?,
+	restWorldTransform: CFrame?,
 }
 
 local RigPart = {}
 RigPart.__index = RigPart
 
 local Pose = require(script.Parent.Pose)
+local TweenService = game:GetService("TweenService")
 
 local MAX_MOTOR6D_DEPTH = 1024 -- extreme depth guard to catch pathological rigs before Luau overflows
 
 type ConnectedJoint = Motor6D | Weld | WeldConstraint
 type CacheableJoint = ConnectedJoint | AnimationConstraint
+
+local tweenStyleByPoseStyle = {
+	Cubic = Enum.EasingStyle.Cubic,
+	CubicV2 = Enum.EasingStyle.Cubic,
+	Bounce = Enum.EasingStyle.Bounce,
+	Elastic = Enum.EasingStyle.Elastic,
+}
+
+local function getPoseInterpolationAlpha(alpha: number, poseStyle: string?, poseDirection: string?): number
+	if poseStyle == nil or poseStyle == "Linear" then
+		return alpha
+	end
+	local tweenStyle = tweenStyleByPoseStyle[poseStyle]
+	if tweenStyle == nil then
+		return alpha
+	end
+	-- Pose easing names are reversed relative to TweenService's names.
+	local tweenDirection = if poseDirection == "In" then Enum.EasingDirection.Out
+		elseif poseDirection == "InOut" then Enum.EasingDirection.InOut
+		else Enum.EasingDirection.In
+	local ok, eased = pcall(function()
+		return TweenService:GetValue(alpha, tweenStyle, tweenDirection)
+	end)
+	if ok and type(eased) == "number" then
+		return math.clamp(eased, 0, 1)
+	end
+	return alpha
+end
 
 local function getConnectedJointParts(joint: ConnectedJoint): (BasePart?, BasePart?)
 	return joint.Part0, joint.Part1
@@ -213,6 +243,7 @@ function RigPart.new(
 		isDeformBone = false,
 		jointParentIsPart0 = true,
 		jointType = nil,
+		restWorldTransform = if part:IsA("Bone") then part.WorldCFrame elseif part:IsA("BasePart") then part.CFrame else nil,
 	}
 	setmetatable(self, RigPart)
 
@@ -271,7 +302,9 @@ function RigPart.new(
 		if preferNew then
 			rig.bones[part.Name] = self
 		else
-			if selfPriority == existingPriority and selfPriority >= 2 then
+			-- Same-name parts are only ambiguous when they hang off the same
+			-- parent; under different hierarchies the first one wins.
+			if selfPriority == existingPriority and selfPriority >= 2 and existing.parent == self.parent then
 				rig._ambiguousAnimationChannels = rig._ambiguousAnimationChannels or {}
 				rig._ambiguousAnimationChannels[part.Name] = true
 			end
@@ -325,6 +358,13 @@ function RigPart:AddPose(kft, transform, isDeformBone, easingStyle, easingDirect
 	self.poses[kft] = Pose.new(self, transform, easingStyle, easingDirection)
 end
 
+-- Used by revisioned live-sync patches. A missing pose is meaningful: it lets
+-- PoseToRobloxAnimation synthesize the surrounding transform instead of
+-- retaining stale data from a previous revision.
+function RigPart:RemovePose(kft)
+	self.poses[kft] = nil
+end
+
 function RigPart:PoseToRobloxAnimation(t)
 	local poses = self.poses
 	local poseToApply = poses[t]
@@ -369,13 +409,14 @@ function RigPart:PoseToRobloxAnimation(t)
 			else
 				-- Interpolate between prev and next (Linear/other)
 				local alpha = (t - (prevTime :: number)) / ((nextTime :: number) - (prevTime :: number))
+				alpha = getPoseInterpolationAlpha(alpha, easingStyle, prevPose.easingDirection)
 				local interpCFrame = prevPose.transform:Lerp(nextPose.transform, alpha)
 				poseToApply = {
 					transform = interpCFrame,
 					-- Carry forward prev's easing so the segment from this
 					-- synthetic keyframe to the next real one stays consistent
 					easingStyle = easingStyle,
-					easingDirection = prevPose.easingDirection or "In",
+					easingDirection = prevPose.easingDirection or "Out",
 				}
 			end
 		elseif nextPose then
@@ -397,6 +438,11 @@ function RigPart:PoseToRobloxAnimation(t)
 	pose.Name = part.Name
 	pose.Weight = enabled and 1 or 0
 	pose.EasingStyle = Enum.PoseEasingStyle.Linear
+	if self.isDeformRig and self.parent == nil and not part:IsA("Bone") then
+		-- This BasePart pose only carries the nested Bone hierarchy. It is not an
+		-- animation channel and may share its name with the actual root Bone.
+		pose:SetAttribute("BlenderAnimationsStructuralRoot", true)
+	end
 
 	if poseToApply then
 		local transform = poseToApply.transform
@@ -425,7 +471,7 @@ function RigPart:PoseToRobloxAnimation(t)
 				pose.EasingDirection = dir
 			else
 				warn("Invalid easing direction:", poseToApply.easingDirection, "for part:", part.Name)
-				pose.EasingDirection = Enum.PoseEasingDirection.In -- Fallback to In
+				pose.EasingDirection = Enum.PoseEasingDirection.Out -- Forward-curve fallback
 			end
 		end
 	end

@@ -45,7 +45,10 @@ class TestCageSolver(unittest.TestCase):
         self.assertEqual(len(predicted), 4)
         self.assertLess(predicted[0][2], predicted[1][2])
         self.assertLess(predicted[2][2], predicted[3][2])
-        self.assertGreater(predicted[1][2], 0.75)
+        # The affine-augmented field reproduces the affine plane through the
+        # controls exactly (0.75 here), instead of the old non-affine solve's
+        # slight overshoot — rigid/affine motion deforms without distortion.
+        self.assertAlmostEqual(predicted[1][2], 0.75, places=4)
         self.assertGreater(predicted[1][2], predicted[0][2] + 0.2)
 
     def test_two_stage_solver_uses_local_rbf_for_large_control_sets(self):

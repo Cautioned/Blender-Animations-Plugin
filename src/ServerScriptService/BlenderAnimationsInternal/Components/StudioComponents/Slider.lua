@@ -25,7 +25,6 @@ local OnEvent = Fusion.OnEvent
 local Hydrate = Fusion.Hydrate
 local Cleanup = Fusion.Cleanup
 local Value = Fusion.Value
-local Out = Fusion.Out
 local New = Fusion.New
 local Ref = Fusion.Ref
 
@@ -64,7 +63,7 @@ return function(props: SliderProperties): TextButton
 	local currentValue, currentAlpha, isDragging = getDragInput({
 		Instance = handleRegion,
 		Enabled = isEnabled,
-		Value = Value(Vector2.new(unwrap(inputValue), 0)),
+		Value = Value(Vector2.new(unwrap(inputValue, false), 0)),
 		Min = Computed(function()
 			return Vector2.new(unwrap(props.Min) or 0, 0)
 		end),
@@ -86,7 +85,9 @@ return function(props: SliderProperties): TextButton
 	end)
 
 	local cleanupInputValueObserver = Observer(inputValue):onChange(function()
-		currentValue:set(Vector2.new(unwrap(inputValue, false), 0))
+		if not unwrap(isDragging) then
+			currentValue:set(Vector2.new(unwrap(inputValue, false), 0))
+		end
 	end)
 
 	local function cleanupCallback()
@@ -110,8 +111,7 @@ return function(props: SliderProperties): TextButton
 
 	local handleFill = themeProvider:GetColor(Enum.StudioStyleGuideColor.Button)
 	local handleBorder = themeProvider:GetColor(Enum.StudioStyleGuideColor.InputFieldBorder, handleModifier)
-	local barAbsSize = Value(Vector2.zero)
-	
+
 	local newSlider = New "Frame" {
 		Name = "Slider",
 		Size = UDim2.new(1, 0, 0, 22),
@@ -130,9 +130,7 @@ return function(props: SliderProperties): TextButton
 					Position = UDim2.fromScale(.5, .5),
 					AnchorPoint = Vector2.new(.5, .5),
 					BorderSizePixel = 0,
-					
-					[Out "AbsoluteSize"] = barAbsSize,
-					
+
 					Size = Computed(function()
 						local handleSize = unwrap(handleSize) or UDim2.new()
 						return UDim2.new(1, -handleSize.X.Offset, 0, 5)
@@ -148,12 +146,13 @@ return function(props: SliderProperties): TextButton
 			New "Frame" {
 				Name = "HandleRegion",
 				ZIndex = 1,
-				Size = UDim2.new(1, 0, 1, 0),
+				Position = UDim2.new(0, unwrap(handleSize).X.Offset / 2, 0, 0),
+				Size = UDim2.new(1, -unwrap(handleSize).X.Offset, 1, 0),
 				BackgroundTransparency = 1,
 				[Ref] = handleRegion,
 
 				[Children] = BoxBorder {
-					Color =  getMotionState(Computed(function()
+					Color = getMotionState(Computed(function()
 						return unwrap(handleBorder):Lerp(unwrap(handleFill), if not unwrap(isEnabled) then .5 else 0)
 					end), "Spring", 40),
 
@@ -162,18 +161,13 @@ return function(props: SliderProperties): TextButton
 						BorderMode = Enum.BorderMode.Inset,
 						BackgroundColor3 = handleFill,
 						BorderSizePixel = 0,
-						
+
 						Size = handleSize,
-						
+
 						AnchorPoint = Vector2.new(.5, .5),
 
 						Position = getMotionState(Computed(function()
-							local handleSize = unwrap(handleSize) or UDim2.new()
-							local absoluteBarSize = unwrap(barAbsSize) or Vector2.zero
-							return UDim2.new(
-								0, (unwrap(currentAlpha).X*absoluteBarSize.X) + handleSize.X.Offset/2,
-								.5, 0
-							)
+							return UDim2.fromScale(unwrap(currentAlpha).X, 0.5)
 						end), "Spring", 40),
 
 						[OnEvent "InputBegan"] = function(inputObject)
@@ -183,7 +177,7 @@ return function(props: SliderProperties): TextButton
 								isHovering:set(true)
 							end
 						end,
-						
+
 						[OnEvent "InputEnded"] = function(inputObject)
 							if not unwrap(isEnabled) then
 								return

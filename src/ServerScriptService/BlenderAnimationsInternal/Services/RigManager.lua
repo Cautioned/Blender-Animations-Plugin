@@ -329,8 +329,8 @@ function RigManager:toggleBone(name)
 		end
 	end
 	self.boneWeights = currentWeights
-	self.playbackService:stopAnimationAndDisconnect()
-	self.playbackService:playCurrentAnimation(State.activeAnimator)
+	-- Reload all rigs: bone toggle changes this rig's pose, need fresh KFS
+	self.playbackService:playAllRigs()
 end
 
 -- Main rig setting function
@@ -353,16 +353,12 @@ function RigManager:setRig(rigModel: Types.RigModelType?): any
 	end
 
 	if previousRigModel and previousRigModel ~= rigModel then
-		if previousAnimator then
-			self.playbackService:stopAnimationAndDisconnect({
-				background = false,
-				animatorOverride = previousAnimator,
-			})
-		end
+		-- Stop only the previous rig's track, leave other rigs playing
+		self.playbackService:stopRigTrack(previousRigModel)
 	end
 
-	-- explicitly stop current animation before switching to the new rig
-	self.playbackService:stopAnimationAndDisconnect()
+	-- Stop the incoming rig's track if any (it's being rebuilt from scratch)
+	self.playbackService:stopRigTrack(rigModel)
 
 	if not rigModel then
 		State.activeRigModel = nil
@@ -714,11 +710,8 @@ function RigManager:syncBones(blenderSyncManager: any?): boolean
         -- rebuild rig to include newly created nodes
         self:setRig(State.activeRigModel)
         
-        -- restart animation to reflect changes
-        self.playbackService:stopAnimationAndDisconnect()
-        if State.activeAnimator then
-            self.playbackService:playCurrentAnimation(State.activeAnimator)
-        end
+        -- restart animation to reflect changes across all rigs
+        self.playbackService:playAllRigs()
         return true
     else
         print("Sync Bones: No new bones needed to be created - all bones from Blender armature already exist in Studio rig")

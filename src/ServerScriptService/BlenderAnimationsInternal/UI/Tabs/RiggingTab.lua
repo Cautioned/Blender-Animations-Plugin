@@ -3,7 +3,6 @@
 --!optimize 2
 local ServerScriptService = game:GetService("ServerScriptService")
 
-
 local State = require(script.Parent.Parent.Parent.state)
 local Fusion = require(script.Parent.Parent.Parent.Packages.Fusion)
 
@@ -27,23 +26,42 @@ local themeProvider = require(StudioComponentsUtil.themeProvider)
 local studioLocale = game:GetService("StudioService").StudioLocaleId or "en-us"
 local localeLang = studioLocale:sub(1, 2):lower()
 
-local UPDATE_WARNING: { [string]: string } = {
-	en = "Skinned and deform rigs are fully supported in v2.5.0 of the Blender addon. Update to v2.5.0+ to use the full rig export pipeline.",
-	es = "Los rigs skinned y deform son totalmente compatibles en la v2.5.0 del addon de Blender. Actualiza a la v2.5.0+ para usar el flujo completo de exportación de rigs.",
-	pt = "Rigs skinned e deform são totalmente suportados na v2.5.0 do addon do Blender. Atualize para v2.5.0+ para usar o fluxo completo de exportação de rigs.",
-	fr = "Les rigs skinned et deform sont entièrement pris en charge dans la v2.5.0 de l'addon Blender. Mettez à jour vers la v2.5.0+ pour utiliser le pipeline complet d'exportation de rigs.",
-	de = "Skinned- und Deform-Rigs werden in v2.5.0 des Blender-Addons vollständig unterstützt. Aktualisiere auf v2.5.0+, um die vollständige Rig-Export-Pipeline zu nutzen.",
-	it = "I rig skinned e deform sono completamente supportati nella v2.5.0 dell'addon di Blender. Aggiorna alla v2.5.0+ per usare l'intera pipeline di esportazione dei rig.",
-	ja = "スキン済みリグとデフォームリグは、Blenderアドオン v2.5.0 で完全にサポートされています。完全なリグ書き出しパイプラインを使うには v2.5.0 以上に更新してください。",
-	ko = "스키닝 및 디폼 리그는 Blender 애드온 v2.5.0에서 완전히 지원됩니다. 전체 리그 내보내기 파이프라인을 사용하려면 v2.5.0 이상으로 업데이트하세요.",
-	ar = "أصبحت هياكل skinned و deform مدعومة بالكامل في الإصدار v2.5.0 من إضافة Blender. حدّث إلى v2.5.0+ لاستخدام مسار تصدير الهياكل بالكامل.",
-	ru = "Скинненные и deform-риги полностью поддерживаются в версии 2.5.0 аддона Blender. Обновитесь до v2.5.0+, чтобы использовать полный пайплайн экспорта ригов.",
-	id = "Rig skinned dan deform didukung penuh di addon Blender v2.5.0. Perbarui ke v2.5.0+ untuk memakai alur ekspor rig lengkap.",
-	ms = "Rig skinned dan deform disokong sepenuhnya dalam addon Blender v2.5.0. Kemas kini ke v2.5.0+ untuk menggunakan saluran eksport rig penuh.",
-	th = "rig แบบ skinned และ deform รองรับเต็มรูปแบบแล้วใน Blender addon v2.5.0 อัปเดตเป็น v2.5.0+ เพื่อใช้กระบวนการส่งออก rig แบบเต็มรูปแบบ",
-	tr = "Skinned ve deform rigler Blender eklentisinin v2.5.0 sürümünde tamamen desteklenir. Tam rig dışa aktarma hattını kullanmak için v2.5.0+ sürümüne güncelleyin.",
-	vi = "Rig skinned va deform được hỗ trợ đầy đủ trong Blender addon v2.5.0. Hãy cập nhật lên v2.5.0+ để dùng toàn bộ quy trình xuất rig.",
-	pl = "Rigi skinned i deform są w pełni obsługiwane w wersji 2.5.0 dodatku do Blendera. Zaktualizuj do v2.5.0+, aby używać pełnego pipeline'u eksportu rigów.",
+local RBXM_REQUIREMENT: { [string]: string } = {
+	en = "Requires v3.0.0+ of the Blender addon. Download the latest version to use .rbxm import.",
+	es = "Requiere la v3.0.0+ del addon de Blender. Descarga la última versión para usar la importación .rbxm.",
+	pt = "Requer a v3.0.0+ do addon do Blender. Baixe a versão mais recente para usar a importação .rbxm.",
+	fr = "Nécessite la v3.0.0+ de l'addon Blender. Téléchargez la dernière version pour utiliser l'import .rbxm.",
+	de = "Erfordert v3.0.0+ des Blender-Addons. Lade die neueste Version herunter, um den .rbxm-Import zu nutzen.",
+	it = "Richiede la v3.0.0+ dell'addon di Blender. Scarica l'ultima versione per usare l'importazione .rbxm.",
+	ja = "Blenderアドオン v3.0.0 以上が必要です。.rbxm インポートを使うには最新バージョンをダウンロードしてください。",
+	ko = "Blender 애드온 v3.0.0 이상이 필요합니다. .rbxm 가져오기를 사용하려면 최신 버전을 다운로드하세요.",
+	ar = "يتطلب الإصدار v3.0.0+ من إضافة Blender. نزّل أحدث إصدار لاستخدام استيراد .rbxm.",
+	ru = "Требуется аддон Blender v3.0.0+. Загрузите последнюю версию, чтобы использовать импорт .rbxm.",
+	id = "Memerlukan addon Blender v3.0.0+. Unduh versi terbaru untuk menggunakan impor .rbxm.",
+	ms = "Memerlukan addon Blender v3.0.0+. Muat turun versi terkini untuk menggunakan import .rbxm.",
+	th = "ต้องใช้ Blender addon v3.0.0 ขึ้นไป ดาวน์โหลดเวอร์ชันล่าสุดเพื่อใช้การนำเข้า .rbxm",
+	tr = "Blender eklentisinin v3.0.0+ sürümü gerekir. .rbxm içe aktarmayı kullanmak için en son sürümü indirin.",
+	vi = "Yêu cầu Blender addon v3.0.0 trở lên. Hãy tải phiên bản mới nhất để dùng nhập .rbxm.",
+	pl = "Wymaga dodatku do Blendera v3.0.0+. Pobierz najnowszą wersję, aby korzystać z importu .rbxm.",
+}
+
+local RBXM_ALTERNATIVE: { [string]: string } = {
+	en = "You don't need this button to export — you can also right-click the rig and 'Save to File', or save your place as .rbxl.",
+	es = "No necesitas este botón para exportar: también puedes hacer clic derecho en el rig y 'Guardar como archivo', o guardar tu lugar como .rbxl.",
+	pt = "Você não precisa deste botão para exportar — também pode clicar com o botão direito no rig e 'Salvar em arquivo', ou salvar o lugar como .rbxl.",
+	fr = "Pas besoin de ce bouton pour exporter — vous pouvez aussi faire un clic droit sur le rig et 'Enregistrer dans un fichier', ou enregistrer votre place en .rbxl.",
+	de = "Du brauchst diesen Button nicht zum Exportieren — du kannst auch mit Rechtsklick auf das Rig 'In Datei speichern' wählen oder deine Place als .rbxl speichern.",
+	it = "Non serve questo pulsante per esportare — puoi anche fare clic destro sul rig e 'Salva su file', oppure salvare la tua place come .rbxl.",
+	ja = "書き出しにこのボタンは不要です。リグを右クリックして「ファイルに保存」を選ぶか、プレイスを .rbxl として保存することもできます。",
+	ko = "내보내기에 이 버튼이 꼭 필요하지는 않습니다. 리그를 우클릭하여 '파일로 저장'하거나, 플레이스를 .rbxl로 저장할 수도 있습니다.",
+	ar = "لا تحتاج إلى هذا الزر للتصدير — يمكنك أيضًا النقر بزر الماوس الأيمن على الهيكل واختيار 'حفظ إلى ملف'، أو حفظ مكانك كملف .rbxl.",
+	ru = "Для экспорта эта кнопка не обязательна — можно также щёлкнуть по ригу правой кнопкой и выбрать 'Сохранить в файл' или сохранить плейс как .rbxl.",
+	id = "Kamu tidak perlu tombol ini untuk mengekspor — kamu juga bisa klik kanan rig lalu 'Simpan ke File', atau simpan place sebagai .rbxl.",
+	ms = "Anda tidak perlukan butang ini untuk mengeksport — anda juga boleh klik kanan rig dan 'Simpan ke Fail', atau simpan place anda sebagai .rbxl.",
+	th = "คุณไม่จำเป็นต้องใช้ปุ่มนี้ในการส่งออก — คุณสามารถคลิกขวาที่ rig แล้วเลือก 'บันทึกเป็นไฟล์' หรือบันทึก place ของคุณเป็น .rbxl ก็ได้",
+	tr = "Dışa aktarmak için bu düğmeye gerek yok — rige sağ tıklayıp 'Dosyaya Kaydet' diyebilir veya place'inizi .rbxl olarak kaydedebilirsiniz.",
+	vi = "Bạn không cần nút này để xuất — bạn cũng có thể nhấp chuột phải vào rig và chọn 'Lưu ra tệp', hoặc lưu place dưới dạng .rbxl.",
+	pl = "Ten przycisk nie jest potrzebny do eksportu — możesz też kliknąć rig prawym przyciskiem i wybrać 'Zapisz do pliku' albo zapisać place jako .rbxl.",
 }
 
 local SharedComponents = require(script.Parent.Parent.SharedComponents)
@@ -105,7 +123,9 @@ local function createPreviewSlot(
 			inst.Archivable = wasArchivable
 			return c
 		end)
-		if not ok or not cloned then return end
+		if not ok or not cloned then
+			return
+		end
 
 		-- figure out bounding box for camera framing
 		local model: Model
@@ -135,31 +155,27 @@ local function createPreviewSlot(
 		spinHeight = dist * 0.15
 		spinAngle = math.atan2(frontDir.X, frontDir.Z)
 
-		local camPos = spinCenter + Vector3.new(
-			math.sin(spinAngle) * spinDist,
-			spinHeight,
-			math.cos(spinAngle) * spinDist
-		)
+		local camPos = spinCenter
+			+ Vector3.new(math.sin(spinAngle) * spinDist, spinHeight, math.cos(spinAngle) * spinDist)
 		viewportCamera.CFrame = CFrame.lookAt(camPos, spinCenter)
 
 		viewportChildren:set({ model })
 
 		-- Start slow spin — update at a low rate to avoid per-frame viewport re-renders
-		if spinConn then spinConn:Disconnect() end
+		if spinConn then
+			spinConn:Disconnect()
+		end
 		local spinAccum = 0
-		local SPIN_INTERVAL = 0.1  -- update camera ~10 times/sec, not every frame
+		local SPIN_INTERVAL = 0.1 -- update camera ~10 times/sec, not every frame
 		spinConn = game:GetService("RunService").Heartbeat:Connect(function(dt)
-			spinAngle = spinAngle + dt * 0.4  -- ~0.4 rad/s, full rotation in ~16s
+			spinAngle = spinAngle + dt * 0.4 -- ~0.4 rad/s, full rotation in ~16s
 			spinAccum = spinAccum + dt
 			if spinAccum < SPIN_INTERVAL then
 				return
 			end
 			spinAccum = spinAccum - SPIN_INTERVAL
-			local pos = spinCenter + Vector3.new(
-				math.sin(spinAngle) * spinDist,
-				spinHeight,
-				math.cos(spinAngle) * spinDist
-			)
+			local pos = spinCenter
+				+ Vector3.new(math.sin(spinAngle) * spinDist, spinHeight, math.cos(spinAngle) * spinDist)
 			viewportCamera.CFrame = CFrame.lookAt(pos, spinCenter)
 		end)
 	end
@@ -180,26 +196,28 @@ local function createPreviewSlot(
 	Observer(instanceValue):onChange(scheduleRefresh)
 	task.defer(refreshPreview) -- initial
 
-	local clearButton = onClear and New("TextButton")({
-		Text = "x",
-		Size = UDim2.fromOffset(18, 18),
-		Position = UDim2.new(1, -2, 0, 2),
-		AnchorPoint = Vector2.new(1, 0),
-		BackgroundColor3 = Color3.fromRGB(180, 50, 50),
-		TextColor3 = Color3.new(1, 1, 1),
-		Font = Enum.Font.SourceSansBold,
-		TextSize = 14,
-		BorderSizePixel = 0,
-		ZIndex = 3,
-		Visible = Computed(function()
-			return instanceValue:get() ~= nil
-		end),
-		[New("UICorner")] = nil,
-		[Children] = {
-			New("UICorner")({ CornerRadius = UDim.new(0, 4) }),
-		},
-		[OnEvent("Activated")] = onClear,
-	}) or nil
+	local clearButton = onClear
+			and New("TextButton")({
+				Text = "x",
+				Size = UDim2.fromOffset(18, 18),
+				Position = UDim2.new(1, -2, 0, 2),
+				AnchorPoint = Vector2.new(1, 0),
+				BackgroundColor3 = Color3.fromRGB(180, 50, 50),
+				TextColor3 = Color3.new(1, 1, 1),
+				Font = Enum.Font.SourceSansBold,
+				TextSize = 14,
+				BorderSizePixel = 0,
+				ZIndex = 3,
+				Visible = Computed(function()
+					return instanceValue:get() ~= nil
+				end),
+				[New("UICorner")] = nil,
+				[Children] = {
+					New("UICorner")({ CornerRadius = UDim.new(0, 4) }),
+				},
+				[OnEvent("Activated")] = onClear,
+			})
+		or nil
 
 	return New("Frame")({
 		LayoutOrder = layoutOrder,
@@ -326,67 +344,19 @@ function RiggingTab.create(services: any)
 			LayoutOrder = 1,
 			[Children] = {
 				Button({
-					Text = "Sync Bones (experimental)",
+					Text = "Export Rig (RBXM)",
 					Size = UDim2.new(1, 0, 0, 30),
 					Enabled = Computed(function()
 						return State.activeRigExists:get()
 					end),
 					Activated = function(): nil
-						-- create missing bones/motors from blender armature
-					services.rigManager:syncBones(services.blenderSyncManager)
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						activeHint:set("Made a new bone? Attached a weapon to your rig in blender? This will create the bone in studio.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						activeHint:set("")
-					end,
-				}) :: any,
-				Button({
-					Text = "Export Rig",
-					Size = UDim2.new(1, 0, 0, 30),
-					Enabled = Computed(function()
-						return State.activeRigExists:get()
-					end),
-					Activated = function(): nil
-						services.exportManager:exportRig()
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						activeHint:set("Exports the rig by deleting the humanoid. This may have issues with textures and meshes, but the rig will usually rebuild more easily in Blender.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						activeHint:set("")
-					end,
-				}) :: any,
-				Button({
-					Text = "Export Rig [Legacy]",
-					Size = UDim2.new(1, 0, 0, 30),
-					Enabled = Computed(function()
-						return State.activeRigExists:get()
-					end),
-					Activated = function(): nil
-						services.exportManager:exportRigLegacy()
+						services.exportManager:exportRigRbxm()
 						return nil
 					end,
 					[OnEvent("MouseEnter")] = function()
 						activeHint:set(
-							"Exports the rig with the legacy method while preserving skinned mesh and wrap metadata. Recommended for skinned/deform rigs.")
-					end,
-					[OnEvent("MouseLeave")] = function()
-						activeHint:set("")
-					end,
-				}) :: any,
-				Button({
-					Text = "Clean Meta Parts",
-					Size = UDim2.new(1, 0, 0, 30),
-					Activated = function(): nil
-						services.exportManager:clearMetaParts()
-						return nil
-					end,
-					[OnEvent("MouseEnter")] = function()
-						activeHint:set("Removes leftover metadata parts from a previous export. This cannot be done automatically.")
+							"Saves the rig as a binary .rbxm via Studio's save dialog. Import it in Blender with 'Import Roblox (.rbxm/.rbxl)' — joints, skinning, and meshes are read straight from the file."
+						)
 					end,
 					[OnEvent("MouseLeave")] = function()
 						activeHint:set("")
@@ -400,18 +370,97 @@ function RiggingTab.create(services: any)
 						return nil
 					end,
 				}) :: any,
-				Checkbox({
-					Value = State.exportWelds,
-					Text = "Export Welds (Recommended)",
-					OnChange = function(newValue: boolean): nil
-						State.exportWelds:set(newValue)
-						return nil
-					end,
-				}) :: any,
 				Label({
-					Text = UPDATE_WARNING[localeLang] or UPDATE_WARNING.en,
+					Text = (RBXM_REQUIREMENT[localeLang] or RBXM_REQUIREMENT.en)
+						.. "\n"
+						.. (RBXM_ALTERNATIVE[localeLang] or RBXM_ALTERNATIVE.en),
 					TextWrapped = true,
+					TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.DimmedText),
+					TextSize = 14,
 				}) :: any,
+				VerticalCollapsibleSection({
+					Text = "DISCONTINUED",
+					Collapsed = true,
+					[Children] = {
+						Label({
+							Text = "RBXM and RBXL export is the new and preferred method of export, it supports PBR Materials, Layered Clothing, Terrain, Lighting, Decals, Beams, and multiple rigs can be exported at once. It's also way more predictable and consistent than trying to patch and work with the inconsistencies roblox's obj exporter provided. There will be no support for bugs on these older export buttons going forward and they will eventually be removed. Use the Export Rig (RBXM) button, or right-click your rig and Save To File (Do not export as obj).",
+							TextWrapped = true,
+							TextColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.DimmedText),
+							TextSize = 14,
+						}) :: any,
+						Button({
+							Text = "Export Rig (Discontinued)",
+							Size = UDim2.new(1, 0, 0, 30),
+							Enabled = Computed(function()
+								return State.activeRigExists:get()
+							end),
+							Activated = function(): nil
+								services.exportManager:exportRig()
+								return nil
+							end,
+							[OnEvent("MouseEnter")] = function()
+								activeHint:set(
+									"DISCONTINUED: use 'Export Rig (RBXM)' with the addon's 'Import Roblox (.rbxm/.rbxl)' instead. Kept for old addon versions. Deletes the humanoid and may have issues with textures and meshes."
+								)
+							end,
+							[OnEvent("MouseLeave")] = function()
+								activeHint:set("")
+							end,
+						}) :: any,
+						Button({
+							Text = "Export Rig [Legacy] (Discontinued)",
+							Size = UDim2.new(1, 0, 0, 30),
+							Enabled = Computed(function()
+								return State.activeRigExists:get()
+							end),
+							Activated = function(): nil
+								services.exportManager:exportRigLegacy()
+								return nil
+							end,
+							[OnEvent("MouseEnter")] = function()
+								activeHint:set(
+									"DISCONTINUED: the .rbxm importer handles skinned/deform rigs natively. Kept for old addon versions. Exports with the legacy method while preserving skinned mesh and wrap metadata."
+								)
+							end,
+							[OnEvent("MouseLeave")] = function()
+								activeHint:set("")
+							end,
+						}) :: any,
+						Button({
+							Text = "Clean Meta Parts",
+							Size = UDim2.new(1, 0, 0, 30),
+							Activated = function(): nil
+								services.exportManager:clearMetaParts()
+								return nil
+							end,
+							[OnEvent("MouseEnter")] = function()
+								activeHint:set(
+									"Removes leftover metadata parts from a previous export. This cannot be done automatically."
+								)
+							end,
+							[OnEvent("MouseLeave")] = function()
+								activeHint:set("")
+							end,
+						}) :: any,
+						Checkbox({
+							Value = State.setRigOrigin,
+							Text = "Center Rig to Origin for Export",
+							OnChange = function(newValue: boolean): nil
+								State.setRigOrigin:set(newValue)
+								return nil
+							end,
+						}) :: any,
+						Checkbox({
+							Value = State.exportWelds,
+							Text = "Export Welds (Recommended)",
+							OnChange = function(newValue: boolean): nil
+								State.exportWelds:set(newValue)
+								return nil
+							end,
+						}) :: any,
+					},
+				}),
+
 				SharedComponents.AnimatedHintLabel({
 					Text = activeHint,
 					LayoutOrder = 5,
@@ -429,34 +478,18 @@ function RiggingTab.create(services: any)
 			LayoutOrder = 2,
 			[Children] = {
 				-- Rig preview slot (read-only, auto-populated)
-				createPreviewSlot(
-					rigPreviewValue,
-					rigPreviewName,
-					1,
-					"Select in Explorer",
-					function()
-						local rig = State.activeRigModel or State.lastKnownRigModel
-						if rig then
-							game.Selection:Set({ rig })
-						end
-					end,
-					nil,
-					"RIG"
-				),
+				createPreviewSlot(rigPreviewValue, rigPreviewName, 1, "Select in Explorer", function()
+					local rig = State.activeRigModel or State.lastKnownRigModel
+					if rig then
+						game.Selection:Set({ rig })
+					end
+				end, nil, "RIG"),
 				-- Weapon preview slot
-				createPreviewSlot(
-					State.selectedWeapon,
-					State.selectedWeaponName,
-					2,
-					"Pick from Selection",
-					function()
-						services.exportManager:pickWeapon()
-					end,
-					function()
-						services.exportManager:clearWeapon()
-					end,
-					"WEAPON"
-				),
+				createPreviewSlot(State.selectedWeapon, State.selectedWeaponName, 2, "Pick from Selection", function()
+					services.exportManager:pickWeapon()
+				end, function()
+					services.exportManager:clearWeapon()
+				end, "WEAPON"),
 				-- Connection status
 				New("Frame")({
 					LayoutOrder = 3,
@@ -476,9 +509,9 @@ function RiggingTab.create(services: any)
 							end),
 							TextColor3 = Computed(function()
 								local status = State.weaponConnectionStatus:get()
-							if status:find("^[Vv]") or status:find(utf8.char(0x2713)) then
-								return Color3.fromRGB(80, 200, 80)
-							elseif status:find(utf8.char(0x26A0)) then
+								if status:find("^[Vv]") or status:find(utf8.char(0x2713)) then
+									return Color3.fromRGB(80, 200, 80)
+								elseif status:find(utf8.char(0x26A0)) then
 									return Color3.fromRGB(220, 160, 40)
 								end
 								return Color3.fromRGB(140, 140, 140)
@@ -499,33 +532,60 @@ function RiggingTab.create(services: any)
 				-- Export button
 				Button({
 					LayoutOrder = 5,
-					Text = "Export Weapon",
+					Text = "Export Weapon (RBXM)",
 					Size = UDim2.new(1, 0, 0, 32),
 					Enabled = Computed(function()
-						local weapon = State.selectedWeapon:get()
-						local rig = State.activeRigModel or State.lastKnownRigModel
-						return weapon ~= nil and rig ~= nil
+						return State.selectedWeapon:get() ~= nil
 					end),
 					Activated = function(): nil
-						services.exportManager:exportWeapon()
+						services.exportManager:exportWeaponRbxm()
 						return nil
 					end,
 					[OnEvent("MouseEnter")] = function()
-						weaponHint:set("Exports the slotted weapon with Motor6D hierarchy and connection data to the rig. Requires v2.4.0+ of the Blender add-on.")
+						weaponHint:set(
+							"Saves the slotted weapon as a binary .rbxm via Studio's save dialog. Import it in Blender with 'Import Roblox (.rbxm/.rbxl)' — parts, Motor6Ds, and textures are read straight from the file."
+						)
 					end,
 					[OnEvent("MouseLeave")] = function()
 						weaponHint:set("")
 					end,
 				}) :: any,
-				Button({
+				VerticalCollapsibleSection({
+					Text = "DISCONTINUED",
+					Collapsed = true,
 					LayoutOrder = 6,
-					Text = "Clean Meta Parts",
-					Size = UDim2.new(1, 0, 0, 24),
-					Activated = function(): nil
-						services.exportManager:clearMetaParts()
-						return nil
-					end,
-				}) :: any,
+					[Children] = {
+						Button({
+							Text = "Export Weapon (Discontinued)",
+							Size = UDim2.new(1, 0, 0, 32),
+							Enabled = Computed(function()
+								local weapon = State.selectedWeapon:get()
+								local rig = State.activeRigModel or State.lastKnownRigModel
+								return weapon ~= nil and rig ~= nil
+							end),
+							Activated = function(): nil
+								services.exportManager:exportWeapon()
+								return nil
+							end,
+							[OnEvent("MouseEnter")] = function()
+								weaponHint:set(
+									"DISCONTINUED: use 'Export Weapon (RBXM)' instead. Kept for old addon versions; exports via the legacy meta-part flow with Motor6D hierarchy and connection data."
+								)
+							end,
+							[OnEvent("MouseLeave")] = function()
+								weaponHint:set("")
+							end,
+						}) :: any,
+						Button({
+							Text = "Clean Meta Parts",
+							Size = UDim2.new(1, 0, 0, 24),
+							Activated = function(): nil
+								services.exportManager:clearMetaParts()
+								return nil
+							end,
+						}) :: any,
+					},
+				}),
 				SharedComponents.AnimatedHintLabel({
 					Text = weaponHint,
 					LayoutOrder = 7,

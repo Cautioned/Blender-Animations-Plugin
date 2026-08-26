@@ -602,6 +602,213 @@ local function applySimplifier(animData)
 	return animData
 end
 
+local function mirrorBoneName(name: string): string
+	local mirrored = name:gsub("Left", "__RBX_MIRROR_LEFT__")
+	mirrored = mirrored:gsub("Right", "Left")
+	mirrored = mirrored:gsub("__RBX_MIRROR_LEFT__", "Right")
+	mirrored = mirrored:gsub("left", "__rbx_mirror_left__")
+	mirrored = mirrored:gsub("right", "left")
+	return mirrored:gsub("__rbx_mirror_left__", "right")
+end
+
+local function componentsToCFrame(components: any): CFrame?
+	if type(components) ~= "table" or #components < 12 then
+		return nil
+	end
+	return CFrame.new(table.unpack(components, 1, 12))
+end
+
+local function mirrorCFrameX(transform: CFrame): CFrame
+	local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = transform:GetComponents()
+	return CFrame.new(-x, y, z, r00, -r01, -r02, -r10, r11, r12, -r20, r21, r22)
+end
+
+local function applyMirror(animData)
+	if not State.mirrorAnimationEnabled:get() or type(animData) ~= "table" or type(animData.kfs) ~= "table" then
+		return animData
+	end
+
+	local rig = State.activeRig
+	for _, keyframe in ipairs(animData.kfs) do
+		if type(keyframe) == "table" and type(keyframe.kf) == "table" then
+			local mirroredPoses = {}
+			for boneName, pose in pairs(keyframe.kf) do
+				local mirroredName = mirrorBoneName(boneName)
+				local mirroredPose = if type(pose) == "table" then table.clone(pose) else pose
+				if type(mirroredPose) == "table" then
+					local localTransform = componentsToCFrame(mirroredPose.components)
+					local sourcePart = rig and rig.bones and rig.bones[boneName]
+					local targetPart = rig and rig.bones and rig.bones[mirroredName]
+					-- Pose CFrames for Motor6D channels are already in the joint's
+					-- animation space, not Blender-style bone-rest space. Only true
+					-- Bone channels can use the rest-space conversion below.
+					local sourceRest = sourcePart and sourcePart.bone and sourcePart.restWorldTransform
+					local targetRest = targetPart and targetPart.bone and targetPart.restWorldTransform
+					local transformed = if localTransform and sourceRest and targetRest
+						then targetRest:Inverse() * mirrorCFrameX(sourceRest * localTransform)
+						elseif localTransform then mirrorCFrameX(localTransform)
+						else nil
+					if transformed then
+						mirroredPose.components = { transformed:GetComponents() }
+					end
+				end
+				mirroredPoses[mirroredName] = mirroredPose
+			end
+			keyframe.kf = mirroredPoses
+		end
+	end
+
+	return animData
+end
+
+local function getAnimTimeScale(animData: any): number
+	if type(animData) == "table" and type(animData.export_info) == "table" then
+		if animData.export_info.time_unit == "frames" then
+			local fps = tonumber(animData.export_info.fps)
+			if fps and fps > 0 then
+				return 1 / fps
+			end
+		end
+	end
+	return 1
+end
+
+local function applyResample(animData)
+	local fps = math.clamp(math.round(State.resampleFps:get()), 1, 240)
+	if not State.resampleEnabled:get() or type(animData) ~= "table" or type(animData.kfs) ~= "table" then
+		return animData
+	end
+
+	local source = animData.kfs
+	if #source == 0 then
+		return animData
+	end
+
+	-- The raw data may be in frames (export_info.time_unit == "frames"), but
+	-- resampling grids must be in seconds. Convert on the way in and back out.
+	local timeScale = getAnimTimeScale(animData)
+	local inverseScale = 1 / timeScale
+
+	local function copyHeld(values)
+		local copy = {}
+		for name, value in pairs(values) do
+			if type(value) == "table" then
+				local held = table.clone(value)
+				-- Poses arrive in two forms: the object form reads
+				-- easingStyle/easingDirection keys, the array form reads
+				-- [2]/[3]. Override both so held frames never interpolate.
+				held.easingStyle = "Constant"
+				if type(held[1]) == "table" then
+					held[2] = "Constant"
+				end
+				copy[name] = held
+			else
+				copy[name] = value
+			end
+		end
+		return copy
+	end
+
+	local function keyframeTimeSeconds(keyframe: any): number
+		return (tonumber(keyframe.t) or 0) * timeScale
+	end
+
+	local lastSourceTime = keyframeTimeSeconds(source[#source])
+	local duration = math.max((tonumber(animData.t) or 0) * timeScale, lastSourceTime)
+	local poses = {}
+	local faces = {}
+	local sourceIndex = 1
+	local sampled = {}
+	local function addSample(timeSeconds: number)
+		while sourceIndex <= #source and keyframeTimeSeconds(source[sourceIndex]) <= timeSeconds + 1e-6 do
+			local keyframe = source[sourceIndex]
+			if type(keyframe.kf) == "table" then
+				for name, pose in pairs(keyframe.kf) do
+					poses[name] = pose
+				end
+			end
+			if type(keyframe.fc) == "table" then
+				for name, face in pairs(keyframe.fc) do
+					faces[name] = face
+				end
+			end
+			sourceIndex += 1
+		end
+
+		if next(poses) ~= nil or next(faces) ~= nil then
+			local keyframe = { t = timeSeconds * inverseScale, kf = copyHeld(poses) }
+			if next(faces) ~= nil then
+				keyframe.fc = copyHeld(faces)
+			end
+			table.insert(sampled, keyframe)
+		end
+	end
+
+	local sampleCount = math.floor(duration * fps + 1e-6)
+	for index = 0, sampleCount do
+		addSample(index / fps)
+	end
+	if duration > sampleCount / fps + 1e-6 then
+		addSample(duration)
+	end
+
+	if #sampled > 0 then
+		animData.kfs = sampled
+	end
+	return animData
+end
+
+local function applySpeed(animData)
+	local speed = math.clamp(State.speedMultiplier:get(), 0.05, 10)
+	if not State.speedEnabled:get() or speed == 1 or type(animData) ~= "table" then
+		return animData
+	end
+
+	if type(animData.kfs) == "table" then
+		for _, keyframe in ipairs(animData.kfs) do
+			keyframe.t = (tonumber(keyframe.t) or 0) / speed
+		end
+	end
+	if type(animData.t) == "number" then
+		animData.t /= speed
+	end
+	return animData
+end
+
+local function getSpeedAdjustedKeyframeNames(): { any }
+	local keyframeNames = State.keyframeNames:get()
+	local speed = math.clamp(State.speedMultiplier:get(), 0.05, 10)
+	if not State.speedEnabled:get() or speed == 1 then
+		return keyframeNames
+	end
+
+	local adjusted = table.create(#keyframeNames)
+	for index, keyframeName in ipairs(keyframeNames) do
+		local copy = table.clone(keyframeName)
+		copy.time /= speed
+		adjusted[index] = copy
+	end
+	return adjusted
+end
+
+--[[
+	Re-applies all active modifiers to the last loaded raw animation data.
+	Modifiers that mutate in place (resample/speed/mirror) must never touch
+	lastRawAnimData: once the raw data is resampled, re-applying with new
+	settings has nothing left to work on (looks like the modifier only
+	applies after save + reload).
+]]
+local function deepCopy(t: any): any
+	if type(t) ~= "table" then
+		return t
+	end
+	local copy = {}
+	for k, v in pairs(t) do
+		copy[deepCopy(k)] = deepCopy(v)
+	end
+	return copy
+end
+
 function AnimationManager:loadAnim(data: string, isBinary: boolean, progressContext: LoadingProgressContext?)
 	local decodeProgress = if progressContext then progressContext:child(0, 0.985) else nil
 	local applyProgress = if progressContext then progressContext:child(0.985, 1) else nil
@@ -623,8 +830,9 @@ function AnimationManager:loadAnim(data: string, isBinary: boolean, progressCont
 	self.lastRawAnimData = animData
 	State.lastRawAnimData:set(animData)
 
-	-- Apply simplifier based on user settings
-	animData = applySimplifier(animData)
+	-- Apply modifiers to a COPY: several modifiers mutate their input in
+	-- place, and lastRawAnimData must stay unmodified for re-application.
+	animData = applyResample(applySpeed(applySimplifier(applyMirror(deepCopy(animData)))))
 
 	State.currentAnimationData:set(animData)
 
@@ -672,17 +880,6 @@ end
 	and reloads the animation into the rig. Called when the user adjusts the simplifier
 	slider or toggles the simplifier checkbox.
 ]]
-local function deepCopy(t: any): any
-	if type(t) ~= "table" then
-		return t
-	end
-	local copy = {}
-	for k, v in pairs(t) do
-		copy[deepCopy(k)] = deepCopy(v)
-	end
-	return copy
-end
-
 function AnimationManager:resimplifyAndPlay()
 	local rawData = self.lastRawAnimData
 	if not rawData then
@@ -691,8 +888,7 @@ function AnimationManager:resimplifyAndPlay()
 
 	local copied = deepCopy(rawData)
 
-	-- Apply simplifier based on current user settings
-	local animData = applySimplifier(copied)
+	local animData = applyResample(applySpeed(applySimplifier(applyMirror(copied))))
 
 	State.currentAnimationData:set(animData)
 
@@ -713,9 +909,9 @@ function AnimationManager:resimplifyAndPlay()
 		return false
 	end
 
-	-- Rebuild and play
-	if self.playbackService and State.activeAnimator then
-		self.playbackService:playCurrentAnimation(State.activeAnimator)
+	-- Rebuild and play all rigs
+	if self.playbackService then
+		self.playbackService:playAllRigs()
 	end
 
 	return true
@@ -730,6 +926,7 @@ function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean, 
 	if ok then
 		local success, rigResult = pcall(self.loadRig, self, nil, progressContext:child(0.95, 1))
 		if success and rigResult ~= false then
+			State.animationDirty:set(false)
 			progressContext:set(
 				1,
 				"Animation loaded",
@@ -760,6 +957,109 @@ function AnimationManager:loadAnimDataFromText(text: string, isBinary: boolean, 
 		end
 		return false
 	end
+end
+
+local function liveSyncTimeKey(value: number): string
+	return string.format("%.9g", value)
+end
+
+local function applyLiveSyncDeltaToData(baseData: any, envelope: any): any?
+	if type(baseData) ~= "table" or type(baseData.kfs) ~= "table"
+		or type(envelope.upsert) ~= "table" or type(envelope.remove) ~= "table" then
+		return nil
+	end
+
+	local frames = {}
+	for _, keyframe in ipairs(baseData.kfs) do
+		if type(keyframe) ~= "table" or type(keyframe.t) ~= "number" then
+			return nil
+		end
+		frames[liveSyncTimeKey(keyframe.t)] = keyframe
+	end
+	for _, time in ipairs(envelope.remove) do
+		if type(time) ~= "number" then
+			return nil
+		end
+		frames[liveSyncTimeKey(time)] = nil
+	end
+	for _, keyframe in ipairs(envelope.upsert) do
+		if type(keyframe) ~= "table" or type(keyframe.t) ~= "number" then
+			return nil
+		end
+		frames[liveSyncTimeKey(keyframe.t)] = keyframe
+	end
+
+	local patched = table.clone(baseData)
+	patched.kfs = {}
+	for _, keyframe in pairs(frames) do
+		table.insert(patched.kfs, keyframe)
+	end
+	table.sort(patched.kfs, function(left, right)
+		return left.t < right.t
+	end)
+	return patched
+end
+
+function AnimationManager:applyLiveSyncEnvelope(envelope: any, expectedBaseHash: string, deferTrackRebuild: boolean?): boolean
+	if type(envelope) ~= "table" or type(envelope.hash) ~= "string" then
+		return false
+	end
+
+	local rawData
+	local isDelta = envelope.type == "animation_delta"
+	if isDelta then
+		if envelope.base_hash ~= expectedBaseHash then
+			return false
+		end
+		rawData = applyLiveSyncDeltaToData(self.lastRawAnimData, envelope)
+	elseif envelope.type == "animation_full" and type(envelope.animation) == "table" then
+		rawData = envelope.animation
+	else
+		return false
+	end
+
+	if not rawData or not ensureActiveRigReady(nil) then
+		return false
+	end
+	local simplifierActive = State.simplifierEnabled:get() and State.simplifierStrength:get() > 0
+	local mirrorActive = State.mirrorAnimationEnabled:get()
+	local speedActive = State.speedEnabled:get() and State.speedMultiplier:get() ~= 1
+	local resampleActive = State.resampleEnabled:get()
+	local appliedData = if simplifierActive or mirrorActive or speedActive or resampleActive
+		then applyResample(applySpeed(applySimplifier(applyMirror(deepCopy(rawData)))))
+		else rawData
+	local activeRig = State.activeRig :: any
+	local applied = false
+	if isDelta and appliedData == rawData then
+		applied = activeRig:ApplyAnimationDelta(envelope, rawData)
+	else
+		activeRig:LoadAnimation(appliedData)
+		applied = true
+	end
+	if not applied then
+		return false
+	end
+
+	self.lastRawAnimData = rawData
+	State.lastRawAnimData:set(rawData)
+	State.currentAnimationData:set(appliedData)
+	State.animationDirty:set(false)
+	if deferTrackRebuild then
+		local timeScale = 1
+		if type(rawData.export_info) == "table" and rawData.export_info.time_unit == "frames" then
+			local fps = tonumber(rawData.export_info.fps)
+			if fps and fps > 0 then
+				timeScale = 1 / fps
+			end
+		end
+		State.animationLength:set((tonumber(rawData.t) or 0) * timeScale)
+		return true
+	end
+	return self:loadRig(nil, nil, true) ~= false
+end
+
+function AnimationManager:rebuildLiveSyncPreview(): boolean
+	return self:loadRig(nil, nil, true) ~= false
 end
 
 -- Legacy-friendly loader: try binary first, then base64 text fallback.
@@ -831,9 +1131,7 @@ local function syncRigAnimationFromKeyframeSequence(animationSerializerService, 
 	rig:LoadAnimation(animData)
 end
 
-function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressContext: LoadingProgressContext?)
-	self.playbackService:stopAnimationAndDisconnect()
-
+function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressContext: LoadingProgressContext?, skipRigSync: boolean?)
 	if not ensureActiveRigReady(progressContext) then
 		warn("No active rig available")
 		return false
@@ -877,9 +1175,11 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressCo
 	end
 
 	-- Ensure the rig holds the loaded animation data so saving back to rig works (even for CurveAnimation-derived clips)
-	pcall(function()
-		syncRigAnimationFromKeyframeSequence(self.animationSerializerService, State.activeRig, kfs)
-	end)
+	if not skipRigSync then
+		pcall(function()
+			syncRigAnimationFromKeyframeSequence(self.animationSerializerService, State.activeRig, kfs)
+		end)
+	end
 
 	-- Detect torso animation data on R6 rigs
 	local function hasTorsoMotion(seq: KeyframeSequence): boolean
@@ -962,53 +1262,6 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressCo
 			true
 		)
 	end
-	
-	self.playbackService:playCurrentAnimation(State.activeAnimator, kfs)
-
-	-- If torso has animation data on R6, verify the torso part actually moves; otherwise warn about Adaptive Animations beta
-	if hasTorsoData and rigModel then
-		task.spawn(function()
-			local torso: BasePart?
-			do
-				local direct = rigModel:FindFirstChild("Torso")
-				if direct and direct:IsA("BasePart") then
-					torso = direct
-				else
-					for _, inst in ipairs(rigModel:GetDescendants()) do
-						if inst:IsA("BasePart") and inst.Name == "Torso" then
-							torso = inst
-							break
-						end
-					end
-				end
-			end
-
-			if not torso then
-				return
-			end
-
-			-- If torso is anchored, don't warn; lack of movement is expected.
-			if torso.Anchored then
-				return
-			end
-
-			local start = torso.CFrame
-			task.wait(0.35)
-			local current = torso.CFrame
-			local delta = start:ToObjectSpace(current)
-			local posDelta = delta.Position.Magnitude
-			local rx, ry, rz = delta:ToOrientation()
-			local rotDelta = math.abs(rx) + math.abs(ry) + math.abs(rz)
-
-			if posDelta < 1e-3 and rotDelta < 1e-3 then
-				if State.rigManager and State.rigManager.addWarning then
-					State.rigManager:addWarning(
-						"Torso has animation data but is not moving. Disable the Adaptive Animations beta feature in Studio, it completely breaks R6. File > Beta Features > Adaptive Animations (uncheck this)"
-					)
-				end
-			end
-		end)
-	end
 
 	-- Calculate keyframe statistics
 	local count = keyframes and #keyframes or 0
@@ -1021,6 +1274,8 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressCo
 	if progressContext then
 		progressContext:set(1, "Animation preview ready", string.format("%d keyframes", count), true)
 	end
+
+	self.playbackService:playAllRigs()
 	return true
 end
 
@@ -1072,13 +1327,175 @@ local function addMarkersToKeyframeSequence(kfs: KeyframeSequence)
 	end
 end
 
+local function keyframeTimeKey(time: number): number
+	return math.round(time * 100000) / 100000
+end
+
+local function getOrCreateKeyframeAtTime(kfs: KeyframeSequence, time: number, keyframesByTime: { [number]: Keyframe }): Keyframe
+	local timeKey = keyframeTimeKey(time)
+	local existing = keyframesByTime[timeKey]
+	if existing then
+		return existing
+	end
+
+	local created = Instance.new("Keyframe")
+	created.Time = time
+	created.Parent = kfs
+	keyframesByTime[timeKey] = created
+	return created
+end
+
+local function ensureFaceControlsFolder(kf: Keyframe): Folder
+	local headPose = nil
+	for _, descendant in ipairs(kf:GetDescendants()) do
+		if descendant:IsA("Pose") and descendant.Name == "Head" then
+			headPose = descendant
+			break
+		end
+	end
+
+	if not headPose then
+		headPose = Instance.new("Pose")
+		headPose.Name = "Head"
+		headPose.CFrame = CFrame.new()
+		headPose.Weight = 0
+		headPose.Parent = kf
+	end
+
+	local existing = headPose:FindFirstChild("FaceControls")
+	if existing and existing:IsA("Folder") then
+		return existing
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = "FaceControls"
+	folder.Parent = headPose
+	return folder
+end
+
+local function hasFaceControlsFolder(kfs: KeyframeSequence): boolean
+	for _, keyframe in ipairs(kfs:GetKeyframes()) do
+		if keyframe:FindFirstChild("FaceControls", true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function copyFaceControlsFromSequence(target: KeyframeSequence, source: KeyframeSequence?)
+	if not source then
+		return
+	end
+
+	local targetKeyframesByTime: { [number]: Keyframe } = {}
+	for _, keyframe in ipairs(target:GetKeyframes()) do
+		targetKeyframesByTime[keyframeTimeKey(keyframe.Time)] = keyframe
+	end
+
+	for _, sourceKeyframe in ipairs(source:GetKeyframes()) do
+		local sourceFolder = sourceKeyframe:FindFirstChild("FaceControls", true)
+		if not sourceFolder or not sourceFolder:IsA("Folder") then
+			continue
+		end
+
+		local targetKeyframe = getOrCreateKeyframeAtTime(target, sourceKeyframe.Time, targetKeyframesByTime)
+		local targetFolder = ensureFaceControlsFolder(targetKeyframe)
+		targetFolder:ClearAllChildren()
+
+		for _, facePose in ipairs(sourceFolder:GetChildren()) do
+			if facePose:IsA("NumberPose") then
+				facePose:Clone().Parent = targetFolder
+			end
+		end
+
+		if #targetFolder:GetChildren() == 0 then
+			targetFolder:Destroy()
+		end
+	end
+end
+
+local function decodeSerializedFaceControlValue(faceData: any): number?
+	if type(faceData) == "number" then
+		return faceData
+	end
+	if type(faceData) ~= "table" then
+		return nil
+	end
+	if type(faceData.value) == "number" then
+		return faceData.value
+	end
+	if type(faceData[1]) == "number" then
+		return faceData[1]
+	end
+	return nil
+end
+
+local function applyFaceControlsFromSerializedData(target: KeyframeSequence, animData: any)
+	if type(animData) ~= "table" or type(animData.kfs) ~= "table" then
+		return
+	end
+
+	local targetKeyframesByTime: { [number]: Keyframe } = {}
+	for _, keyframe in ipairs(target:GetKeyframes()) do
+		targetKeyframesByTime[keyframeTimeKey(keyframe.Time)] = keyframe
+	end
+
+	for _, kfData in ipairs(animData.kfs) do
+		if type(kfData) ~= "table" or type(kfData.fc) ~= "table" or type(kfData.t) ~= "number" then
+			continue
+		end
+
+		local targetKeyframe = getOrCreateKeyframeAtTime(target, kfData.t, targetKeyframesByTime)
+		local targetFolder = ensureFaceControlsFolder(targetKeyframe)
+		targetFolder:ClearAllChildren()
+
+		for controlName, faceData in pairs(kfData.fc) do
+			if type(controlName) == "string" then
+				local value = decodeSerializedFaceControlValue(faceData)
+				if value ~= nil then
+					local numberPose = Instance.new("NumberPose")
+					numberPose.Name = controlName
+					numberPose.Value = value
+					pcall(function()
+						(numberPose :: any).Weight = 1
+					end)
+					numberPose.Parent = targetFolder
+				end
+			end
+		end
+
+		if #targetFolder:GetChildren() == 0 then
+			targetFolder:Destroy()
+		end
+	end
+end
+
+local function ensureSavedFaceControls(kfs: KeyframeSequence)
+	if hasFaceControlsFolder(kfs) then
+		return
+	end
+
+	applyFaceControlsFromSerializedData(kfs, State.currentAnimationData:get())
+	if hasFaceControlsFolder(kfs) then
+		return
+	end
+
+	applyFaceControlsFromSerializedData(kfs, State.lastRawAnimData:get())
+	if hasFaceControlsFolder(kfs) then
+		return
+	end
+
+	copyFaceControlsFromSequence(kfs, State.currentKeyframeSequence)
+end
+
 function AnimationManager:createKeyframeSequenceFromState(): KeyframeSequence?
 	if not State.activeRig then
 		return nil
 	end
 
-	State.activeRig.keyframeNames = State.keyframeNames:get() :: { any }?
+	State.activeRig.keyframeNames = getSpeedAdjustedKeyframeNames()
 	local kfs = State.activeRig:ToRobloxAnimation()
+	ensureSavedFaceControls(kfs)
 
 	if State.scaleFactor:get() ~= 1 then
 		kfs = Utils.scaleAnimation(kfs, State.scaleFactor:get())
@@ -1102,14 +1519,7 @@ function AnimationManager:saveAnimationRig()
 		return
 	end
 
-	-- Use currentKeyframeSequence for animation data, but add markers from State.keyframeNames
-	local kfs
-	if State.currentKeyframeSequence then
-		kfs = State.currentKeyframeSequence:Clone()
-		addMarkersToKeyframeSequence(kfs)
-	else
-		kfs = self:createKeyframeSequenceFromState()
-	end
+	local kfs = self:createKeyframeSequenceFromState()
 	if not kfs then
 		return
 	end
@@ -1156,6 +1566,7 @@ function AnimationManager:saveAnimationRig()
 	end
 
 	kfs.Parent = animSaves
+	State.animationDirty:set(false)
 
 	if State.rigManager and State.rigManager.updateSavedAnimationsList then
 		State.rigManager:updateSavedAnimationsList()
@@ -1176,19 +1587,9 @@ function AnimationManager:saveAnimationFolder(name: string)
 		folder.Parent = game.Workspace
 	end
 	
-	-- Use currentKeyframeSequence for animation data, but add markers from State.keyframeNames
-	local kfs
-	if State.currentKeyframeSequence then
-		kfs = State.currentKeyframeSequence:Clone()
-		addMarkersToKeyframeSequence(kfs)
-	else
-		assert(State.activeRig)
-		State.activeRig.keyframeNames = State.keyframeNames:get() :: { any }?
-		kfs = State.activeRig:ToRobloxAnimation()
-	end
-	
-	if State.scaleFactor:get() ~= 1 then
-		kfs = Utils.scaleAnimation(kfs, State.scaleFactor:get()) -- Scale the animation
+	local kfs = self:createKeyframeSequenceFromState()
+	if not kfs then
+		return
 	end
 
 	-- Always apply current state properties (the clone path won't have these)
@@ -1213,14 +1614,7 @@ function AnimationManager:uploadAnimation()
 		return
 	end
 
-	-- Use currentKeyframeSequence for animation data, but add markers from State.keyframeNames
-	local kfs
-	if State.currentKeyframeSequence then
-		kfs = State.currentKeyframeSequence:Clone()
-		addMarkersToKeyframeSequence(kfs)
-	else
-		kfs = self:createKeyframeSequenceFromState()
-	end
+	local kfs = self:createKeyframeSequenceFromState()
 	if not kfs then
 		return
 	end
@@ -1311,8 +1705,8 @@ function AnimationManager:playSavedAnimation(animation)
 	self.lastRawAnimData = animData
 	State.lastRawAnimData:set(animData)
 
-	-- Apply simplifier based on user settings
-	animData = applySimplifier(animData)
+	-- Apply modifiers to a COPY so re-applying with new settings works.
+	animData = applyResample(applySpeed(applySimplifier(applyMirror(deepCopy(animData)))))
 
 	State.currentAnimationData:set(animData)
 	activeRig:LoadAnimation(animData)
@@ -1320,7 +1714,7 @@ end
 
 function AnimationManager:importAnimationsBulk()
 	if State.activeRig then
-		self.playbackService:stopAnimationAndDisconnect({ background = true })
+		self.playbackService:stopRigTrack(State.activeSessionRig:get())
 
 		local animfiles = game:GetService("StudioService"):PromptImportFiles({ "rbxanim" })
 
@@ -1335,7 +1729,7 @@ function AnimationManager:importAnimationsBulk()
 			local bulkProgress = createLoadingProgressContext(self, 0, 1)
 
 			for index, animfile in ipairs(animfiles) do
-				self.playbackService:stopAnimationAndDisconnect({ background = true })
+				self.playbackService:stopRigTrack(State.activeSessionRig:get())
 				local fileName = animfile.Name
 				local fileDetail = string.format("file %d/%d: %s", index, totalFiles, fileName)
 				local fileProgress = bulkProgress:child((index - 1) / totalFiles, index / totalFiles)
@@ -1467,6 +1861,7 @@ AnimationManager._testing = {
 	interpolateMissingAxis = interpolateMissingAxis,
 	ensureChannelSample = ensureChannelSample,
 	applyBoneWeights = applyBoneWeights,
+	applyFaceControlsFromSerializedData = applyFaceControlsFromSerializedData,
 }
 
 return AnimationManager

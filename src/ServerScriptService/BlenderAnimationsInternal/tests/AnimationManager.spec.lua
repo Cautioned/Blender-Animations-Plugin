@@ -4,6 +4,7 @@ return function()
 	local sampleAxisValue = AnimationManager._testing.sampleAxisValue
 	local interpolateMissingAxis = AnimationManager._testing.interpolateMissingAxis
 	local ensureChannelSample = AnimationManager._testing.ensureChannelSample
+	local applyFaceControlsFromSerializedData = AnimationManager._testing.applyFaceControlsFromSerializedData
 
 	describe("AnimationManager internals", function()
 		describe("sampleAxisValue", function()
@@ -348,6 +349,42 @@ return function()
 				local b = ensureChannelSample(poseMap, "Head", 0)
 
 				expect(a).to.never.equal(b)
+			end)
+		end)
+
+		describe("applyFaceControlsFromSerializedData", function()
+			it("should materialize FaceControls folders on keyframes", function()
+				local kfs = Instance.new("KeyframeSequence")
+				local kf = Instance.new("Keyframe")
+				kf.Time = 0
+				kf.Parent = kfs
+
+				applyFaceControlsFromSerializedData(kfs, {
+					t = 0,
+					kfs = {
+						{
+							t = 0,
+							kf = {},
+							fc = {
+								JawDrop = { value = 0.45, easingStyle = "Linear", easingDirection = "Out" },
+							},
+						},
+					},
+				})
+
+				local head = kf:FindFirstChild("Head")
+				expect(head).to.be.ok()
+
+				local faceControls = head:FindFirstChild("FaceControls")
+				expect(faceControls).to.be.ok()
+				expect(faceControls:IsA("Folder")).to.equal(true)
+
+				local jawDrop = faceControls:FindFirstChild("JawDrop")
+				expect(jawDrop).to.be.ok()
+				expect(jawDrop:IsA("NumberPose")).to.equal(true)
+				expect((jawDrop :: NumberPose).Value).to.be.near(0.45, 0.001)
+
+				kfs:Destroy()
 			end)
 		end)
 	end)

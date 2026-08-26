@@ -12,7 +12,6 @@ local OnEvent = Fusion.OnEvent
 local Observer = Fusion.Observer
 local Value = Fusion.Value
 local Ref = Fusion.Ref
-local Out = Fusion.Out
 
 local StudioComponentsUtil = script.Parent.Parent.Parent.Components.StudioComponents:FindFirstChild("Util")
 local getDragInput = require(StudioComponentsUtil.getDragInput)
@@ -36,7 +35,6 @@ function PlaybackSlider.create(props: {
 	local isEnabled = getState(props.Enabled, true)
 	local isHovering = Value(false)
 	local handleRegion = Value()
-	local barAbsSize = Value(Vector2.zero)
 	local inputValue = getState(props.Value, 0)
 	local visualAlpha = Value(0)
 	local lastAlpha = 0
@@ -118,7 +116,6 @@ function PlaybackSlider.create(props: {
 				BackgroundColor3 = themeProvider:GetColor(Enum.StudioStyleGuideColor.InputFieldBackground),
 				BackgroundTransparency = 0.35,
 				BorderSizePixel = 0,
-				[Out("AbsoluteSize")] = barAbsSize,
 				[Children] = {
 					New("UICorner")({
 						CornerRadius = UDim.new(1, 0),
@@ -154,16 +151,16 @@ function PlaybackSlider.create(props: {
 			}),
 			New("Frame")({
 				Name = "HandleRegion",
-				Size = UDim2.fromScale(1, 1),
 				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(8, 0),
+				Size = UDim2.new(1, -16, 1, 0),
 				[Ref] = handleRegion,
 				[Children] = {
 					New("Frame")({
 						Name = "Handle",
 						AnchorPoint = Vector2.new(0.5, 0.5),
 						Position = Computed(function()
-							local absoluteBarSize = unwrap(barAbsSize) or Vector2.zero
-							return UDim2.new(0, (visualAlpha:get() * absoluteBarSize.X) + 8, 0.5, 0)
+							return UDim2.fromScale(visualAlpha:get(), 0.5)
 						end),
 						Size = getMotionState(Computed(function()
 							local offset = if isHovering:get() then 16 else 14

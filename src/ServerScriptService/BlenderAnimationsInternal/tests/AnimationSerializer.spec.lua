@@ -236,6 +236,31 @@ return function()
 				expect(result.is_deform_bone_rig).to.be.ok()
 			end)
 
+			it("should not replace a deform bone with its structural root pose", function()
+				local kfs = Instance.new("KeyframeSequence")
+				local keyframe = Instance.new("Keyframe")
+				keyframe.Time = 0
+				keyframe.Parent = kfs
+
+				local structuralRoot = Instance.new("Pose")
+				structuralRoot.Name = "Torso"
+				structuralRoot.CFrame = CFrame.identity
+				structuralRoot:SetAttribute("BlenderAnimationsStructuralRoot", true)
+				structuralRoot.Parent = keyframe
+
+				local bonePose = Instance.new("Pose")
+				bonePose.Name = "Torso"
+				bonePose.CFrame = CFrame.new(0, 3, 0)
+				bonePose.Parent = structuralRoot
+
+				local rig = { isDeformRig = true, bones = {}, ToRobloxAnimation = function() return kfs end }
+				local result = serializer:serialize(kfs, rig)
+
+				expect(result).to.be.ok()
+				expect(result.kfs[1].kf.Torso).to.be.ok()
+				expect(result.kfs[1].kf.Torso.components[2]).to.be.near(3)
+			end)
+
 			it("should correctly serialize keyframes with parent-child bone relationships in time order", function()
 				local kfs = Instance.new("KeyframeSequence")
 
