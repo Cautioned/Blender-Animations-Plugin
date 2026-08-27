@@ -1012,6 +1012,76 @@ class TestRbxmRigTree(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def _enc_solid_mesh(positions, faces):
+    """Build a legacy SolidMeshHolder blob (pre-CSGMDL union mesh)."""
+    body = bytearray(b"SolidMesh\0\0\0\0")
+    body += struct.pack("<II", len(positions), 0)
+    for position in positions:
+        body += struct.pack("<3f", *position)
+    body += struct.pack("<II", len(faces), 0)
+    for _ in faces:
+        body += struct.pack("<3f", 0.0, 1.0, 0.0)  # per-face normal
+    body += struct.pack("<IIII", 0, 0, 0, 0)  # padding + color_count
+    indices = [index for face in faces for index in face]
+    encoded = bytearray()
+    index_out = 0
+    for index in indices:
+        delta = index - index_out
+        encoded.append(delta if 0 <= delta < 64 else delta + 128)
+        index_out = index
+    body += struct.pack("<II", len(indices), 0)
+    body += encoded
+    return bytes((3, 1)) + struct.pack("<III", len(body), 0, len(body)) + bytes(body)
+
+
+def _enc_csgmdl5(positions, faces):
+    """Build a CSGMDL5 blob (only the 10-byte magic is obfuscated)."""
+    cycle = (86, 46, 110, 88, 49, 32, 48, 4, 52, 105, 12, 119, 12, 1, 94, 0,
+             26, 96, 55, 105, 29, 82, 43, 7, 79, 36, 89, 101, 83, 4, 122)
+    body = bytearray(b"CSGMDL" + struct.pack("<I", 5))
+    # positions
+    body += struct.pack("<H", len(positions))
+    for position in positions:
+        body += struct.pack("<3f", *position)
+    # quantized normals (stored = round(n * 32767) + 32767, wrapped to i16)
+    body += struct.pack("<HI", len(positions), len(positions) * 6)
+    for _ in positions:
+        body += struct.pack("<3h", 0, 0x7FFF, 0)  # +Y normal
+    # colors (red) + normal ids (Top)
+    body += struct.pack("<H", len(positions))
+    for _ in positions:
+        body += bytes((255, 0, 0, 255))
+    body += struct.pack("<H", len(positions))
+    for _ in positions:
+        body += bytes((2,))
+    # uvs + tangents (none)
+    body += struct.pack("<H", len(positions))
+    for _ in positions:
+        body += struct.pack("<2f", 0.0, 0.0)
+    body += struct.pack("<HI", 0, 0)
+    # delta-encoded indices with range markers [0, index_count]
+    indices = [index for face in faces for index in face]
+    encoded = bytearray()
+    index_out = 0
+    for index in indices:
+        delta = index - index_out
+        if 0 <= delta < 64:
+            encoded.append(delta)
+        elif -64 <= delta < 0:
+            encoded.append(delta + 128)
+        else:
+            raise ValueError("test delta out of range")
+        index_out = index
+    body += struct.pack("<II", len(indices), len(encoded))
+    body += encoded
+    body += struct.pack("<B", 2)
+    body += struct.pack("<II", 0, len(indices))
+    obfuscated = bytearray(body)
+    for index in range(10):
+        obfuscated[index] ^= cycle[index % 31]
+    return bytes(obfuscated)
+
+
 def _enc_csgmdl2(positions, faces):
     """Build a CSGMDL2 blob (obfuscated) the way Studio writes MeshData2."""
     body = bytearray()
@@ -1036,7 +1106,7 @@ def _enc_csgmdl2(positions, faces):
 
 
 class TestRbxmUnion(unittest.TestCase):
-    def _build_union(self):
+    def _build_union(self, use_part_color=False):
         # Model > UnionOperation with a triangle CSGMDL2 mesh in MeshData2.
         positions = [(-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 2.0, 0.0)]
         faces = [(0, 1, 2)]
@@ -1051,6 +1121,8 @@ class TestRbxmUnion(unittest.TestCase):
         identity = (1, 0, 0, 0, 1, 0, 0, 0, 1)
         chunks.append(_prop_chunk(2, "CFrame", 0x10, _enc_cframes([(3.0, 4.0, 5.0) + identity])))
         chunks.append(_prop_chunk(2, "size", 0x0E, _enc_vector3s([[2.0, 2.0, 1.0]])))
+        if use_part_color:
+            chunks.append(_prop_chunk(2, "UsePartColor", 0x02, b"\x01"))
         chunks.append(
             _prop_chunk(2, "MeshData2", 0x1C, _enc_shared_string_indices([0]))
         )
@@ -1075,6 +1147,15 @@ class TestRbxmUnion(unittest.TestCase):
         xs = [p[0] for p in mesh["positions"]]
         self.assertAlmostEqual(max(xs) - min(xs), 2.0)
 
+    def test_union_use_part_color_strips_baked_colors(self):
+        data = self._build_union(use_part_color=True)
+        entries = rbxm_to_part_aux(data)
+        self.assertEqual(len(entries), 1)
+        mesh = entries[0].get("union_mesh")
+        self.assertIsNotNone(mesh)
+        self.assertEqual(mesh.get("colors"), [])  # falls back to part Color3
+        self.assertEqual(len(mesh["faces"]), 1)
+
     def test_union_without_meshdata_marks_unsupported(self):
         chunks = []
         chunks.append(_inst_chunk(1, "UnionOperation", [0]))
@@ -1089,6 +1170,108 @@ class TestRbxmUnion(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertTrue(entries[0].get("union_unsupported"))
         self.assertNotIn("union_mesh", entries[0])
+
+    def test_union_asset_id_reference_is_stamped(self):
+        # 2012-era unions store no mesh inline; the AssetId content URL
+        # references the render-mesh asset the importer fetches later.
+        chunks = []
+        chunks.append(_inst_chunk(1, "UnionOperation", [0]))
+        chunks.append(_prop_chunk(1, "Name", 0x01, _enc_string("OldUnion")))
+        chunks.append(
+            _prop_chunk(
+                1, "AssetId", 0x01,
+                _enc_string("http://www.roblox.com//asset/?id=361773430"),
+            )
+        )
+        chunks.append(_prnt_chunk([0], [-1]))
+        data = _rbxm(chunks, class_count=1, instance_count=1)
+
+        entries = rbxm_to_part_aux(data)
+        self.assertEqual(len(entries), 1)
+        self.assertTrue(entries[0].get("union_unsupported"))
+        self.assertEqual(entries[0].get("union_asset_id"), 361773430)
+
+    def test_lz4_decoder_tolerates_legacy_length_miscount(self):
+        # Legacy union assets declare an uncompressed length that is SHORT of
+        # the real block (observed +39 on ChildData chunks).  A clean decode
+        # that consumed the whole input is trusted over the declared size.
+        from roblox_animations.core.rbxm import _lz4_block_decompress
+
+        payload = bytes(range(1, 64)) * 3
+        # lz4 block: 15+ ext literals is enough for a short run.
+        block = bytes([0xF0, len(payload) - 15]) + payload
+        out = _lz4_block_decompress(block, len(payload) - 7)
+        self.assertEqual(bytes(out), payload)
+
+    def test_union_csgmdl5_extraction(self):
+        # CSGMDL5: deinterleaved arrays + delta-encoded indices + markers.
+        positions = [(-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 2.0, 0.0)]
+        faces = [(0, 1, 2)]
+        blob = _enc_csgmdl5(positions, faces)
+
+        chunks = []
+        chunks.append(_chunk(b"SSTR", _enc_sstr([blob])))
+        chunks.append(_inst_chunk(1, "Model", [0]))
+        chunks.append(_inst_chunk(2, "UnionOperation", [1]))
+        chunks.append(_prop_chunk(1, "Name", 0x01, _enc_string("Unions")))
+        chunks.append(_prop_chunk(2, "Name", 0x01, _enc_string("V5")))
+        identity = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        chunks.append(_prop_chunk(2, "CFrame", 0x10, _enc_cframes([(3.0, 4.0, 5.0) + identity])))
+        chunks.append(_prop_chunk(2, "size", 0x0E, _enc_vector3s([[2.0, 2.0, 1.0]])))
+        chunks.append(
+            _prop_chunk(2, "MeshData2", 0x1C, _enc_shared_string_indices([0]))
+        )
+        chunks.append(_prnt_chunk([0, 1], [-1, 0]))
+        data = _rbxm(chunks, class_count=2, instance_count=2)
+
+        entries = rbxm_to_part_aux(data)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["name"], "V5")
+        self.assertEqual(entry["mesh_class"], "UnionOperation")
+        mesh = entry.get("union_mesh")
+        self.assertIsNotNone(mesh)
+        self.assertEqual(len(mesh["positions"]), 3)
+        self.assertEqual(len(mesh["faces"]), 1)
+        self.assertEqual(mesh["faces"][0], (0, 1, 2))
+        self.assertAlmostEqual(mesh["positions"][2][1], 2.0)
+        self.assertAlmostEqual(mesh["colors"][0][0], 1.0)  # red
+        # normal ids take priority: Top (+Y) flat normals for CSG
+        self.assertAlmostEqual(mesh["normals"][0][1], 1.0)
+
+    def test_union_solid_mesh_extraction(self):
+        # Legacy unions embed their render mesh in SolidMeshHolder.
+        positions = [(-1.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 2.0, 0.0)]
+        faces = [(0, 1, 2)]
+        blob = _enc_solid_mesh(positions, faces)
+
+        chunks = []
+        chunks.append(_chunk(b"SSTR", _enc_sstr([blob])))
+        chunks.append(_inst_chunk(1, "Model", [0]))
+        chunks.append(_inst_chunk(2, "UnionOperation", [1]))
+        chunks.append(_prop_chunk(1, "Name", 0x01, _enc_string("Unions")))
+        chunks.append(_prop_chunk(2, "Name", 0x01, _enc_string("Legacy")))
+        identity = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+        chunks.append(_prop_chunk(2, "CFrame", 0x10, _enc_cframes([(3.0, 4.0, 5.0) + identity])))
+        chunks.append(_prop_chunk(2, "size", 0x0E, _enc_vector3s([[2.0, 2.0, 1.0]])))
+        chunks.append(
+            _prop_chunk(2, "SolidMeshHolder", 0x1C, _enc_shared_string_indices([0]))
+        )
+        chunks.append(_prnt_chunk([0, 1], [-1, 0]))
+        data = _rbxm(chunks, class_count=2, instance_count=2)
+
+        entries = rbxm_to_part_aux(data)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["mesh_class"], "UnionOperation")
+        self.assertNotIn("union_unsupported", entry)
+        mesh = entry.get("union_mesh")
+        self.assertIsNotNone(mesh)
+        self.assertEqual(len(mesh["positions"]), 3)
+        self.assertEqual(mesh["faces"], [(0, 1, 2)])
+        self.assertAlmostEqual(mesh["positions"][2][1], 2.0)
+        # flat normals rebuilt from the face (cross of edges 0->1, 0->2)
+        self.assertAlmostEqual(mesh["normals"][0][2], 1.0, places=5)
 
     def test_binary_string_props_survive(self):
         # A String prop containing invalid UTF-8 must come back as bytes,

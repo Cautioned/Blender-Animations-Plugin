@@ -249,12 +249,17 @@ def _build_primitive_mesh_data(entry, include_surface_data=True):
                     )
                     loop_uvs.append((u_studs * 0.5, v_studs * 0.125))
                     uvs[index] = (u_studs * 0.5, v_studs * 0.125)
+        elif shape in ("cylinder", 2):
+            uv_entry = dict(entry)
+            uv_entry["_primitive_positions"] = positions
+            loop_uvs = _cylinder_loop_uvs(faces, uv_entry)
+            uvs = _generate_face_uvs(faces, n, uv_entry)
         else:
             uv_entry = dict(entry)
             uv_entry["_primitive_positions"] = positions
             loop_uvs = _generate_primitive_loop_uvs(faces, uv_entry)
             uvs = _generate_face_uvs(faces, n, uv_entry)
-        face_surface_types = _face_surface_types(entry, faces, shape)
+        face_surface_types = _face_surface_types(entry, faces, shape, positions)
     return {
         "positions": positions,
         "faces": faces,
@@ -344,18 +349,99 @@ def _generate_primitive_loop_uvs(faces, entry):
     return loop_uvs
 
 
+def _cylinder_arc_studs(y, z, diameter):
+    """Arc position (in studs) around a cylinder's YZ cross-section.
+
+    Mirrors GfxRender/GeometryGenerator.cpp addCylinder<false>: the side is
+    four quadrant patches, each stretched to the circle DIAMETER (the
+    πd/4 arc becomes d studs) and anchored at its own start corner:
+    Back (+Z) starts at +45°, Top (+Y) at +135°, Front (-Z) at +135° through
+    ±180°, Bottom (-Y) at -135°.
+    """
+    import math as _math
+
+    theta = _math.degrees(_math.atan2(y, z))
+    if theta >= 45.0 and theta <= 135.0:  # Top quadrant
+        return (135.0 - theta) / 90.0 * diameter
+    if theta >= -45.0 and theta < 45.0:  # Back quadrant
+        return (45.0 - theta) / 90.0 * diameter
+    if theta >= -135.0 and theta < -45.0:  # Bottom quadrant
+        return (theta + 135.0) / 90.0 * diameter
+    if theta >= 0.0:  # Front quadrant, +135°..+180°
+        return (theta - 135.0) / 90.0 * diameter
+    return (theta + 225.0) / 90.0 * diameter  # Front, -180°..-135°
+
+
+def _cylinder_loop_uvs(faces, entry):
+    """Per-loop cylinder UVs matching the 2016 renderer.
+
+    Side quads: band U tiles along the cylinder axis (X) at the band's
+    2-stud width, band V wraps around the arc per quadrant
+    (_cylinder_arc_studs).  Caps: radial from the cap centre in material
+    studs — the renderer never gives caps stud-atlas UVs (uvStuds is zero),
+    so their loop UVs only feed the built-in material layer.
+    """
+    positions = entry.get("_primitive_positions") or []
+    size = entry.get("part_size") or [4.0, 1.0, 2.0]
+    hx = float(size[0]) / 2.0
+    diameter = min(float(size[1]), float(size[2]))
+    radius = diameter / 2.0
+    loop_uvs = []
+    for face in faces:
+        idxs = [int(index) for index in face if 0 <= int(index) < len(positions)]
+        if len(idxs) < 3:
+            loop_uvs.extend([(0.0, 0.0)] * len(face))
+            continue
+        points = [positions[index] for index in idxs]
+        p0, p1, p2 = points[0], points[1], points[2]
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        nx = e1[1] * e2[2] - e1[2] * e2[1]
+        ny = e1[2] * e2[0] - e1[0] * e2[2]
+        nz = e1[0] * e2[1] - e1[1] * e2[0]
+        if abs(nx) >= abs(ny) and abs(nx) >= abs(nz):
+            # Cap fan: u = d(1 ∓ z/r)/2, v = d(1 - y/r)/2 in studs.
+            z_sign = -1.0 if nx > 0 else 1.0
+            loop_uvs.extend(
+                (
+                    (diameter * (1.0 + z_sign * point[2] / radius) / 2.0)
+                    * _U_UNITS_PER_STUD,
+                    (diameter * (1.0 - point[1] / radius) / 2.0)
+                    * _V_UNITS_PER_STUD,
+                )
+                for point in points
+            )
+        else:
+            loop_uvs.extend(
+                (
+                    (point[0] + hx) * _U_UNITS_PER_STUD,
+                    _cylinder_arc_studs(point[1], point[2], diameter)
+                    * _V_UNITS_PER_STUD,
+                )
+                for point in points
+            )
+    return loop_uvs
+
+
 # Roblox's per-face surface order is Back, Front, Top, Bottom, Right, Left,
 # matching surface_types indices 0..5 parsed from the rbxm.
-def _face_surface_types(entry, faces, shape):
+def _face_surface_types(entry, faces, shape, positions=None):
     """Map each generated triangle to its Roblox surface type.
 
     Block faces are emitted as 6 quads (2 tris each) in the same order Roblox
     reports surfaces: -Z=Back, +Z=Front, +Y=Top, -Y=Bottom, +X=Right, -X=Left.
-    Wedge/CornerWedge faces map onto their nearest Roblox surface.  Curved
-    shapes (cylinder/ball) use the dominant textured type on every face.
+    Wedge/CornerWedge faces map onto their nearest Roblox surface.
+
+    Curved shapes follow the 2016 renderer (GfxRender/GeometryGenerator.cpp):
+    the cylinder side is four quadrant patches (+Y=Top, +Z=Back, -Y=Bottom,
+    -Z=Front) and its ±X caps NEVER sample the studs atlas, so they map to
+    Smooth (0) and the full material path.  The ball is six patches, one per
+    NormalId direction.
     """
     sts = entry.get("surface_types") or [0] * 6
     n = len(faces)
+
+    import math as _math
 
     if shape in ("block", 1):
         return [sts[min(t // 2, 5)] for t in range(n)]
@@ -367,13 +453,63 @@ def _face_surface_types(entry, faces, shape):
         # +X tri=Right, slopes=Top/Front, bottom=Bottom, -Z tri=Back
         order = (4, 2, 1, 3, 0)
         return [sts[order[min(t // 2, 4)]] for t in range(n)]
-    # cylinder / ball: no per-face mapping — use the dominant textured type.
-    dominant = 0
-    for cand in (3, 4, 1, 5):
-        if cand in sts:
-            dominant = cand
-            break
-    return [dominant] * n
+
+    if not positions or len(positions) < 3:
+        return [0] * n
+
+    def _face_normal(face):
+        idxs = [int(index) for index in face if 0 <= int(index) < len(positions)]
+        if len(idxs) < 3:
+            return (0.0, 0.0, 0.0)
+        p0, p1, p2 = positions[idxs[0]], positions[idxs[1]], positions[idxs[2]]
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        return (
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        )
+
+    def _dominant_axis_surface(nx, ny, nz):
+        axn, ayn, azn = abs(nx), abs(ny), abs(nz)
+        if axn >= ayn and axn >= azn:
+            return sts[4] if nx > 0 else sts[5]  # +X Right, -X Left
+        if ayn >= axn and ayn >= azn:
+            return sts[2] if ny > 0 else sts[3]  # +Y Top, -Y Bottom
+        return sts[0] if nz > 0 else sts[1]  # +Z Back, -Z Front
+
+    result = []
+    for face in faces:
+        nx, ny, nz = _face_normal(face)
+        if shape in ("cylinder", 2):
+            # The facet-plane normal of a cylinder side quad is NOT radial
+            # (the chord normal tilts up to 90° from the surface direction,
+            # matching the radial only at 45°).  Classify like the
+            # renderer's normal2d: by the ring direction of the centroid.
+            # Caps have every vertex at the same x (±hx) and never sample
+            # the studs atlas — material path (0).
+            idxs = [int(i) for i in face if 0 <= int(i) < len(positions)]
+            if len(idxs) < 3:
+                result.append(0)
+                continue
+            xs = [positions[i][0] for i in idxs]
+            if abs(xs[0] - xs[1]) < 1e-9 and abs(xs[0] - xs[2]) < 1e-9:
+                result.append(0)
+                continue
+            y_c = sum(positions[i][1] for i in idxs) / len(idxs)
+            z_c = sum(positions[i][2] for i in idxs) / len(idxs)
+            theta = _math.degrees(_math.atan2(y_c, z_c))
+            if theta >= 45.0 and theta <= 135.0:
+                result.append(sts[2])  # +Y Top
+            elif theta >= -45.0 and theta < 45.0:
+                result.append(sts[0])  # +Z Back
+            elif theta >= -135.0 and theta < -45.0:
+                result.append(sts[3])  # -Y Bottom
+            else:
+                result.append(sts[1])  # -Z Front
+        else:  # ball: six patches, one per NormalId direction
+            result.append(_dominant_axis_surface(nx, ny, nz))
+    return result
 
 
 # Roblox Studio's OBJ export emits block faces as quads (two triangles each)

@@ -59,14 +59,16 @@ _MAX_IMAGE_BYTES = 64 * 1024 * 1024
 # add-on build or a previous import in the same Blender session carry this
 # stamp; a mismatch forces an in-place rebuild so old datablocks never
 # outlive a graph change.
-_MATERIAL_GRAPH_VERSION = 19
+_MATERIAL_GRAPH_VERSION = 21
 
-# Blender 5.1 mis-evaluates an overlay mix when the factor reads the alpha
-# channel of the SAME image datablock whose colour feeds the tint multiply
-# (verified by render: the composite comes out several times too bright).
-# The overlay factor therefore samples a dedicated COPY datablock; copies
-# are cached per source image so the pixel cost is one duplicate per asset.
-_OVERLAY_ALPHA_IMAGE_CACHE: dict = {}
+# ShaderNodeMix arrived in Blender 3.4; the legacy 3.x build needs the
+# MixRGB equivalent (same blend modes, Fac instead of Factor).
+try:
+    import bpy as _bpy
+    _HAS_MIX_NODE = hasattr(_bpy.types, "ShaderNodeMix")
+except Exception:
+    _HAS_MIX_NODE = True
+_LINK_ARGS_REVERSED = not _HAS_MIX_NODE
 
 
 def _graph_current(material) -> bool:
@@ -338,6 +340,20 @@ def _thumbnail_location(payload: bytes) -> Optional[str]:
         return None
 
 
+def _looks_like_image_payload(data: bytes) -> bool:
+    """True when ``data`` starts with a known image magic.
+
+    Accepting every format Blender's loader decodes means a valid WebP/GIF/
+    BMP served directly (no redirect) is kept instead of discarded as a
+    non-image response.
+    """
+    if data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"\xff\xd8":
+        return True
+    if data[:4] in (b"GIF8", b"BM"):
+        return True
+    return data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
 def _fetch_image_bytes(
     texture_ref: str,
     auth_headers: Optional[dict] = None,
@@ -398,12 +414,15 @@ def _fetch_image_bytes(
             if locations:
                 started = time.perf_counter()
                 result = _fetch_url_bytes(
-                    locations[0], timeout=timeout, max_bytes=_MAX_IMAGE_BYTES
+                    locations[0],
+                    timeout=timeout,
+                    max_bytes=_MAX_IMAGE_BYTES,
+                    trim_mesh_header=False,
                 )
                 record("cdn", started)
                 break
             # No redirect: the payload may itself be the image.
-            if payload[:8] == b"\x89PNG\r\n\x1a\n" or payload[:2] == b"\xff\xd8":
+            if _looks_like_image_payload(payload):
                 result = payload
                 break
         except Exception as exc:
@@ -430,7 +449,10 @@ def _fetch_image_bytes(
             if image_url:
                 started = time.perf_counter()
                 result = _fetch_url_bytes(
-                    image_url, timeout=timeout, max_bytes=_MAX_IMAGE_BYTES
+                    image_url,
+                    timeout=timeout,
+                    max_bytes=_MAX_IMAGE_BYTES,
+                    trim_mesh_header=False,
                 )
                 record("cdn", started)
                 print(f"[RbxTexture] using thumbnail fallback for asset {asset_id}")
@@ -858,13 +880,22 @@ def _image_from_raw_pixels(
     return image
 
 
-def fetch_texture_image(texture_ref: str, name: str = "texture", non_color: bool = False):
+def fetch_texture_image(
+    texture_ref: str,
+    name: str = "texture",
+    non_color: bool = False,
+    ignore_defer: bool = False,
+):
     """Resolve a texture reference (rbxasset:// or rbxassetid:// or url) to a bpy Image.
 
     ``non_color`` selects the colorspace the image is CREATED with (data
     maps: Non-Color; colour chains: sRGB).  Setting it before the pixel
     upload avoids post-upload colorspace flips, which wipe generated image
     buffers and can leave Eevee with a stale GPU texture.
+
+    ``ignore_defer`` skips the deferred-loading gate for fetches that are a
+    SYNCHRONOUS dependency of the current build (the clothing bake needs its
+    templates NOW — a deferred fetch would silently skip the layer forever).
     """
     if not texture_ref:
         return None
@@ -880,7 +911,7 @@ def fetch_texture_image(texture_ref: str, name: str = "texture", non_color: bool
             _IMAGE_CACHE.pop(texture_ref, None)
             _IMAGE_CACHE.pop(asset_key, None)
 
-    if _DEFER_TEXTURE_IMAGES:
+    if _DEFER_TEXTURE_IMAGES and not ignore_defer:
         return None
 
     image = None
@@ -915,7 +946,6 @@ def invalidate_texture_cache() -> None:
     _PAYLOAD_IMAGE_CACHE.clear()
     _PART_MATERIAL_CACHE.clear()
     _OBJECT_TINT_BUILTIN_CACHE.clear()
-    _OVERLAY_ALPHA_IMAGE_CACHE.clear()
     _IMAGE_PREFETCH_FAILURES.clear()
     _PREFETCH_FAILED_REFS.clear()
     _ROLE_COPY_CACHE.clear()
@@ -954,6 +984,12 @@ def _reinit_material(material) -> None:
 
 def _part_material_cache_key(entry: dict):
     """Return a visual signature for reusable MeshPart materials."""
+    # Scope the clothing context to THIS entry's character before reading
+    # context_signature, otherwise the key (computed on the main thread for
+    # lazy place imports) captures a neighbour's clothing and the worker
+    # reuses the wrong material.
+    _scoped_clothing_context(entry)
+
     def stable(value):
         try:
             return json.dumps(value or {}, sort_keys=True, separators=(",", ":"), default=str)
@@ -982,8 +1018,12 @@ def _part_material_cache_key(entry: dict):
     # part colour must NOT split them into per-colour material datablocks —
     # that is exactly the id churn that slows place imports down.  The
     # variant-aware effective material covers MaterialVariant-only parts.
+    # Meshes with asset-baked vertex colors multiply the tint in-shader, so
+    # their colour must stay in the key (different tints = different graphs).
+    mesh_vertex_colors = bool(entry.get("_mesh_vertex_colors"))
     if (
         _effective_material_id(entry) is not None
+        and not mesh_vertex_colors
         and not any(
             (sa or {}).get("color_map") for sa in _entry_surface_appearances(entry)
         )
@@ -999,6 +1039,7 @@ def _part_material_cache_key(entry: dict):
         stable(_entry_surface_appearances(entry)), stable(entry.get("face_decal")),
         clothing_role, clothing_signature,
         bool(entry.get("_use_2022_materials", True)),
+        mesh_vertex_colors,
     )
 
 
@@ -1036,53 +1077,8 @@ def _bind_named_uv(material, tex_node, layer_name: str, node_name: str) -> None:
 
 
 def _overlay_alpha_image_copy(image):
-    """A dedicated datablock copy for the overlay factor's alpha sample.
-
-    The colour chain and the factor chain must never read the same image
-    datablock (see _OVERLAY_ALPHA_IMAGE_CACHE above), so the factor gets a
-    duplicate.  Copies are cached per source image name.
-
-    The duplicate is built from a fresh datablock with a raw pixel-buffer
-    copy: ``image.copy()`` corrupts in-memory (file-less) float images on
-    Blender 5.1, which silently turned the overlay factor solid.
-    """
-    if image is None:
-        return None
-    # Keep colour and factor sampling on distinct datablocks on every Blender
-    # version.  Treating 5.2 as fixed was unsafe: viewport/GPU evaluation can
-    # still alias the two samplers after incremental image hydration, making
-    # overlays brighten, flicker, or appear to draw repeatedly.
-    try:
-        cached = _OVERLAY_ALPHA_IMAGE_CACHE.get(image.name)
-        if cached is not None:
-            try:
-                if cached.name in bpy.data.images and cached.size[:2] == image.size[:2]:
-                    return cached
-            except ReferenceError:
-                pass
-        image.update()
-        width, height = (int(value) for value in image.size[:2])
-        try:
-            is_float = bool(image.is_float)
-        except (AttributeError, ReferenceError):
-            is_float = False
-        copy = bpy.data.images.new(
-            f"{image.name}.alpha",
-            width=width,
-            height=height,
-            alpha=True,
-            float_buffer=is_float,
-        )
-        try:
-            copy.colorspace_settings.name = image.colorspace_settings.name
-        except (AttributeError, TypeError, ReferenceError):
-            pass
-        copy.pixels[:] = image.pixels[:]
-        copy.update()
-        _OVERLAY_ALPHA_IMAGE_CACHE[image.name] = copy
-        return copy
-    except (ReferenceError, RuntimeError):
-        return None
+    """Removed: overlay factors read the texture node's own alpha output."""
+    return None
 
 
 def _set_base_color(material, rgba):
@@ -1099,7 +1095,13 @@ def _set_base_color(material, rgba):
 
 
 def _link(material, out_socket, in_socket):
-    material.node_tree.links.new(out_socket, in_socket)
+    if out_socket is None or in_socket is None:
+        return
+    if _LINK_ARGS_REVERSED:
+        # Blender <3.4: NodeLinks.new(input, output).
+        material.node_tree.links.new(in_socket, out_socket)
+    else:
+        material.node_tree.links.new(out_socket, in_socket)
 
 
 def _socket_by_type(node, kind, name, socket_type):
@@ -1130,6 +1132,60 @@ def _set_color_default(socket, rgba) -> None:
         socket.default_value = rgba[:3]
 
 
+def _float_factor_socket(mix):
+    """The mix node's float factor socket, verified by socket TYPE.
+
+    Blender 5.1 exposes a Factor per data type; a name-only lookup can land
+    on a vector-typed variant and the fade link then fails (leaving the
+    overlay factor unlinked and the transparency visually ignored).
+    MixRGB (pre-3.4) names the socket Fac.
+    """
+    for socket in mix.inputs:
+        if socket.name in ("Factor", "Fac") and str(getattr(socket, "type", "")) in (
+            "VALUE",
+            "FLOAT",
+        ):
+            return socket
+    return None
+
+
+def _new_mix_node(material, name, label, blend_type):
+    """Create an RGBA mix node, returning (node, a, b, factor, result).
+
+    Pre-3.4 Blender lacks ShaderNodeMix, so the legacy build falls back to
+    MixRGB: same blend modes, Fac instead of Factor, Color1/Color2 sockets.
+    """
+    if _HAS_MIX_NODE:
+        mix = material.node_tree.nodes.new("ShaderNodeMix")
+        mix.data_type = "RGBA"
+        mix.blend_type = blend_type
+        a = _socket_by_type(mix, "input", "A", "RGBA")
+        b = _socket_by_type(mix, "input", "B", "RGBA")
+        factor = _float_factor_socket(mix)
+        result = _socket_by_type(mix, "output", "Result", "RGBA")
+    else:
+        mix = material.node_tree.nodes.new("ShaderNodeMixRGB")
+        mix.blend_type = blend_type
+        a = mix.inputs["Color1"]
+        b = mix.inputs["Color2"]
+        factor = mix.inputs["Fac"]
+        result = mix.outputs["Color"]
+    mix.name = name
+    mix.label = label
+    return mix, a, b, factor, result
+
+
+def _output_surface_socket(material):
+    """The material output node's Surface input socket."""
+    for node in material.node_tree.nodes:
+        if node.type == "OUTPUT_MATERIAL":
+            try:
+                return node.inputs["Surface"]
+            except KeyError:
+                return None
+    return None
+
+
 def _bind_overlay_alpha(material, principled, texture_node, color, alpha_scale=1.0, tint=None, tag="") -> None:
     """Composite an overlay texture over the part colour by its alpha.
 
@@ -1154,40 +1210,13 @@ def _bind_overlay_alpha(material, principled, texture_node, color, alpha_scale=1
         )
     except (TypeError, ValueError, IndexError):
         tint_color = (1.0, 1.0, 1.0)
-    mix = material.node_tree.nodes.new("ShaderNodeMix")
-    mix.data_type = "RGBA"
-    mix.blend_type = "MIX"
-    mix.name = f"RBX Overlay Mix{tag}"
-    mix.label = "RBX overlay composite (map α over part colour)"
+    mix, a_socket, b_socket, factor_socket, color_out = _new_mix_node(
+        material, f"RBX Overlay Mix{tag}",
+        "RBX overlay composite (map α over part colour)", "MIX",
+    )
     mix.location = (-150, 0)
-    # The factor samples a COPY of the image datablock through its own
-    # texture node: Blender 5.1 evaluates the mix wrong when the factor's
-    # alpha and the tint multiply's colour come from the same datablock.
     texture_node.image = _color_image_view(texture_node.image)
-    alpha_image = _overlay_alpha_image_copy(texture_node.image)
-    if alpha_image is not None:
-        alpha_tex = _image_texture_node(material, alpha_image, "OverlayAlpha")
-        alpha_tex.name = f"RBX Overlay Alpha{tag}"
-        alpha_tex.label = "RBX overlay alpha (factor sample)"
-        alpha_tex.location = (
-            texture_node.location[0],
-            texture_node.location[1] - 180,
-        )
-        # The alpha copy must sample the same UV source as the colour
-        # texture. In Cycles background mode an unlinked Vector input falls
-        # back to the first UV layer, but Eevee/material preview leaves the
-        # node black and the overlay disappears.
-        vector_source = None
-        if texture_node.inputs.get("Vector") and texture_node.inputs["Vector"].links:
-            vector_source = texture_node.inputs["Vector"].links[0].from_socket
-        if vector_source is not None:
-            _link(material, vector_source, alpha_tex.inputs["Vector"])
-        factor_source = alpha_tex.outputs["Alpha"]
-    else:
-        factor_source = texture_node.outputs["Alpha"]
-    a_socket = _socket_by_type(mix, "input", "A", "RGBA")
-    b_socket = _socket_by_type(mix, "input", "B", "RGBA")
-    factor_socket = _socket_by_type(mix, "input", "Factor", "VALUE")
+    factor_source = texture_node.outputs["Alpha"]
     base_input = principled.inputs["Base Color"]
     existing = base_input.links[0].from_socket if base_input.links else None
     if existing is not None:
@@ -1196,17 +1225,39 @@ def _bind_overlay_alpha(material, principled, texture_node, color, alpha_scale=1
         _link(material, existing, a_socket)
     else:
         _set_color_default(a_socket, tint_color + (1.0,))
-    if alpha_scale != 1.0:
+    if alpha_scale != 1.0 and factor_socket is not None:
+        # Atomic: the fade node must be fully wired or removed.  An
+        # orphaned fade leaves the mix factor unlinked and the default
+        # (0.5) drives the overlay — a half-strength decal that looks like
+        # the transparency was never applied.
         fade = material.node_tree.nodes.new("ShaderNodeMath")
-        fade.operation = "MULTIPLY"
-        fade.name = f"RBX Overlay Alpha Scale{tag}"
-        fade.label = "RBX overlay fade (1 − texture transparency)"
-        fade.location = (-300, -200)
-        fade.inputs[1].default_value = max(0.0, min(1.0, float(alpha_scale)))
-        _link(material, factor_source, fade.inputs[0])
-        _link(material, fade.outputs["Value"], factor_socket)
+        try:
+            fade.operation = "MULTIPLY"
+            fade.name = f"RBX Overlay Alpha Scale{tag}"
+            fade.label = "RBX overlay fade (1 − texture transparency)"
+            fade.location = (-300, -200)
+            fade.inputs[1].default_value = max(0.0, min(1.0, float(alpha_scale)))
+            _link(material, factor_source, fade.inputs[0])
+            _link(material, fade.outputs["Value"], factor_socket)
+        except Exception:
+            try:
+                material.node_tree.nodes.remove(fade)
+            except Exception:
+                pass
+            if factor_socket is not None:
+                _link(material, factor_source, factor_socket)
+            print(
+                "[RbxTexture] overlay fade wiring failed; "
+                "binding the overlay at full strength"
+            )
     else:
-        _link(material, factor_source, factor_socket)
+        if alpha_scale != 1.0 and factor_socket is None:
+            print(
+                "[RbxTexture] no float factor socket on the overlay mix; "
+                "binding the overlay at full strength"
+            )
+        if factor_socket is not None:
+            _link(material, factor_source, factor_socket)
     overlay_color = texture_node.outputs["Color"]
     if tint is not None and any(abs(c - 1.0) > 1e-5 for c in tint[:3]):
         try:
@@ -1216,26 +1267,21 @@ def _bind_overlay_alpha(material, principled, texture_node, color, alpha_scale=1
         except (TypeError, ValueError, IndexError):
             instance_tint = None
         if instance_tint is not None:
-            tint_mix = material.node_tree.nodes.new("ShaderNodeMix")
-            tint_mix.data_type = "RGBA"
-            tint_mix.blend_type = "MULTIPLY"
-            tint_mix.name = f"RBX Overlay Tint{tag}"
-            tint_mix.label = "RBX overlay tint (texture colour × instance Color3)"
-            tint_mix.location = (-300, 150)
-            _socket_by_type(tint_mix, "input", "Factor", "VALUE").default_value = 1.0
-            _set_color_default(
-                _socket_by_type(tint_mix, "input", "A", "RGBA"),
-                instance_tint + (1.0,),
+            tint_mix, tint_a, tint_b, tint_factor, tint_result = _new_mix_node(
+                material, f"RBX Overlay Tint{tag}",
+                "RBX overlay tint (texture colour × instance Color3)", "MULTIPLY",
             )
-            _link(material, texture_node.outputs["Color"],
-                  _socket_by_type(tint_mix, "input", "B", "RGBA"))
-            overlay_color = _socket_by_type(tint_mix, "output", "Result", "RGBA")
+            tint_mix.location = (-300, 150)
+            if tint_factor is not None:
+                tint_factor.default_value = 1.0
+            _set_color_default(tint_a, instance_tint + (1.0,))
+            _link(material, texture_node.outputs["Color"], tint_b)
+            overlay_color = tint_result
     _link(material, overlay_color, b_socket)
-    color_out = _socket_by_type(mix, "output", "Result", "RGBA")
     _link(material, color_out, base_input)
 
 
-def _bind_transparency_alpha(material, principled, texture_node, tint=None, bind_alpha=True) -> None:
+def _bind_transparency_alpha(material, principled, texture_node, tint=None, bind_alpha=True, alpha_scale=None) -> None:
     """Bind a Roblox transparency-alpha texture (leaves, fences, grass).
 
     Unlike overlay alpha (decal semantics, where transparent texels reveal
@@ -1250,6 +1296,9 @@ def _bind_transparency_alpha(material, principled, texture_node, tint=None, bind
     texture. SurfaceAppearance color maps are full-color and skip the tint.
     ``bind_alpha=False`` keeps the multiply without touching Principled
     Alpha — used for opaque built-in material color maps.
+    ``alpha_scale`` multiplies the texture alpha (Roblox also multiplies
+    BasePart.Transparency into the map), mirroring the community-standard
+    Map Range chain without an extra node when the scale is 1.
     """
     base_input = principled.inputs["Base Color"]
     for link in list(base_input.links):
@@ -1260,26 +1309,36 @@ def _bind_transparency_alpha(material, principled, texture_node, tint=None, bind
         )
         # MULTIPLY with Factor=1 is just A x B — cheaper and clearer than
         # routing a vector math node into the color chain.
-        mix = material.node_tree.nodes.new("ShaderNodeMix")
-        mix.data_type = "RGBA"
-        mix.blend_type = "MULTIPLY"
-        mix.name = "RBX TextureID Tint"
-        mix.label = "RBX TextureID Tint (part colour x texture)"
-        mix.location = (-150, 0)
-        _socket_by_type(mix, "input", "Factor", "VALUE").default_value = 1.0
-        _set_color_default(
-            _socket_by_type(mix, "input", "A", "RGBA"), tint_color + (1.0,)
+        mix, tint_a, tint_b, factor, tint_result = _new_mix_node(
+            material, "RBX TextureID Tint",
+            "RBX TextureID Tint (part colour x texture)", "MULTIPLY",
         )
-        _link(material, texture_node.outputs["Color"],
-              _socket_by_type(mix, "input", "B", "RGBA"))
-        color_out = _socket_by_type(mix, "output", "Result", "RGBA")
-        _link(material, color_out, base_input)
+        mix.location = (-150, 0)
+        if factor is not None:
+            factor.default_value = 1.0
+        _set_color_default(tint_a, tint_color + (1.0,))
+        _link(material, texture_node.outputs["Color"], tint_b)
+        _link(material, tint_result, base_input)
     else:
         _link(material, texture_node.outputs["Color"], base_input)
     if bind_alpha:
         alpha_input = principled.inputs.get("Alpha")
         if alpha_input is not None:
-            _link(material, texture_node.outputs["Alpha"], alpha_input)
+            if alpha_scale is not None and abs(alpha_scale - 1.0) > 1e-6:
+                try:
+                    scale = max(0.0, min(1.0, float(alpha_scale)))
+                except (TypeError, ValueError):
+                    scale = 1.0
+                multiply = material.node_tree.nodes.new("ShaderNodeMath")
+                multiply.operation = "MULTIPLY"
+                multiply.name = "RBX TextureID AlphaScale"
+                multiply.label = "RBX texture alpha x part transparency"
+                multiply.location = (-150, -300)
+                multiply.inputs[1].default_value = scale
+                _link(material, texture_node.outputs["Alpha"], multiply.inputs[0])
+                _link(material, multiply.outputs["Value"], alpha_input)
+            else:
+                _link(material, texture_node.outputs["Alpha"], alpha_input)
 
 
 def _activate_texture_node(material, texture_node) -> None:
@@ -1568,6 +1627,83 @@ def _bind_linear_tint(material, texture_node, use_attribute_tint, base_input):
     _link(material, texture_node.outputs["Color"], multiply.inputs[0])
     _link(material, color_attr.outputs["Color"], multiply.inputs[1])
     _link(material, multiply.outputs["Vector"], base_input)
+
+
+def _apply_mesh_vertex_color_tint(material, principled, color, enabled) -> None:
+    """Multiply asset-baked RBXColor vertex colors into the tint chain.
+
+    Regular FileMesh parts can carry baked per-vertex colors in their mesh
+    asset; Studio multiplies those by the part Color3 (and TextureID).  The
+    mesh's RBXColor attribute holds the baked colors (written by
+    creation._apply_mesh_vertex_colors), so this stage multiplies them into
+    whatever Base Color chain the texture/builtin paths left behind — once.
+    A component already provided by the chain (attribute-read tint or the
+    TextureID tint mix) is not applied twice.
+    """
+    if not enabled:
+        return
+    nodes = material.node_tree.nodes
+    base_input = principled.inputs["Base Color"]
+    links = [link for link in base_input.links]
+    chain_nodes = [link.from_node for link in links]
+    reads_baked = any(
+        node is not None
+        and getattr(node, "type", None) == "VERTEX_COLOR"
+        and getattr(node, "layer_name", None) == "RBXColor"
+        for node in chain_nodes
+    )
+    chain_has_tint = any(
+        node is not None
+        and getattr(node, "name", "").startswith("RBX TextureID Tint")
+        for node in chain_nodes
+    )
+    try:
+        tint = (
+            max(0.0, min(1.0, float(component))) for component in color[:3]
+        )
+        tint = tuple(tint) + (1.0,)
+    except (TypeError, ValueError, IndexError):
+        tint = (1.0, 1.0, 1.0, 1.0)
+
+    def _multiply(a_socket, b_socket, label, node_name):
+        mix, mix_a, mix_b, factor, result = _new_mix_node(
+            material, node_name, label, "MULTIPLY",
+        )
+        if factor is not None:
+            factor.default_value = 1.0
+        _link(material, a_socket, mix_a)
+        _link(material, b_socket, mix_b)
+        return result
+
+    current = links[0].from_socket if links else None
+    if current is None:
+        # No chain at all: the Principled default IS the flat part tint.
+        rgb = nodes.new("ShaderNodeRGB")
+        _set_color_default(rgb.outputs["Color"], tint)
+        current = rgb.outputs["Color"]
+        chain_has_tint = True
+    if not reads_baked:
+        attr_node = nodes.new("ShaderNodeVertexColor")
+        attr_node.layer_name = "RBXColor"
+        attr_node.name = "RBX Mesh VertexColors"
+        attr_node.label = "RBX mesh vertex colors (asset baked)"
+        attr_node.location = (-400, 300)
+        current = _multiply(
+            current, attr_node.outputs["Color"],
+            "RBX vertex colors × colour chain",
+            "RBX Mesh VertexColors Multiply",
+        )
+    if not chain_has_tint:
+        rgb = nodes.new("ShaderNodeRGB")
+        _set_color_default(rgb.outputs["Color"], tint)
+        current = _multiply(
+            current, rgb.outputs["Color"],
+            "RBX part colour × vertex colors",
+            "RBX Mesh VertexColors Tint",
+        )
+    for link in links:
+        material.node_tree.links.remove(link)
+    _link(material, current, base_input)
 
 
 def _ensure_builtin_material_color(mesh, rgba):
@@ -2030,6 +2166,17 @@ def build_part_material(
     # creation._apply_mesh_vertex_colors) instead of the flat part color.
     union_mesh = entry.get("union_mesh") or {}
     union_colors = union_mesh.get("colors") if isinstance(union_mesh, dict) else None
+    # Regular FileMesh parts whose asset carries baked vertex colors: the
+    # geometry pass flagged the entry, and the mesh's RBXColor attribute
+    # holds the varying colors.  SurfaceAppearance colour maps override them
+    # (the SA build below owns Base Color).
+    mesh_baked_colors = bool(
+        entry.get("_mesh_vertex_colors")
+        and not union_colors
+        and not any(
+            (sa or {}).get("color_map") for sa in _entry_surface_appearances(entry)
+        )
+    )
     # SurfaceAppearance overrides the CSG-baked vertex colours (its colour
     # map, Overlay or Transparency, drives the look) — the vertex-colour
     # chain must yield to the SA build below.
@@ -2113,8 +2260,13 @@ def build_part_material(
         if alpha_mode == 1:
             # Transparency: RGB drives Base Color, alpha cuts the part
             # against the world (foliage, fences).  It REPLACES the colour
-            # chain beneath it.
-            _bind_transparency_alpha(material, principled, tex_node)
+            # chain beneath it.  BasePart.Transparency multiplies into the
+            # map alpha, same as Studio.
+            try:
+                part_alpha = 1.0 - max(0.0, min(1.0, float(entry.get("transparency", 0.0))))
+            except (TypeError, ValueError):
+                part_alpha = 1.0
+            _bind_transparency_alpha(material, principled, tex_node, alpha_scale=part_alpha)
             texture_alpha_used = True
             overlay_layers.append({
                 "node": tex_node.name,
@@ -2295,6 +2447,11 @@ def build_part_material(
                 continue
             image = fetch_texture_image(texture_instance_ref, name=f"{part_name}_texinst")
             image = _color_image_view(image)
+            if image is not None:
+                try:
+                    image.alpha_mode = "CHANNEL_PACKED"
+                except (AttributeError, TypeError):
+                    pass
             tex_node = _image_texture_node(material, image, "TextureInstance")
             tex_node.name = _layer_node_name("RBX TextureInstance", layer_index)
             tex_node.label = "RBX Texture instance (surface texture over part)"
@@ -2322,6 +2479,11 @@ def build_part_material(
                 )
             except (TypeError, ValueError):
                 instance_alpha = 1.0
+            print(
+                f"[RbxTexture] instance '{material.name}' "
+                f"transparency={texture_instance.get('transparency')} "
+                f"fade={round(instance_alpha, 4)}"
+            )
             try:
                 instance_tint = tuple(
                     float(component) for component in texture_instance.get("color") or ()
@@ -2329,6 +2491,10 @@ def build_part_material(
             except (TypeError, ValueError):
                 instance_tint = None
             tag = _layer_tag(layer_index)
+            # Decal semantics: only the TEXTURE fades.  The composite mixes
+            # the part colour with the texture colour by the image alpha
+            # scaled by (1 - Transparency); Principled Alpha stays 1 so the
+            # part itself never turns transparent.
             _bind_overlay_alpha(
                 material,
                 principled,
@@ -2345,11 +2511,6 @@ def build_part_material(
                 "tag": tag,
             })
             layer_index += 1
-            # The overlay composite NEVER touches Principled Alpha: the
-            # part stays opaque (texels reveal the layer beneath in-shader).
-            # Marking it texture-alpha'd would force the whole material into
-            # BLEND mode with hashed shadows, which Eevee renders markedly
-            # darker under world light than Cycles (the dark-wall symptom).
             _activate_texture_node(material, tex_node)
 
     # Face decal: composited with the head body color inside the clothing
@@ -2358,6 +2519,9 @@ def build_part_material(
 
     # Classic clothing (shirt/pants/bodycolor) baked into a per-limb crop.
     _apply_clothing_bake(material, principled, source_part_name, entry)
+    # Asset-baked mesh vertex colors multiply the part tint (last, so they
+    # compose with whichever Base Color chain the paths above built).
+    _apply_mesh_vertex_color_tint(material, principled, color, mesh_baked_colors)
     _apply_part_transparency(
         material, principled, entry, texture_alpha=texture_alpha_used
     )
@@ -2377,6 +2541,7 @@ def build_part_material(
         except (TypeError, ValueError):
             pass
     material["RBXMaterialGraphVersion"] = _MATERIAL_GRAPH_VERSION
+    _organize_material_nodes(material)
 
     # NOTE: primitive Parts with classic surface textures (Studs/Inlet/Glue/
     # Universal) are NOT handled here — they need per-face materials, which
@@ -2443,7 +2608,10 @@ def _apply_clothing_bake(material, principled, part_name, entry):
 # separate images because Blender's REPEAT wrap only wraps at UV 0..1 — a
 # face longer than 8 studs sampling the full atlas would bleed into the next
 # band, while a cropped 128x512 band image tiles over any face length.
-_SURFACE_TYPE_TO_BAND = {3: 0, 1: 1, 4: 2, 5: 3}
+# Surface type -> atlas band.  Band order matches the 2016 renderer's
+# getStudsAtlasInfo offsets: Studs (0), Glue/Weld share band 1, Inlet (2),
+# Universal (3).  Weld renders with the glue band in the engine.
+_SURFACE_TYPE_TO_BAND = {3: 0, 1: 1, 2: 1, 4: 2, 5: 3}
 _BAND_PX = 512
 
 _ATLAS_CACHE: dict = {}
@@ -2704,23 +2872,19 @@ def _primitive_surface_material(color, surface_type, transparency=0.0):
             tex_node.extension = "REPEAT"
             tex_node.location = (-500, 300)
             _bind_named_uv(material, tex_node, "UVMap", "RBX Surface UV")
-            mix_node = nodes.new("ShaderNodeMix")
-            mix_node.name = "RBX Tint"
-            mix_node.label = "RBX Tint (part colour ×2)"
-            mix_node.data_type = "RGBA"
-            mix_node.blend_type = "MULTIPLY"
-            _socket_by_type(mix_node, "input", "Factor", "VALUE").default_value = 1.0
+            mix_node, tint_a, tint_b, factor, tint_result = _new_mix_node(
+                material, "RBX Tint", "RBX Tint (part colour ×2)", "MULTIPLY",
+            )
+            if factor is not None:
+                factor.default_value = 1.0
             # x2 part colour: the band's ~0.5 grey mean multiplies back to ~1.
             _set_color_default(
-                _socket_by_type(mix_node, "input", "A", "RGBA"),
+                tint_a,
                 (min(r * 2.0, 4.0), min(g * 2.0, 4.0), min(b * 2.0, 4.0), 1.0),
             )
             mix_node.location = (-250, 300)
-            _link(material, tex_node.outputs["Color"],
-                  _socket_by_type(mix_node, "input", "B", "RGBA"))
-            _link(material,
-                  _socket_by_type(mix_node, "output", "Result", "RGBA"),
-                  principled.inputs["Base Color"])
+            _link(material, tex_node.outputs["Color"], tint_b)
+            _link(material, tint_result, principled.inputs["Base Color"])
             # Solid/Texture viewport shading draws the ACTIVE image node and
             # cannot evaluate RBX Tint, so activate a pre-tinted atlas copy.
             try:
@@ -2754,11 +2918,161 @@ def _primitive_surface_material(color, surface_type, transparency=0.0):
             _link(material, normal_node.outputs["Normal"], principled.inputs["Normal"])
 
     _PRIMITIVE_MAT_CACHE[cache_key] = material
+    _organize_material_nodes(material)
     return material
+
+
+def _node_frame_name(node) -> str:
+    """The organizing frame for a node, per its RBX role prefix."""
+    name = node.name
+    # One frame per overlay layer tag: "RBX Overlay", "RBX Overlay.1", ...
+    for prefix in (
+        "RBX ColorMap", "RBX Overlay Mix", "RBX Overlay Tint",
+        "RBX Overlay Alpha Scale", "RBX Overlay Alpha",
+    ):
+        if name.startswith(prefix):
+            return "RBX Overlay" + name[len(prefix):]
+    if name.startswith("RBX TextureInstance"):
+        return "RBX Texture Instance" + name[len("RBX TextureInstance"):]
+    if name.startswith("RBX Material") or name in ("RBX Tint", "RBX VertexColor"):
+        return "RBX Material"
+    if name.startswith("RBX NormalMap"):
+        return "RBX Normal"
+    if name.startswith(("RBX MetalRough", "RBX Surface metalness", "RBX Surface roughness")):
+        return "RBX PBR Maps"
+    if name.startswith(("RBX TextureID", "RBX TextureID Tint")):
+        return "RBX TextureID"
+    if name.startswith(
+        ("RBX Instance UV", "RBX Material UV", "RBX Surface UV", "RBX Clothing UV")
+    ):
+        return "RBX UV"
+    return None
+
+
+def _organize_material_nodes(material) -> None:
+    """Lay out a built graph: left->right columns, frames per role, hidden
+    options on utility nodes (Node Tree Organisation Cookbook basics)."""
+    try:
+        tree = material.node_tree
+        principled = _principled_node(material)
+        if principled is None:
+            return
+        # Column depth: principled = 0, its sources walk left.
+        depth = {principled: 0}
+        queue = [principled]
+        visited = {principled}
+        while queue:
+            node = queue.pop(0)
+            for input_socket in node.inputs:
+                for link in input_socket.links:
+                    source = link.from_node
+                    if source not in visited:
+                        visited.add(source)
+                        depth[source] = depth[node] + 1
+                        queue.append(source)
+        # Nodes not on any input chain (loose) get dumped in one column.
+        for node in tree.nodes:
+            if node not in visited and node.type not in ("OUTPUT_MATERIAL", "FRAME"):
+                depth[node] = max(depth.values(), default=0) + 1
+        columns = {}
+        for node, level in depth.items():
+            columns.setdefault(level, []).append(node)
+        row_offset = 0
+        for level in sorted(columns, reverse=True):
+            column = sorted(columns[level], key=lambda n: n.name)
+            for index, node in enumerate(column):
+                node.location = (level * -280.0, row_offset - index * 210.0)
+            row_offset -= max(220.0, 90.0 * len(column))
+        # Output node one column right of the principled.
+        for node in tree.nodes:
+            if node.type == "OUTPUT_MATERIAL":
+                node.location = (280.0, -50.0)
+        # Small frames per role, positioned around their members.
+        frames = {}
+        for node in tree.nodes:
+            if node.type in ("FRAME", "OUTPUT_MATERIAL", "BSDF_PRINCIPLED"):
+                continue
+            frame_name = _node_frame_name(node)
+            if frame_name is None:
+                continue
+            if node.type in ("MATH", "VECTOR_MATH", "MAP_RANGE", "MIX", "MIX_RGB"):
+                # Collapse the option UI on utility nodes; their labels
+                # already describe the operation.
+                try:
+                    node.hide = True
+                except Exception:
+                    pass
+            frame = frames.get(frame_name)
+            if frame is None:
+                try:
+                    frame = tree.nodes.new("NodeFrame")
+                except RuntimeError:
+                    frame = tree.nodes.new("ShaderNodeFrame")
+                frame.label = frame_name
+                frames[frame_name] = frame
+            try:
+                node.parent = frame
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+        for frame in frames.values():
+            try:
+                _fit_frame_to_children(tree, frame)
+            except Exception:
+                pass
+    except Exception:
+        # Organization is cosmetic; a failure must never break the build.
+        pass
+
+
+def _fit_frame_to_children(tree, frame) -> None:
+    """Place a frame around its parented nodes (frames auto-size to their
+    children; only the position needs setting)."""
+    frame_name = getattr(frame, "name", None)
+    children = [
+        node for node in tree.nodes
+        if getattr(getattr(node, "parent", None), "name", None) == frame_name
+        and node is not frame
+    ]
+    if not children:
+        return
+    min_x = min(node.location.x for node in children)
+    max_y = max(node.location.y for node in children)
+    frame.location = (min_x - 40.0, max_y + 20.0)
+
+
+def _scoped_clothing_context(entry):
+    """Set the clothing context for one part entry.
+
+    rbxm imports stamp every entry with ITS OWN character's clothing
+    (_rbxm_clothing_scoped); anything else keeps the file-level context the
+    legacy import paths set up front.
+    """
+    if not entry.get("_rbxm_clothing_scoped"):
+        return
+    try:
+        from . import clothing
+
+        # NB: no clothing_available() gate here — that reads the CURRENT
+        # context, which is exactly what we are about to replace.
+        face = entry.get("face_decal") or {}
+        clothing.set_clothing_context(
+            shirt_template=entry.get("shirt_template"),
+            pants_template=entry.get("pants_template"),
+            face_texture=entry.get("face_texture") or face.get("texture"),
+            body_colors=entry.get("body_colors"),
+            face_transparency=(
+                entry.get("face_transparency")
+                if entry.get("face_transparency") is not None
+                else face.get("transparency", 0.0)
+            ),
+        )
+    except Exception:
+        pass
 
 
 def get_part_material(part_name: str, entry: dict):
     """Return the reusable one-slot material for a normal MeshPart."""
+    _scoped_clothing_context(entry)
     cache_key = _part_material_cache_key(entry)
     material = _PART_MATERIAL_CACHE.get(cache_key) if cache_key is not None else None
     live = _live_material(material)
@@ -2776,23 +3090,102 @@ def get_part_material(part_name: str, entry: dict):
     return material
 
 
-def _polygon_face_ids(mesh):
-    """Per-polygon Roblox NormalId (Right 0, Top 1, Back 2, Left 3,
-    Bottom 4, Front 5) or None for non-axis surfaces (cylinder side,
-    sphere), which no NormalId addresses."""
+# Roblox NormalId values -> surface names (matches _polygon_face_ids).
+_NORMALID_FACE_NAMES = {
+    0: "Right",
+    1: "Top",
+    2: "Back",
+    3: "Left",
+    4: "Bottom",
+    5: "Front",
+}
+
+
+def _face_material_name(mesh_name: str, faces) -> str:
+    """Material name for one or more face NormalIds (e.g. Wall_Front)."""
+    names = []
+    for face in faces:
+        try:
+            face_int = int(face)
+        except (TypeError, ValueError):
+            face_int = face
+        names.append(_NORMALID_FACE_NAMES.get(face_int, f"Face{face_int}"))
+    return f"{mesh_name}_{'_'.join(names)}"
+
+
+def _polygon_face_ids(mesh, entry=None):
+    """Per-polygon Roblox NormalId LISTS for child Texture assignment.
+
+    Box shapes use the generator's fixed face order (immune to the t2b axis
+    remap and to arbitrary part rotations); the curved ball classifies by
+    polygon centre in part-local space.  Lists hold more than one id where
+    the renderer draws that face's decal in several slots (GfxRender/
+    GeometryGenerator.cpp decal tables): a wedge slope carries BOTH Top and
+    Front, a corner-wedge slope carries Top plus Back or Left, and a
+    cylinder side decal only covers its own quadrant.
+    """
+    shape = (entry or {}).get("shape", "block")
+    polys = len(mesh.polygons)
+    if shape in ("block", 1):
+        # Generator order: -Z, +Z, +Y, -Y, +X, -X
+        # -> Front, Back, Top, Bottom, Right, Left.
+        table = ((5,), (2,), (1,), (4,), (0,), (3,))
+        return [table[min(t // 2, 5)] for t in range(polys)]
+    if shape == "wedge":
+        # +Z rect=Back, +X tri=Right, -X tri=Left, bottom=Bottom,
+        # slope carries Top AND Front (same decal quad in the renderer).
+        table = ((2,), (0,), (3,), (4,), (1, 5))
+        return [table[min(t // 2, 4)] for t in range(polys)]
+    if shape == "corner_wedge":
+        # +X tri=Right, slope A-D-C=Top+Back, slope A-E-D=Top+Left,
+        # bottom=Bottom, -Z tri=Front.
+        table = ((0,), (1, 2), (1, 3), (4,), (5,))
+        return [table[min(t // 2, 4)] for t in range(polys)]
+    if shape in ("cylinder", 2):
+        # +X cap fans (Right), -X cap fans (Left), then 16 side quads
+        # starting at +Y (Top) every 22.5 degrees around the circle.
+        ids = []
+        for t in range(polys):
+            if t < 32:
+                ids.append((0,) if t < 16 else (3,))
+            else:
+                a = 22.5 * (((t - 32) // 2) + 0.5)
+                if a <= 45.0 or a >= 315.0:
+                    ids.append((1,))
+                elif a <= 135.0:
+                    ids.append((2,))
+                elif a <= 225.0:
+                    ids.append((4,))
+                else:
+                    ids.append((5,))
+        return ids
+    # Ball: six patches by the dominant local axis of the polygon centre.
+    try:
+        from ..core.constants import get_transform_to_blender
+        from ..core.utils import cf_to_mat
+        from mathutils import Matrix, Vector
+
+        part_cf = (entry or {}).get("part_cf")
+        basis = get_transform_to_blender() @ (
+            cf_to_mat(part_cf) if part_cf else Matrix.Identity(4)
+        )
+        inverse = basis.inverted_safe()
+    except Exception:
+        return [() for _ in range(polys)]
     ids = []
     for poly in mesh.polygons:
-        normal = poly.normal
-        axis, magnitude = max(
-            ((0, abs(normal[0])), (1, abs(normal[1])), (2, abs(normal[2]))),
-            key=lambda item: item[1],
-        )
-        if magnitude < 0.9:
-            ids.append(None)
-        elif normal[axis] > 0:
-            ids.append((0, 1, 5)[axis])  # +X Right, +Y Top, +Z Front
+        try:
+            local = inverse @ Vector(poly.center)
+        except Exception:
+            ids.append(())
+            continue
+        ax, ay, az = abs(local[0]), abs(local[1]), abs(local[2])
+        if ax >= ay and ax >= az:
+            ids.append((0,) if local[0] > 0 else (3,))
+        elif ay >= ax and ay >= az:
+            ids.append((1,) if local[1] > 0 else (4,))
         else:
-            ids.append((3, 4, 2)[axis])  # -X Left, -Y Bottom, -Z Back
+            ids.append((2,) if local[2] > 0 else (5,))
     return ids
 
 
@@ -2811,7 +3204,7 @@ def apply_part_material(mesh_obj, entry: dict) -> bool:
         # material per surface: faces with instances composite them over
         # the face's base material; studded faces without an instance keep
         # their classic surface-band material.
-        face_ids = _polygon_face_ids(mesh)
+        face_ids = _polygon_face_ids(mesh, entry)
         per_face = {}
         for instance in texture_instances:
             try:
@@ -2843,7 +3236,7 @@ def apply_part_material(mesh_obj, entry: dict) -> bool:
             face_entry["texture_instances"] = list(instances)
             face_entry.pop("texture_instance", None)
             materials[face] = get_part_material(
-                f"{mesh_obj.name}_face{face}", face_entry
+                _face_material_name(mesh_obj.name, [face]), face_entry
             )
         base_material = get_part_material(mesh_obj.name, base_entry)
         band_materials = {}
@@ -2876,11 +3269,33 @@ def apply_part_material(mesh_obj, entry: dict) -> bool:
         for face in sorted(materials):
             slot_of[face] = len(mesh.materials)
             mesh.materials.append(materials[face])
-        for poly, face, st in zip(
+        for poly, ids, st in zip(
             mesh.polygons, face_ids, face_st or [None] * len(face_ids)
         ):
-            if face in slot_of:
-                poly.material_index = slot_of[face]
+            matching = [face for face in ids if face in slot_of]
+            if len(matching) == 1:
+                poly.material_index = slot_of[matching[0]]
+            elif len(matching) > 1:
+                # One face carries several decal slots (wedge slope: Top +
+                # Front).  Composite both instance lists into one material.
+                key = tuple(sorted(matching))
+                slot = slot_of.get(key)
+                if slot is None:
+                    merged = []
+                    for face in key:
+                        merged.extend(per_face[face])
+                    face_entry = dict(entry)
+                    face_entry["texture_instances"] = list(merged)
+                    face_entry.pop("texture_instance", None)
+                    slot_of[key] = len(mesh.materials)
+                    mesh.materials.append(
+                        get_part_material(
+                            _face_material_name(mesh_obj.name, key),
+                            face_entry,
+                        )
+                    )
+                    slot = slot_of[key]
+                poly.material_index = slot
             elif st in band_slot:
                 poly.material_index = band_slot[st]
             else:
@@ -2954,7 +3369,8 @@ def apply_part_material(mesh_obj, entry: dict) -> bool:
                 mesh.uv_layers.active_render = uv_layer
             except Exception:
                 pass
-        _ensure_builtin_material_color(mesh, entry.get("color") or (1.0, 1.0, 1.0))
+        if not entry.get("_mesh_vertex_colors"):
+            _ensure_builtin_material_color(mesh, entry.get("color") or (1.0, 1.0, 1.0))
     elif (
         (entry.get("texture_id") and entry.get("texture_studs_per_tile"))
         or (
@@ -2973,7 +3389,7 @@ def apply_part_material(mesh_obj, entry: dict) -> bool:
                 mesh.uv_layers.active_render = uv_layer
             except Exception:
                 pass
-    elif entry_uses_shared_builtin_tint(entry):
+    elif entry_uses_shared_builtin_tint(entry) and not entry.get("_mesh_vertex_colors"):
         # Built-ins without maps still tint through the attribute.
         _ensure_builtin_material_color(mesh, entry.get("color") or (1.0, 1.0, 1.0))
     if len(mesh.materials):
@@ -3279,54 +3695,25 @@ def hydrate_material_images(material, entry: dict) -> None:
                 non_color=non_color,
                 ref=str(map_ref),
             )
-    # The overlay factor node samples a copy of whatever image drives the
-    # overlay colour; assign it after the main node has its datablock.
-    # Deferred builds (image-less texture nodes) skip the copy at build
-    # time, so it is also CREATED here when hydration brings the image in —
-    # otherwise the factor keeps reading the same datablock as the colour
-    # chain and Blender 5.1 mis-evaluates the composite.  Stacked layers
-    # each get their own factor node via their tag.
+    # The overlay factor samples the texture node's OWN alpha output; no
+    # copy datablock.  (A copy node was the previous suspect for factors
+    # reading 1 despite the fade: sample the real pixels directly.)
     for layer in _overlay_layer_registry(material):
         if layer.get("mode") != "overlay":
             continue
         tag = layer.get("tag") or ""
         main = nodes.get(layer.get("node") or "")
         overlay_mix = nodes.get(f"RBX Overlay Mix{tag}")
-        alpha_node = nodes.get(f"RBX Overlay Alpha{tag}")
+        if overlay_mix is None:
+            # Texture instances composite through a Mix Shader.
+            overlay_mix = nodes.get(f"RBX Instance Mix Shader{tag}")
         if overlay_mix is None or main is None:
             continue
         main_image = getattr(main, "image", None)
-        if alpha_node is None:
-            if main_image is None:
-                continue
-            alpha_image = _overlay_alpha_image_copy(main_image)
-            if alpha_image is None:
-                continue
-            alpha_tex = _image_texture_node(material, alpha_image, "OverlayAlpha")
-            alpha_tex.name = f"RBX Overlay Alpha{tag}"
-            alpha_tex.label = "RBX overlay alpha (factor sample)"
-            alpha_tex.location = (
-                main.location[0],
-                main.location[1] - 180,
-            )
-            # Sample the same UV source as the colour texture or Eevee
-            # evaluates the factor against a black (unlinked) vector input.
-            vector_source = None
-            if main.inputs.get("Vector") and main.inputs["Vector"].links:
-                vector_source = main.inputs["Vector"].links[0].from_socket
-            if vector_source is not None:
-                _link(material, vector_source, alpha_tex.inputs["Vector"])
-            factor_socket = _socket_by_type(overlay_mix, "input", "Factor", "VALUE")
-            for link in list(factor_socket.links):
-                material.node_tree.links.remove(link)
-            _link(material, alpha_tex.outputs["Alpha"], factor_socket)
-        elif getattr(alpha_node, "image", None) is None and main_image is not None:
-            alpha_node.image = _overlay_alpha_image_copy(main_image)
-            vector_source = None
-            if main.inputs.get("Vector") and main.inputs["Vector"].links:
-                vector_source = main.inputs["Vector"].links[0].from_socket
-            if vector_source is not None and not alpha_node.inputs["Vector"].links:
-                _link(material, vector_source, alpha_node.inputs["Vector"])
+        if main_image is None:
+            continue
+        # Direct alpha wiring at build time; nothing to create or rewire
+        # during hydration.
     _apply_missing_color_map_fallback(material, entry)
     missing = [
         node.name
@@ -3372,20 +3759,55 @@ def _apply_missing_color_map_fallback(material, entry) -> None:
                 for link in list(node.outputs["Color"].links):
                     material.node_tree.links.remove(link)
                 continue
-            # Overlay decal without its image: unlink it and pull the mix
+            # Overlay decal without its image: remove the whole layer
+            # cluster (texture, alpha copy, fade, tint) and pull the mix
             # factor to zero so Result = A, revealing the layer underneath.
-            for link in list(node.outputs["Color"].links) + list(
-                node.outputs["Alpha"].links
-            ):
-                material.node_tree.links.remove(link)
-            mix = nodes.get(f"RBX Overlay Mix{layer.get('tag') or ''}")
+            # Leaving the nodes in place would strand dead "RBX Texture
+            # instance" entries in the shader graph.
+            tag = layer.get("tag") or ""
+            mix = nodes.get(f"RBX Overlay Mix{tag}")
+            if mix is None:
+                mix = nodes.get(f"RBX Instance Mix Shader{tag}")
             if mix is not None:
                 try:
-                    factor_socket = _socket_by_type(mix, "input", "Factor", "VALUE")
+                    factor_socket = _float_factor_socket(mix)
                     for link in list(factor_socket.links):
                         material.node_tree.links.remove(link)
                     factor_socket.default_value = 0.0
                 except (AttributeError, TypeError):
+                    pass
+            for dead_name in (
+                layer.get("node") or "",
+                f"RBX Overlay Alpha{tag}",
+                f"RBX Overlay Alpha Scale{tag}",
+                f"RBX Overlay Tint{tag}",
+                f"RBX Instance BSDF{tag}",
+            ):
+                dead = nodes.get(dead_name)
+                if dead is not None:
+                    try:
+                        material.node_tree.nodes.remove(dead)
+                    except (RuntimeError, ReferenceError):
+                        pass
+            # Instance layers feed Base Color AND Alpha directly.  Removing
+            # their nodes leaves both unlinked: restore the flat part colour
+            # and opaque alpha so the part renders instead of vanishing.
+            if layer.get("mode") == "overlay" and mix is None:
+                try:
+                    if not principled.inputs["Base Color"].links:
+                        color = entry.get("color") or (1.0, 1.0, 1.0)
+                        principled.inputs["Base Color"].default_value = (
+                            max(0.0, min(1.0, float(color[0]))),
+                            max(0.0, min(1.0, float(color[1]))),
+                            max(0.0, min(1.0, float(color[2]))),
+                            1.0,
+                        )
+                except (TypeError, ValueError, IndexError):
+                    pass
+                try:
+                    if not principled.inputs["Alpha"].links:
+                        principled.inputs["Alpha"].default_value = 1.0
+                except (AttributeError, KeyError):
                     pass
         if missing_color_layer:
             color = entry.get("color")
@@ -3721,8 +4143,8 @@ def _apply_union_color_materials(mesh_obj, mesh, entry, union_mesh) -> bool:
         return (round(col[0], 2), round(col[1], 2), round(col[2], 2))
 
     distinct = {_q(c) for c in colors}
-    if len(distinct) <= 1:
-        return False  # single-color union: one flat material is correct.
+    if not distinct:
+        return False  # no usable color data: part-color material path
 
     # Face color = the quantized color shared by its vertices (mesher output
     # has per-color shells, so all three verts of a face share a color; if

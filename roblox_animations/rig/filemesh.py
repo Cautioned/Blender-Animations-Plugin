@@ -610,6 +610,7 @@ def extract_asset_id(content_id) -> Optional[int]:
         r"/asset/\?id=(\d+)",
         r"/asset/\?ID=(\d+)",
         r"/library/(\d+)",
+        r"/catalog/(\d+)",
     ]
 
     for pattern in patterns:
@@ -904,7 +905,11 @@ def _resolve_rbxasset_path(content_id: str) -> Optional[Path]:
     return None
 
 
-def _normalize_filemesh_bytes(data: bytes, max_bytes: int = _MAX_ASSET_BYTES) -> bytes:
+def _normalize_filemesh_bytes(
+    data: bytes,
+    max_bytes: int = _MAX_ASSET_BYTES,
+    trim_mesh_header: bool = True,
+) -> bytes:
     if len(data) > max_bytes:
         raise ValueError("asset exceeds import safety limit")
     if data.startswith(b"\x1f\x8b"):
@@ -916,9 +921,14 @@ def _normalize_filemesh_bytes(data: bytes, max_bytes: int = _MAX_ASSET_BYTES) ->
         except OSError:
             pass
 
-    version_index = data.find(b"version ")
-    if 0 < version_index < 4096:
-        data = data[version_index:]
+    # The mesh loader trims leading junk up to the "version " marker.
+    # IMAGE/asset fetches must NOT do this: a valid PNG can carry a tEXt
+    # chunk containing "version " inside its first 4KB, and trimming there
+    # corrupts the payload (the image then fails every decoder).
+    if trim_mesh_header:
+        version_index = data.find(b"version ")
+        if 0 < version_index < 4096:
+            data = data[version_index:]
 
     return data
 
@@ -1061,6 +1071,7 @@ def _fetch_url_bytes(
     timeout: float = 15.0,
     extra_headers: Optional[Dict[str, str]] = None,
     max_bytes: int = _MAX_ASSET_BYTES,
+    trim_mesh_header: bool = True,
 ) -> bytes:
     # Never let urllib carry a bearer token across an Open Cloud redirect.  The
     # delivery service returns a signed CDN location; that second request must
@@ -1079,8 +1090,15 @@ def _fetch_url_bytes(
         location = response.headers.get("Location")
         locations = [location] if location else _extract_locations_from_payload(data)
         if locations:
-            return _fetch_url_bytes(locations[0], timeout=timeout, max_bytes=max_bytes)
-    return _normalize_filemesh_bytes(data, max_bytes=max_bytes)
+            return _fetch_url_bytes(
+                locations[0],
+                timeout=timeout,
+                max_bytes=max_bytes,
+                trim_mesh_header=trim_mesh_header,
+            )
+    return _normalize_filemesh_bytes(
+        data, max_bytes=max_bytes, trim_mesh_header=trim_mesh_header
+    )
 
 
 def _extract_locations_from_payload(payload: bytes) -> List[str]:
@@ -1712,76 +1730,171 @@ def _parse_coremesh_v1(chunk: bytes) -> Tuple[List[dict], List[Tuple[int, int, i
     return vertices, faces, num_verts
 
 
-def _get_blender_draco_dll_path() -> Optional[Path]:
+def _draco_lib_name() -> str:
+    if sys.platform == "win32":
+        return "extern_draco.dll"
+    if sys.platform == "darwin":
+        return "libextern_draco.dylib"
+    return "libextern_draco.so"
+
+
+def _get_blender_draco_dll_paths() -> List[Path]:
+    """Candidate paths for the extern_draco decoder, best first.
+
+    The glTF importer ships the decoder as ``io_scene_gltf2/extern_draco.*``
+    next to its python module, but the layout varies across versions
+    (standard, portable, Blender Launcher, extensions platform), and
+    Blender 5.2 replaced the extern_draco shim with a bridge DLL, so a
+    bundled copy of the decoder ships with the addon as the last resort.
+    """
+    lib_name = _draco_lib_name()
+    candidates: List[Path] = []
+
+    def add(path):
+        if path:
+            try:
+                resolved = Path(path).resolve()
+            except Exception:
+                return
+            if resolved not in candidates:
+                candidates.append(resolved)
+
+    # 1. The glTF module itself knows where its DLL lives (pre-5.2).
     try:
-        draco_module = importlib.import_module("io_scene_gltf2.io.com.draco")
-        candidate = draco_module.dll_path()
-        if candidate and Path(candidate).exists():
-            return Path(candidate)
+        module = importlib.import_module("io_scene_gltf2.io.com.draco")
+        try:
+            add(module.dll_path())
+        except Exception:
+            pass
+        module_file = getattr(module, "__file__", None)
+        if module_file:
+            # .../io_scene_gltf2/io/com/draco.py -> .../io_scene_gltf2/
+            add(Path(module_file).resolve().parents[2] / lib_name)
     except Exception:
         pass
 
-    executable = Path(sys.executable).resolve() if sys.executable else None
-    if executable:
-        version_dir = executable.parent.parent.name
-        for addons_dir in ("addons_core", "addons"):
-            candidate = executable.parent.parent / version_dir / "scripts" / addons_dir / "io_scene_gltf2"
-            if sys.platform == "win32":
-                candidate = candidate / "extern_draco.dll"
-            elif sys.platform == "linux":
-                candidate = candidate / "libextern_draco.so"
-            elif sys.platform == "darwin":
-                candidate = candidate / "libextern_draco.dylib"
-            else:
-                candidate = None
+    # 1b. Blender 5.2 removed the extern_draco shim but kept the decoder
+    # as bf_intern_draco_bridge, exposed through io.com.library.
+    try:
+        library = importlib.import_module("io_scene_gltf2.io.com.library")
+        add(library.dll_path("bf_intern_draco_bridge", "Draco"))
+    except Exception:
+        pass
 
-            if candidate and candidate.exists():
-                return candidate
+    # 2. Blender resource/script dirs (correct for standard AND portable
+    # installs; the old sys.executable arithmetic broke on both).
+    try:
+        import bpy  # noqa: PLC0415
 
+        local = bpy.utils.resource_path("LOCAL")
+        if local:
+            for scripts_name in ("scripts",):
+                for addons_name in ("addons_core", "addons"):
+                    add(
+                        Path(local) / scripts_name / addons_name
+                        / "io_scene_gltf2" / lib_name
+                    )
+        for scripts_dir in bpy.utils.script_paths():
+            for addons_name in ("addons_core", "addons"):
+                add(
+                    Path(scripts_dir) / addons_name
+                    / "io_scene_gltf2" / lib_name
+                )
+    except Exception:
+        pass
+
+    # 3. Climb upward from the executable for launcher layouts where the
+    # versioned script dir (and Blender 5.2's blender.shared) sit one or
+    # more levels above python.exe.
+    if sys.executable:
+        current = Path(sys.executable).resolve().parent
+        for _ in range(8):
+            for scripts_name in ("scripts",):
+                for addons_name in ("addons_core", "addons"):
+                    candidate = (
+                        current / scripts_name / addons_name
+                        / "io_scene_gltf2" / lib_name
+                    )
+                    if candidate.exists():
+                        add(candidate)
+            # Pre-4.2 Blender bundled the shim with the python modules
+            # (lib/site-packages on Windows, sometimes versioned on mac).
+            py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+            for site_base in (
+                Path("lib") / "site-packages",
+                Path("lib") / py_version / "site-packages",
+            ):
+                candidate = current / site_base / lib_name
+                if candidate.exists():
+                    add(candidate)
+            candidate = current / "io_scene_gltf2" / lib_name
+            if candidate.exists():
+                add(candidate)
+            # Blender 5.2 keeps the raw draco library in blender.shared/.
+            candidate = current / "blender.shared" / "draco.dll"
+            if candidate.exists():
+                add(candidate)
+            if current.parent == current:
+                break
+            current = current.parent
+
+    return candidates
+
+
+def _get_blender_draco_dll_path() -> Optional[Path]:
+    for candidate in _get_blender_draco_dll_paths():
+        if candidate.exists():
+            return candidate
     return None
 
 
 def _load_blender_draco_dll():
     global _DRACO_DLL, _DRACO_LOAD_ERROR
-    if _DRACO_DLL is not _DRACO_DLL_UNINITIALIZED:
+    # Only an established DLL short-circuits.  A previous None (library not
+    # found) retries: the failure may predate a login/relaunch that changed
+    # the environment, and the path search is cheap.
+    if _DRACO_DLL is not _DRACO_DLL_UNINITIALIZED and _DRACO_DLL is not None:
         return _DRACO_DLL
 
-    dll_path = _get_blender_draco_dll_path()
-    if dll_path is None:
-        _DRACO_LOAD_ERROR = "blender draco library was not found"
-        return None
+    last_error = "blender draco library was not found"
+    for dll_path in _get_blender_draco_dll_paths():
+        if not dll_path.exists():
+            continue
+        dll = None
+        try:
+            dll = ctypes.cdll.LoadLibrary(str(dll_path))
+            dll.decoderCreate.restype = ctypes.c_void_p
+            dll.decoderCreate.argtypes = []
+            dll.decoderRelease.restype = None
+            dll.decoderRelease.argtypes = [ctypes.c_void_p]
+            dll.decoderDecode.restype = ctypes.c_bool
+            dll.decoderDecode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            dll.decoderReadAttribute.restype = ctypes.c_bool
+            dll.decoderReadAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_char_p]
+            dll.decoderGetVertexCount.restype = ctypes.c_uint32
+            dll.decoderGetVertexCount.argtypes = [ctypes.c_void_p]
+            dll.decoderGetIndexCount.restype = ctypes.c_uint32
+            dll.decoderGetIndexCount.argtypes = [ctypes.c_void_p]
+            dll.decoderGetAttributeByteLength.restype = ctypes.c_size_t
+            dll.decoderGetAttributeByteLength.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            dll.decoderCopyAttribute.restype = None
+            dll.decoderCopyAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
+            dll.decoderReadIndices.restype = ctypes.c_bool
+            dll.decoderReadIndices.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            dll.decoderGetIndicesByteLength.restype = ctypes.c_size_t
+            dll.decoderGetIndicesByteLength.argtypes = [ctypes.c_void_p]
+            dll.decoderCopyIndices.restype = None
+            dll.decoderCopyIndices.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        except Exception as exc:
+            last_error = f"failed to load {dll_path}: {exc}"
+            continue
 
-    try:
-        dll = ctypes.cdll.LoadLibrary(str(dll_path.resolve()))
-        dll.decoderCreate.restype = ctypes.c_void_p
-        dll.decoderCreate.argtypes = []
-        dll.decoderRelease.restype = None
-        dll.decoderRelease.argtypes = [ctypes.c_void_p]
-        dll.decoderDecode.restype = ctypes.c_bool
-        dll.decoderDecode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-        dll.decoderReadAttribute.restype = ctypes.c_bool
-        dll.decoderReadAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_size_t, ctypes.c_char_p]
-        dll.decoderGetVertexCount.restype = ctypes.c_uint32
-        dll.decoderGetVertexCount.argtypes = [ctypes.c_void_p]
-        dll.decoderGetIndexCount.restype = ctypes.c_uint32
-        dll.decoderGetIndexCount.argtypes = [ctypes.c_void_p]
-        dll.decoderGetAttributeByteLength.restype = ctypes.c_size_t
-        dll.decoderGetAttributeByteLength.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        dll.decoderCopyAttribute.restype = None
-        dll.decoderCopyAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
-        dll.decoderReadIndices.restype = ctypes.c_bool
-        dll.decoderReadIndices.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        dll.decoderGetIndicesByteLength.restype = ctypes.c_size_t
-        dll.decoderGetIndicesByteLength.argtypes = [ctypes.c_void_p]
-        dll.decoderCopyIndices.restype = None
-        dll.decoderCopyIndices.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    except Exception as exc:
-        _DRACO_LOAD_ERROR = f"failed to load {dll_path}: {exc}"
-        return None
+        _DRACO_LOAD_ERROR = None
+        _DRACO_DLL = dll
+        return dll
 
-    _DRACO_LOAD_ERROR = None
-    _DRACO_DLL = dll
-    return dll
+    _DRACO_LOAD_ERROR = last_error
+    return None
 
 
 def _decode_draco_attribute_buffer(

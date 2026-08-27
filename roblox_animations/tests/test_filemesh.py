@@ -606,6 +606,26 @@ class TestFileMeshParsing(unittest.TestCase):
         self.assertEqual(extract_asset_id("rbxassetid://12345"), 12345)
         self.assertEqual(extract_asset_id("https://www.roblox.com/asset/?id=456"), 456)
         self.assertEqual(extract_asset_id("789"), 789)
+        self.assertEqual(
+            extract_asset_id("https://www.roblox.com/catalog/144076357/Classic-Shirt"),
+            144076357,
+        )
+
+    def test_normalize_keeps_image_version_chunk(self):
+        # A PNG whose first 4KB carries a tEXt chunk containing "version "
+        # must survive image fetches (trim_mesh_header=False); mesh payloads
+        # still trim leading junk up to the version marker.
+        from ..rig.filemesh import _normalize_filemesh_bytes
+
+        png = b"\x89PNG\r\n\x1a\n" + b"JUNK" * 100 + b"Software: version 1.2 " + b"JUNK" * 100
+        self.assertEqual(
+            _normalize_filemesh_bytes(png, trim_mesh_header=False), png
+        )
+        mesh = b"garbage-header-bytes " + b"version 1.00\nrest"
+        self.assertEqual(
+            _normalize_filemesh_bytes(mesh, trim_mesh_header=True),
+            b"version 1.00\nrest",
+        )
 
     def test_parse_v1_ascii_comma_separated_groups(self):
         # Old v1.00 assets (e.g. the classic "Spiky Hair Mesh", asset

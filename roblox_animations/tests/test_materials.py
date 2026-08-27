@@ -467,14 +467,11 @@ class MaterialPipelineTests(unittest.TestCase):
         mix = material.node_tree.nodes.get("RBX Overlay Mix")
         tex = material.node_tree.nodes.get("RBX ColorMap")
         factor = textures._socket_by_type(mix, "input", "Factor", "VALUE").links[0]
-        # The factor samples a dedicated copy datablock so the tint multiply
-        # and the mix factor never read the same image (Blender 5.1
-        # mis-evaluates that combination).
-        self.assertEqual(factor.from_node.name, "RBX Overlay Alpha")
+        # The factor samples the texture node's own alpha output directly —
+        # no copy datablock.
+        self.assertEqual(factor.from_node.name, "RBX ColorMap")
         self.assertEqual(factor.from_socket.name, "Alpha")
-        alpha_node = material.node_tree.nodes.get("RBX Overlay Alpha")
-        self.assertIsNotNone(alpha_node)
-        self.assertIs(alpha_node.image, textures._overlay_alpha_image_copy(tex.image))
+        self.assertIsNone(material.node_tree.nodes.get("RBX Overlay Alpha"))
         self.assertEqual(
             textures._socket_by_type(mix, "input", "B", "RGBA").links[0].from_node.name,
             "RBX ColorMap",
@@ -506,12 +503,9 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertIn("RBX Overlay Mix", names)
 
     def test_overlay_composites_stay_opaque(self):
-        # An overlay composite (Texture instance or Overlay SA) reveals the
-        # layer beneath IN-SHADER and never touches Principled Alpha, so the
-        # material must stay opaque.  Forcing BLEND here made Eevee render
-        # walls markedly darker than Cycles under world light (the
-        # dark-wall symptom).  A Transparency SA uses dithered/hashed alpha
-        # to avoid sorted-blend overlap artifacts.
+        # A Texture instance fades the DECAL over the part colour; the part
+        # itself stays opaque.  Only a Transparency SA uses dithered/hashed
+        # alpha to avoid sorted-blend overlap artifacts.
         entry = _entry(color=(0.5, 0.5, 0.5), material=256)
         entry["texture_instances"] = [{"texture": "rbxassetid://111"}]
         material = self._build(entry)
@@ -921,8 +915,9 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertIsNotNone(normal_tex)
 
     def test_deferred_hydration_assigns_every_layer_and_alpha_factor(self):
-        # The deferred pass must hydrate ALL registry layers and create one
-        # alpha-copy factor node per overlay layer.
+        # The deferred pass must hydrate ALL registry layers; the overlay
+        # factor is wired to the texture node's own alpha at build time, so
+        # hydration only lands the datablocks.
         entry = _entry(color=(0.2, 0.4, 0.9), material=256)
         entry["surface_appearances"] = [
             {"color_map": "rbxassetid://111", "alpha_mode": 0},
@@ -941,13 +936,13 @@ class MaterialPipelineTests(unittest.TestCase):
         second = nodes.get("RBX ColorMap.1")
         self.assertIsNotNone(first.image)
         self.assertIsNotNone(second.image)
-        # Each overlay mix gets its own alpha factor node, with the UV link
-        # mirrored from its colour node.
+        # No copy nodes anywhere; each mix factor reads its colour node.
         for tag, color_node in (("", first), (".1", second)):
-            alpha_node = nodes.get(f"RBX Overlay Alpha{tag}")
-            self.assertIsNotNone(alpha_node)
-            self.assertIsNotNone(alpha_node.image)
-            self.assertIsNot(alpha_node.image, color_node.image)
+            self.assertIsNone(nodes.get(f"RBX Overlay Alpha{tag}"))
+            mix = nodes.get(f"RBX Overlay Mix{tag}")
+            factor = textures._float_factor_socket(mix)
+            self.assertIsNotNone(factor)
+            self.assertEqual(factor.links[0].from_node.name, color_node.name)
         self.assertTrue(material.get("RBXTextureHydrated"))
 
     def test_cache_key_splits_by_full_layer_lists(self):
@@ -1163,20 +1158,20 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertIsNotNone(tree.nodes.get("RBX Material ColorMap"))
         tex = tree.nodes.get("RBX TextureInstance")
         self.assertIsNotNone(tex)
+        # Decal composite: the mix fades the TEXTURE over the part colour.
         mix = tree.nodes.get("RBX Overlay Mix")
         self.assertIsNotNone(mix)
-        # The mix's underneath layer is the material tint chain, not a flat
-        # part colour default: input A must be driven by a link.
         self.assertTrue(
             textures._socket_by_type(mix, "input", "A", "RGBA").links
         )
-        # Factor comes from the texture alpha, so no Principled Alpha link.
+        # The part stays opaque: Principled Alpha keeps no link.
         principled = next(
             n for n in tree.nodes if n.type == "BSDF_PRINCIPLED"
         )
         alpha_input = principled.inputs.get("Alpha")
         self.assertIsNotNone(alpha_input)
         self.assertFalse(alpha_input.links)
+        self.assertNotEqual(material.blend_method, "BLEND")
         # Instances tile at their own studs-per-tile density through a
         # dedicated scale chain; the material's own maps keep the default
         # density and must not inherit the instance's.
@@ -1532,6 +1527,76 @@ class MaterialPipelineTests(unittest.TestCase):
                 node.inputs["Vector"].links[0].from_node.uv_map,
                 "UVMap",
             )
+
+
+class PolygonFaceIdTests(unittest.TestCase):
+    """Texture child Face assignment must mirror the renderer's decal tables.
+
+    Box shapes are index-based (generator face order survives the t2b remap
+    and part rotations); the ball classifies by polygon centre in
+    part-local space.
+    """
+
+    class _Mesh:
+        def __init__(self, poly_count, centers=None):
+            class _Poly:
+                def __init__(self, center):
+                    self.center = center
+
+            self.polygons = [
+                _Poly(centers[i] if centers else None) for i in range(poly_count)
+            ]
+
+    def test_block_faces(self):
+        mesh = self._Mesh(12)
+        self.assertEqual(
+            textures._polygon_face_ids(mesh, {"shape": "block"}),
+            [(5,), (5,), (2,), (2,), (1,), (1,),
+             (4,), (4,), (0,), (0,), (3,), (3,)],
+        )
+
+    def test_wedge_faces(self):
+        mesh = self._Mesh(10)
+        self.assertEqual(
+            textures._polygon_face_ids(mesh, {"shape": "wedge"}),
+            [(2,), (2,), (0,), (0,), (3,), (3,),
+             (4,), (4,), (1, 5), (1, 5)],
+        )
+
+    def test_corner_wedge_faces(self):
+        mesh = self._Mesh(10)
+        self.assertEqual(
+            textures._polygon_face_ids(mesh, {"shape": "corner_wedge"}),
+            [(0,), (0,), (1, 2), (1, 2), (1, 3), (1, 3),
+             (4,), (4,), (5,), (5,)],
+        )
+
+    def test_cylinder_faces(self):
+        mesh = self._Mesh(64)
+        ids = textures._polygon_face_ids(mesh, {"shape": "cylinder"})
+        self.assertEqual(ids[:32], [(0,)] * 16 + [(3,)] * 16)
+        self.assertEqual(
+            ids[32:],
+            [(1,)] * 4 + [(2,)] * 8 + [(4,)] * 8 + [(5,)] * 8 + [(1,)] * 4,
+        )
+
+    def test_ball_faces(self):
+        # Mesh-space centres -> part-local through t2b^-1, where t2b maps
+        # (x, y, z) -> (x, -z, y): blender +Y is roblox -Z (Front),
+        # blender +Z is roblox +Y (Top), etc.
+        mesh = self._Mesh(6, [
+            (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0), (0.0, -1.0, 0.0),
+            (0.0, 0.0, 1.0), (0.0, 0.0, -1.0),
+        ])
+        entry = {
+            "shape": "ball",
+            "part_cf": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        }
+        self.assertEqual(
+            textures._polygon_face_ids(mesh, entry),
+            [(0,), (3,), (5,), (2,), (1,), (4,)],
+        )
 
 
 if __name__ == "__main__":

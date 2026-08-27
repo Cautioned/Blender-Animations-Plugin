@@ -98,7 +98,7 @@ bl_info = {
     "name": "Roblox Animations Importer/Exporter",
     "description": "Plugin for importing roblox rigs and exporting animations.",
     "author": "Cautioned",
-    "version": (3, 0, 0),
+    "version": (3, 0, 1),
     "blender": (2, 80, 0),
     "location": "View3D > Toolbar",
 }
@@ -238,12 +238,18 @@ def file_import_extend(self, context):
     """Add import options to the file menu"""
     import_model_op = _resolve_operator_class("OBJECT_OT_ImportModel", fallback_module="import_ops")
     import_anim_op = _resolve_operator_class("OBJECT_OT_ImportFbxAnimation", fallback_module="import_ops")
+    import_rbxm_op = _resolve_operator_class("OBJECT_OT_ImportRbxm", fallback_module="import_ops")
     if import_model_op is not None:
         self.layout.operator(import_model_op.bl_idname, text="Roblox Rig (.obj)")
     if import_anim_op is not None:
         self.layout.operator(
             import_anim_op.bl_idname,
             text="Animation for Roblox Rig (.fbx)",
+        )
+    if import_rbxm_op is not None:
+        self.layout.operator(
+            import_rbxm_op.bl_idname,
+            text="Roblox Model/Place (.rbxm/.rbxl)",
         )
 
 

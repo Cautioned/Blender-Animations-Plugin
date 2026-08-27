@@ -77,6 +77,105 @@ _LAZY_HYDRATION_OVERLAP_BUDGET = 32
 _SKY_ASSET_CONSUMER = ("scene", "sky")
 _BEAM_ASSET_CONSUMER = ("scene", "beams")
 _TERRAIN_ASSET_CONSUMER = ("scene", "terrain")
+_UNION_ASSET_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _fetch_legacy_union_mesh(asset_id, auth_headers, rbxm_mod, filemesh_mod):
+    """Download a 2012-era union render-mesh asset and decode its CSGMDL.
+
+    The asset is a gzip'd legacy rbxm document whose PartOperationAsset
+    carries a MeshData property: a lz4-wrapped, XOR-obfuscated CSGMDL v2
+    blob (the legacy chunk parser + tolerant lz4 decoder in core/rbxm.py
+    handle the framing).  Returns a filemesh-style mesh dict or None.
+    """
+    try:
+        from ..rig.filemesh import _fetch_url_bytes
+
+        # The modern minting endpoint returns a signed contentdelivery
+        # location for OLD content types (SolidModel union meshes) that the
+        # legacy assetdelivery.roblox.com/v1 route 401s.  _fetch_url_bytes
+        # follows the JSON "location" hop anonymously once the bearer has
+        # been used.
+        raw = _fetch_url_bytes(
+            f"https://apis.roblox.com/asset-delivery-api/v1/assetId/{int(asset_id)}",
+            timeout=20.0,
+            extra_headers=dict(auth_headers or {}),
+            max_bytes=_UNION_ASSET_MAX_BYTES,
+            trim_mesh_header=False,
+        )
+        import gzip
+
+        blob = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
+        instances, _roots = rbxm_mod._parse_chunks(blob)
+        for inst in instances.values():
+            if inst.class_name not in (
+                "PartOperationAsset", "PartOperation",
+                "UnionOperation", "NegateOperation",
+            ):
+                continue
+            mesh = rbxm_mod._extract_union_mesh(inst)
+            if isinstance(mesh, dict) and mesh.get("faces"):
+                return mesh
+    except Exception as exc:  # noqa: BLE001 - unions degrade gracefully
+        print(f"[RbxmImport] legacy union asset {asset_id} failed: {exc}")
+    return None
+
+
+def _resolve_legacy_union_assets(part_aux, auth_headers):
+    """Replace union_unsupported placeholders with decoded legacy union meshes.
+
+    Fetches each distinct union render-mesh asset once and stamps the decoded
+    CSGMDL onto every entry that referenced it, mirroring how Studio resolves
+    PartOperation AssetIds through the CSG dictionary.
+    """
+    try:
+        from ..core import rbxm as rbxm_mod
+        from ..rig import filemesh as filemesh_mod
+    except ImportError:
+        return 0
+    ids = sorted({
+        int(entry["union_asset_id"])
+        for entry in part_aux
+        if isinstance(entry, dict)
+        and isinstance(entry.get("union_asset_id"), (int, float, str))
+        and not isinstance(entry.get("union_mesh"), dict)
+    })
+    if not ids:
+        return 0
+    resolved = {}
+    for asset_id in ids:
+        mesh = _fetch_legacy_union_mesh(asset_id, auth_headers, rbxm_mod, filemesh_mod)
+        if isinstance(mesh, dict):
+            resolved[asset_id] = mesh
+    applied = 0
+    for entry in part_aux:
+        if not isinstance(entry, dict) or isinstance(entry.get("union_mesh"), dict):
+            continue
+        try:
+            asset_id = int(entry.get("union_asset_id"))
+        except (TypeError, ValueError):
+            continue
+        mesh = resolved.get(asset_id)
+        if isinstance(mesh, dict):
+            if entry.get("union_use_part_color"):
+                # UsePartColor unions render with the part's Color3, never
+                # the CSG mesher's baked vertex colors.  The strip has to
+                # happen AFTER the asset fetch, which is where legacy
+                # unions get their mesh from.
+                mesh = dict(mesh)
+                mesh["colors"] = []
+            entry["union_mesh"] = mesh
+            entry.pop("union_unsupported", None)
+            # Drop the placeholder block fallback now that the real CSG
+            # render mesh is attached.
+            entry.pop("shape", None)
+            applied += 1
+    if applied:
+        print(
+            f"[RbxmImport] resolved {applied} legacy union(s) from "
+            f"{len(ids)} render-mesh asset(s)"
+        )
+    return applied
 
 
 def _lazy_fetch_filemesh(mesh_id, auth_headers, lod_index=0):
@@ -5191,10 +5290,19 @@ def _create_equirectangular_sky_image(
         if image_data is None:
             return (0.0, 0.0, 0.0, 1.0)
         width, height, pixels = image_data
-        x = min(width - 1, max(0, int(_clamp(u, 0.0, 1.0) * (width - 1))))
-        y = min(height - 1, max(0, int(_clamp(v, 0.0, 1.0) * (height - 1))))
-        index = 4 * (y * width + x)
-        return tuple(pixels[index + channel] for channel in range(4))
+        fx = _clamp(u, 0.0, 1.0) * (width - 1)
+        fy = _clamp(v, 0.0, 1.0) * (height - 1)
+        x0, y0 = int(fx), int(fy)
+        x1, y1 = min(width - 1, x0 + 1), min(height - 1, y0 + 1)
+        tx, ty = fx - x0, fy - y0
+
+        def rgba(x, y):
+            index = 4 * (y * width + x)
+            return tuple(pixels[index + channel] for channel in range(4))
+
+        top = tuple(rgba(x0, y0)[c] * (1.0 - tx) + rgba(x1, y0)[c] * tx for c in range(4))
+        bottom = tuple(rgba(x0, y1)[c] * (1.0 - tx) + rgba(x1, y1)[c] * tx for c in range(4))
+        return tuple(top[c] * (1.0 - ty) + bottom[c] * ty for c in range(4))
 
     def cubemap_sample(direction):
         x, y, z = direction
@@ -5207,13 +5315,17 @@ def _create_equirectangular_sky_image(
             face, u, v = (("up", x / major, -z / major) if y > 0 else ("down", x / major, z / major))
         return sample(face, *_roblox_sky_uv(face, (u + 1.0) * 0.5, (v + 1.0) * 0.5))
 
-    width, height = 1024, 512
+    # 512px cubemap faces under-sample the horizon when spread across a
+    # 1024px equirectangular ring; 2048x1024 keeps every output texel within
+    # the source's Nyquist rate while the bilinear tap below smooths the
+    # remaining fractional offsets.
+    width, height = 2048, 1024
     resample_started = time.perf_counter()
     inverse_basis = get_transform_to_blender().to_3x3().inverted_safe()
     try:
-        # Blender bundles NumPy. Converting all 524,288 environment pixels in
-        # vectorized blocks is orders of magnitude cheaper than crossing the
-        # Python interpreter for every direction and colour channel.
+        # Blender bundles NumPy. Converting all 2,097,152 environment pixels
+        # in vectorized blocks is orders of magnitude cheaper than crossing
+        # the Python interpreter for every direction and colour channel.
         import numpy as np
 
         longitude = np.linspace(
@@ -5254,17 +5366,20 @@ def _create_equirectangular_sky_image(
             source = np.asarray(pixels, dtype=np.float32).reshape(
                 source_height, source_width, 4
             )
-            source_x = np.clip(
-                ((u[mask] + 1.0) * 0.5 * (source_width - 1)).astype(np.int32),
-                0,
-                source_width - 1,
-            )
-            source_y = np.clip(
-                ((v[mask] + 1.0) * 0.5 * (source_height - 1)).astype(np.int32),
-                0,
-                source_height - 1,
-            )
-            output_pixels[mask] = source[source_y, source_x]
+            # Bilinear tap: point sampling here is what made imported skies
+            # look crunchy at the horizon.  The floor/lerp pair costs nothing
+            # compared with the scalar fallback and keeps face edges smooth.
+            fx = (u[mask] + 1.0) * 0.5 * (source_width - 1)
+            fy = (v[mask] + 1.0) * 0.5 * (source_height - 1)
+            x0 = np.clip(np.floor(fx).astype(np.int32), 0, source_width - 1)
+            y0 = np.clip(np.floor(fy).astype(np.int32), 0, source_height - 1)
+            x1 = np.clip(x0 + 1, 0, source_width - 1)
+            y1 = np.clip(y0 + 1, 0, source_height - 1)
+            tx = (fx - x0)[:, None]
+            ty = (fy - y0)[:, None]
+            top = source[y0, x0] * (1.0 - tx) + source[y0, x1] * tx
+            bottom = source[y1, x0] * (1.0 - tx) + source[y1, x1] * tx
+            output_pixels[mask] = top * (1.0 - ty) + bottom * ty
 
         x, y, z = (directions[:, :, index] for index in range(3))
         x_major = major_axis == 0
@@ -5465,11 +5580,11 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
         # Feed the assembled sky straight to World Output so Eevee builds the
         # probe from it.  The locked Roblox client-camera calibration chose a
         # nominal strength of 1.0; the former fake Sun dome is not needed.
-        # Eevee's world-probe irradiance is stronger than Roblox Future's sky
-        # bounce.  The fixed Crossroads client-camera fit puts the conversion
-        # at 0.76: it preserves the camera sky while avoiding the previous
-        # over-lit road and grass.
-        background.inputs["Strength"].default_value = 0.76
+        # Side-by-side against Studio's default Lighting.Brightness (2), a
+        # world strength of 1.0 matches the client's sky and surface fill.
+        # The earlier 0.76 Crossroads camera fit under-lit everything that was
+        # not in direct sun; drop it rather than keep dimming imported scenes.
+        background.inputs["Strength"].default_value = 1.0
         world.node_tree.links.new(background.outputs["Background"], output.inputs["Surface"])
         world["rbx_eevee_world_probe"] = True
     else:
@@ -5601,19 +5716,21 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
     # exposure offset here: a Crossroads-specific sweep improved that map but
     # overexposed the controlled fixture, proving it is not a general mapping.
     correction = (post_effects or {}).get("color_correction") or {}
-    # Brightness maps well to exposure.  Contrast/saturation are retained as
-    # metadata because Blender's scene color management cannot apply them to
-    # the interactive material-preview path without taking over the user's
-    # compositor.
-    exposure = float(lighting.get("exposure_compensation", 0.0)) + (
-        float(correction.get("brightness", 0.0)) * 1.5 if correction.get("enabled", True) else 0.0
-    )
+    # Studio's ExposureCompensation and ColorCorrection.Brightness are both
+    # stop-like offsets that Blender's scene exposure reproduces 1:1, so the
+    # values pass through unchanged.  Contrast/saturation stay metadata:
+    # Blender's scene color management cannot apply them to the interactive
+    # material-preview path without taking over the user's compositor.
+    exposure = float(lighting.get("exposure_compensation", 0.0))
+    if correction.get("enabled", True):
+        exposure += float(correction.get("brightness", 0.0))
     scene.view_settings.exposure = _clamp(exposure, -10.0, 10.0)
-    # Available in Blender 5.1+; retain a safe fallback for older bundled
-    # OCIO configs (such as the development Blender 4.1 install).
+    # Khronos PBR Neutral renders the imported PBR materials the way they
+    # were authored, with Medium Contrast for a tame highlight rolloff.
+    # Fall back to Standard on older bundled OCIO configs that lack it.
     try:
         scene.view_settings.view_transform = "Khronos PBR Neutral"
-        scene.view_settings.look = "High Contrast"
+        scene.view_settings.look = "Medium Contrast"
     except (TypeError, ValueError):
         try:
             scene.view_settings.view_transform = "Standard"
@@ -5979,8 +6096,11 @@ def _create_rbx_decals(collection, part_entries):
     created = 0
     transform_to_blender = get_transform_to_blender()
     for entry in part_entries:
-        # Head decals are handled by the existing face-composite path.
-        if entry.get("name") == "Head":
+        # Classic heads (plain Part, no SpecialMesh) carry the decal as
+        # face_decal and composite it through the clothing path.  Dynamic
+        # heads never get face_decal, so their Decal instances must still
+        # build as projected planes here.
+        if entry.get("name") == "Head" and entry.get("face_decal"):
             continue
         for index, decal in enumerate(entry.get("decals") or ()):
             if not isinstance(decal, dict):
@@ -6620,6 +6740,18 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
         description="Import supported classic face decals",
         default=True,
     )
+    material_defaults: bpy.props.EnumProperty(
+        name="Material Defaults",
+        description=(
+            "Material system to use when the file does not declare one "
+            "(MaterialService.Use2022Materials)"
+        ),
+        items=[
+            ("2022", "2022", "PBR-style materials (current Roblox default)"),
+            ("old", "Old", "Legacy pre-2022 textures and materials"),
+        ],
+        default="2022",
+    )
     # Multi-select: `files` holds every picked file, `directory` their folder.
     files: bpy.props.CollectionProperty(
         type=bpy.types.OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"}
@@ -6644,6 +6776,9 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
         effects.label(text="Visuals", icon="TEXTURE")
         effects.prop(self, "import_beams")
         effects.prop(self, "import_decals")
+        materials = layout.box()
+        materials.label(text="Materials", icon="MATERIAL")
+        materials.prop(self, "material_defaults")
 
     def execute(self, context):
         import os
@@ -6768,7 +6903,11 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
         # "<Model>/<Part>.<class>" and stay unique across a multi-model scene.
         model_tag = f"{rig_name}.place" if is_place else f"{rig_name}.model"
         meta_loaded["model_tag"] = model_tag
-        use_2022_materials = bool(meta_loaded.get("use_2022_materials", True))
+        # The file's declared material system always wins; the dropdown
+        # only fills the gap when the file has no MaterialService flag.
+        use_2022_materials = bool(
+            meta_loaded.get("use_2022_materials", self.material_defaults == "2022")
+        )
         for entry in part_aux:
             entry["model_tag"] = model_tag
             entry["_use_2022_materials"] = use_2022_materials
@@ -6956,7 +7095,13 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             try:
                 from ..rig import avatar_scale
 
-                avatar_scale.set_hd_scale_context(meta_loaded.get("hd_scale"))
+                # rbxm part sizes are the FINAL render sizes (the file bakes
+                # in HD scale and AvatarPartScaleType proportions already).
+                # Re-running the canonical-form conversion here would scale
+                # the meshes away from their joints — the detached-limb bug
+                # on muscled rigs.  Clear any context a server-export import
+                # left behind and keep limb scale at unity.
+                avatar_scale.set_hd_scale_context(None)
                 if meta_loaded.get("hd_scale"):
                     print(f"[RbxmImport] HD scale: {meta_loaded['hd_scale']}")
                 scale_types = {
@@ -7111,6 +7256,15 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             )
 
         started = time.perf_counter()
+        # Legacy (2012-era) unions reference their CSGMDL render mesh by
+        # AssetId.  Resolve those before job planning so the union branch
+        # below builds them like embedded meshes.
+        try:
+            from ..core.auth import get_auth_headers
+
+            _resolve_legacy_union_assets(part_aux, get_auth_headers())
+        except Exception as exc:  # noqa: BLE001 - offline imports degrade
+            print(f"[RbxmImport] union asset resolution skipped: {exc}")
         static_batches = {}
         lazy_mesh_jobs = []
         sync_texture_entries = []
