@@ -2066,10 +2066,16 @@ def _apply_builtin_material(material, principled, part_name, entry, builtin):
             # colour into the RBXColor layer, and the object-tint/baked-tint
             # paths rewire exactly this node — a static default would bake
             # the FIRST part's colour into every neon part's glow.
+            # Blender 4.0 renamed the socket from "Emission" to
+            # "Emission Color"; resolve by presence for 3.x.
+            emission_color = (
+                principled.inputs.get("Emission Color")
+                or principled.inputs.get("Emission")
+            )
             _link(
                 material,
                 color_attr.outputs["Color"],
-                principled.inputs["Emission Color"],
+                emission_color,
             )
             principled.inputs["Emission Strength"].default_value = 2.0
             principled.inputs["Roughness"].default_value = 0.25
