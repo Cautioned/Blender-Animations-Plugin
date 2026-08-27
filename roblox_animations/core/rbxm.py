@@ -21,6 +21,7 @@ Format references:
 from __future__ import annotations
 
 import math
+import re
 import struct
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -40,7 +41,14 @@ MAX_RBXM_SOURCE_BYTES = 512 * 1024 * 1024
 _MAX_CHUNK_BYTES = 64 * 1024 * 1024
 _MAX_TOTAL_CHUNK_BYTES = 512 * 1024 * 1024
 _MAX_CHUNKS = 8_192
-_MAX_INSTANCES = 250_000
+# Header sanity bound: real places declare millions of instances (mostly
+# scripts, folders, sounds).  The decoded-chunk byte caps already bound
+# actual memory, so this only rejects corrupt/impossible headers.
+_MAX_INSTANCES = 10_000_000
+# Hard cap on instances whose properties we retain.  Unsupported classes
+# (Scripts, GUI, lights, ...) stay as lightweight tree nodes and do NOT
+# count against this limit.
+_MAX_PROPS_INSTANCES = 2_000_000
 _MAX_STRING_BYTES = 8 * 1024 * 1024
 _MAX_SHARED_STRING_BYTES = 128 * 1024 * 1024
 
@@ -251,6 +259,11 @@ def _lz4_block_decompress(src: bytes, expected_length: int) -> bytes:
     out = bytearray()
     src_len = len(src)
     i = 0
+    # Legacy 2012-era union assets undercount the declared uncompressed
+    # length (observed +39 bytes on ChildData chunks).  Decode against a
+    # generous cap and trust a clean full-consumption stream at the end
+    # rather than the header's arithmetic.
+    output_cap = max(expected_length * 2, 65536)
     try:
         while i < src_len:
             token = src[i]
@@ -264,8 +277,8 @@ def _lz4_block_decompress(src: bytes, expected_length: int) -> bytes:
                     literal_length += b
                     if b != 255:
                         break
-            if literal_length > expected_length - len(out):
-                raise RbxmError("lz4 output exceeds declared chunk length")
+            if literal_length > output_cap - len(out):
+                raise RbxmError("lz4 output exceeds decoded-size safety cap")
             out += src[i: i + literal_length]
             i += literal_length
 
@@ -288,8 +301,8 @@ def _lz4_block_decompress(src: bytes, expected_length: int) -> bytes:
                         break
             match_length += 4
 
-            if match_length > expected_length - len(out):
-                raise RbxmError("lz4 output exceeds declared chunk length")
+            if match_length > output_cap - len(out):
+                raise RbxmError("lz4 output exceeds decoded-size safety cap")
 
             start = len(out) - offset
             if start < 0:
@@ -308,7 +321,9 @@ def _lz4_block_decompress(src: bytes, expected_length: int) -> bytes:
     except IndexError as exc:  # pragma: no cover - corrupt data
         raise RbxmError(f"malformed lz4 block: {exc}") from exc
 
-    if len(out) != expected_length:
+    if i < src_len:
+        raise RbxmError("lz4 stream ended before consuming input")
+    if not out:
         raise RbxmError("lz4 output length does not match chunk header")
     return bytes(out)
 
@@ -743,6 +758,7 @@ def _parse_chunks(data: bytes) -> Tuple[Dict[int, _Instance], Dict[int, _Instanc
     decoded_chunk_bytes = 0
     shared_string_bytes = 0
     chunk_count = 0
+    props_instances = 0
 
     while reader.remaining() > 0:
         chunk_count += 1
@@ -797,19 +813,35 @@ def _parse_chunks(data: bytes) -> Tuple[Dict[int, _Instance], Dict[int, _Instanc
             if object_format == 1:
                 cr.read(count)  # service markers
             classes[class_id] = (class_name, referents)
+            if class_name in _PROPS_CLASSES:
+                props_instances += count
+                if props_instances > _MAX_PROPS_INSTANCES:
+                    raise RbxmError("supported instances exceed import safety limit")
             for referent in referents:
                 instances[referent] = _Instance(referent, class_name)
 
         elif name == b"PROP":
             class_id = cr.u32le()
+            class_info = classes.get(class_id)
+            if class_info is None:
+                # Legacy 2012-era union render-mesh assets serialise PROP
+                # chunks WITHOUT a class id: the body is u32 0 + u32 name
+                # length + name + u8 type + u32 value length + raw value.
+                # The file holds a single class, so the property applies to
+                # every instance in the document.
+                if _read_legacy_prop(cr, instances):
+                    continue
+                break
             prop_name = cr.string()
             if cr.remaining() <= 0:
                 continue
             type_id = cr.u8()
-            class_info = classes.get(class_id)
-            if class_info is None:
-                break
             class_name, referents = class_info
+            # Only classes the importer reads need their properties parsed
+            # (and held in memory).  Everything else remains a lightweight
+            # tree node.
+            if class_name not in _PROPS_CLASSES:
+                continue
             # Attributes serialize as a String-typed binary blob; decoding
             # it as UTF-8 would corrupt the payload.  Read it raw here and
             # let consumers decode it on demand.  Studio has used both
@@ -895,8 +927,9 @@ def _first_prop(inst: _Instance, *names: str) -> Any:
 # payload is a CSGMDL container. Format reference (community reverse
 # engineering): https://github.com/krakow10/rbx_mesh — ``union_graphics``.
 #
-# Layout summary (little-endian throughout):
-#   bytes 0..9    "CSGMDL" + u32 version, XOR-obfuscated like the rest
+# v2/v4 layout (little-endian, whole payload XOR-obfuscated with the 31-byte
+# noise cycle below; the first ten bytes decode to the ASCII magic):
+#   bytes 0..9    "CSGMDL" + u32 version
 #   bytes 10..41  32-byte hash
 #   u32 vertex_count, u32 vertex_stride (84 in v2)
 #   vertex_count × Vertex {
@@ -904,9 +937,22 @@ def _first_prop(inst: _Instance, *names: str) -> Any:
 #       f32×2 uv, f32×3 tangent, 16 bytes padding
 #   }
 #   u32 index_count, then index_count × u32 vertex indices
+#   (v4 appends an unknown u32-counted list after the indices)
 #
-# The whole blob is XORed with a 31-byte noise cycle (offset 0 of the blob ==
-# offset 0 of the cycle, i.e. the first ten bytes decode to the ASCII magic).
+# v5 layout (little-endian, deinterleaved): only the 10-byte magic is
+# XOR-obfuscated; everything after it is plain:
+#   magic "CSGMDL"+5 (obfuscated)
+#   u16 pos_count, pos_count × f32×3 positions
+#   u16 normals_count, u32 normals_len, normals_count × i16×3 quantized normals
+#   u16 color_count, color_count × u8×4 colors
+#   u16 normal_id_count, normal_id_count × u8 NormalId (1..6)
+#   u16 tex_count, tex_count × f32×2 uvs
+#   u16 tangents_count, u32 tangents_len, tangents_count × i16×3
+#   faces: u32 index_count, u32 vertex_data_len, vertex_data_len delta bytes,
+#          u8 range_marker_count, range_marker_count × u32
+# The delta indices are a state machine: byte <64 adds itself, 64..127 adds
+# byte-128, >=128 reads two more bytes as a 23-bit positive offset. Markers
+# split the index list into ranges (LODs); the first range is the render mesh.
 # ---------------------------------------------------------------------------
 
 _CSGMDL_XOR_CYCLE = bytes(
@@ -914,13 +960,184 @@ _CSGMDL_XOR_CYCLE = bytes(
      26, 96, 55, 105, 29, 82, 43, 7, 79, 36, 89, 101, 83, 4, 122)
 )
 _CSGMDL_MAGIC = b"CSGMDL"
+_CSGMDL_MAGIC_OBFUSCATED_PREFIX = bytes(
+    _CSGMDL_MAGIC[index] ^ _CSGMDL_XOR_CYCLE[index] for index in range(6)
+)
 _CSGMDL2_VERTEX_STRIDE = 84
 _CSGMDL_MAX_VERTICES = 4_000_000
+# v5's on-disk magic: the version byte is the digit itself (0x35 == '5').
+_CSGMDL5_MAGIC = _CSGMDL_MAGIC_OBFUSCATED_PREFIX + bytes((0x35, 0x04, 0x34, 0x69))
+# CSGMDL v5 NormalId enum -> world-space flat normal direction.
+_NORMAL_ID5_DIRECTIONS = {
+    1: (1.0, 0.0, 0.0),   # Right
+    2: (0.0, 1.0, 0.0),   # Top
+    3: (0.0, 0.0, 1.0),   # Back
+    4: (-1.0, 0.0, 0.0),  # Left
+    5: (0.0, -1.0, 0.0),  # Bottom
+    6: (0.0, 0.0, -1.0),  # Front
+}
 
 
 def _deobfuscate_csgmdl(blob: bytes) -> bytes:
     cycle = _CSGMDL_XOR_CYCLE
     return bytes(b ^ cycle[i % 31] for i, b in enumerate(blob))
+
+
+def _dequant_csgmdl5_i16(value: int) -> float:
+    # rbx_mesh QuantizedF32x3: (x.wrapping_sub(0x7FFF) as f32) * (1/32767).
+    value = value - 0x7FFF
+    if value < -32768:
+        value += 65536
+    return value * (1.0 / 32767.0)
+
+
+def _decode_csgmdl5_indices(vertex_data: bytes, expected_count: int) -> Optional[List[int]]:
+    """Decode CSGMDL v5 delta-encoded vertex indices (state machine)."""
+    if expected_count > len(vertex_data) * 4:
+        return None
+    indices: List[int] = []
+    position = 0
+    data_len = len(vertex_data)
+    index_out = 0
+    for _ in range(expected_count):
+        if position >= data_len:
+            return None
+        v0 = vertex_data[position]
+        position += 1
+        if v0 < 64:
+            offset = v0
+        elif v0 < 128:
+            offset = v0 - 128
+        else:
+            if position + 1 >= data_len:
+                return None
+            v1 = vertex_data[position]
+            v2 = vertex_data[position + 1]
+            position += 2
+            offset = v2 | (v1 << 8) | ((v0 - 128) << 16)
+        index_out = (index_out + offset) & 0xFFFFFFFF
+        indices.append(index_out & 0x007FFFFF)
+    if position != data_len:
+        return None
+    return indices
+
+
+def _parse_csgmdl_v5(blob: bytes) -> Optional[dict]:
+    """Parse a CSGMDL v5 union render mesh into a filemesh-style dict."""
+    try:
+        reader = _Reader(blob, 0)
+        if reader.read(10) != _CSGMDL5_MAGIC:
+            return None
+
+        pos_count = reader.u16le()
+        if pos_count == 0 or pos_count > _CSGMDL_MAX_VERTICES:
+            return None
+        if reader.remaining() < pos_count * 12:
+            return None
+        positions = [
+            struct.unpack_from("<3f", reader.read(12), 0)
+            for _ in range(pos_count)
+        ]
+
+        normals_count = reader.u16le()
+        reader.read(4)  # normals_len (normals_count * 6, informational)
+        if normals_count > _CSGMDL_MAX_VERTICES or reader.remaining() < normals_count * 6:
+            return None
+        quantized_normals = [
+            tuple(
+                _dequant_csgmdl5_i16(value)
+                for value in struct.unpack_from("<3h", reader.read(6), 0)
+            )
+            for _ in range(normals_count)
+        ]
+
+        color_count = reader.u16le()
+        if color_count > _CSGMDL_MAX_VERTICES or reader.remaining() < color_count * 4:
+            return None
+        colors = [
+            tuple(component / 255.0 for component in reader.read(4))
+            for _ in range(color_count)
+        ]
+
+        normal_id_count = reader.u16le()
+        if normal_id_count > _CSGMDL_MAX_VERTICES or reader.remaining() < normal_id_count:
+            return None
+        normal_ids = [reader.u8() for _ in range(normal_id_count)]
+
+        tex_count = reader.u16le()
+        if tex_count > _CSGMDL_MAX_VERTICES or reader.remaining() < tex_count * 8:
+            return None
+        uvs = [
+            struct.unpack_from("<2f", reader.read(8), 0)
+            for _ in range(tex_count)
+        ]
+
+        tangents_count = reader.u16le()
+        reader.read(4)  # tangents_len
+        if tangents_count > _CSGMDL_MAX_VERTICES or reader.remaining() < tangents_count * 6:
+            return None
+        for _ in range(tangents_count):
+            reader.read(6)  # tangent data is unused downstream
+
+        # Delta-encoded vertex indices with range markers (LOD splits).
+        index_count = reader.u32le()
+        vertex_data_len = reader.u32le()
+        if vertex_data_len > reader.remaining():
+            return None
+        vertex_data = reader.read(vertex_data_len)
+        range_marker_count = reader.u8()
+        if range_marker_count and reader.remaining() < range_marker_count * 4:
+            return None
+        range_markers = [reader.u32le() for _ in range(range_marker_count)]
+
+        indices = _decode_csgmdl5_indices(vertex_data, index_count)
+        if indices is None or not indices:
+            return None
+
+        # Markers split the decoded index list into ranges; the first range
+        # (marker0..marker1) is the render LOD, exactly as rbx_mesh keeps it.
+        if range_markers:
+            marker0 = range_markers[0]
+            if marker0 >= len(indices):
+                return None
+            if marker0 != 0:
+                indices = indices[marker0:]
+            if len(range_markers) >= 2:
+                marker1 = range_markers[1] - marker0
+                if marker1 > len(indices):
+                    return None
+                if marker1 != 0:
+                    indices = indices[:marker1]
+
+        if len(indices) % 3 != 0:
+            return None
+        faces = [
+            (indices[i], indices[i + 1], indices[i + 2])
+            for i in range(0, len(indices), 3)
+        ]
+        if not faces:
+            return None
+        if any(face_index >= pos_count for face in faces for face_index in face):
+            return None
+
+        # CSG is flat-shaded: prefer the per-vertex NormalId axis over the
+        # quantized smooth normals when the counts line up.
+        normals: List[Tuple[float, float, float]] = []
+        if len(normal_ids) == pos_count:
+            for normal_id in normal_ids:
+                normals.append(_NORMAL_ID5_DIRECTIONS.get(normal_id) or (0.0, 0.0, 0.0))
+        elif len(quantized_normals) == pos_count:
+            normals = quantized_normals
+
+        return {
+            "positions": positions,
+            "normals": normals,
+            "uvs": uvs,
+            "colors": colors,
+            "faces": faces,
+        }
+    except RbxmError:
+        return None
 
 
 def _parse_csgmdl(blob: bytes) -> Optional[dict]:
@@ -932,14 +1149,21 @@ def _parse_csgmdl(blob: bytes) -> Optional[dict]:
         return None
     if len(blob) > 256 * 1024 * 1024:  # sanity: 256 MiB
         return None
-    plain = _deobfuscate_csgmdl(bytes(blob))
+    raw = bytes(blob)
+    # Every version writes the same XOR-obfuscated 6-byte magic prefix; the
+    # version digit sits at byte 6 in the clear ('2', '4' or '5').  v2/v4
+    # obfuscate the whole payload, v5 obfuscates only the magic itself.
+    if raw[:6] != _CSGMDL_MAGIC_OBFUSCATED_PREFIX:
+        return None
+    if raw[6] == 0x35:  # '5'
+        return _parse_csgmdl_v5(raw)
+    plain = _deobfuscate_csgmdl(raw)
     if plain[:6] != _CSGMDL_MAGIC:
         return None
     version = struct.unpack_from("<I", plain, 6)[0]
-    if version != 2:
-        # v4 shares the v2 vertex layout but is unobserved in the wild here;
-        # v5 (deinterleaved, state-machine indices) and CSGK (asset reference)
-        # are different formats — bail rather than guess.
+    if version not in (2, 4):
+        # CSGK (asset reference) and anything newer are different formats —
+        # bail rather than guess.
         return None
 
     reader = _Reader(plain, 10)
@@ -1032,11 +1256,195 @@ def _parse_csgmdl(blob: bytes) -> Optional[dict]:
     }
 
 
+_SOLID_MESH_MAGIC = b"SolidMesh\0\0\0\0"
+
+
+def _parse_solid_mesh(blob: bytes) -> Optional[dict]:
+    """Parse a legacy ``SolidMeshHolder`` union render mesh.
+
+    Pre-CSGMDL unions embed their render mesh directly in the file as a
+    "SolidMesh" chunk (the modern Studio serialiser stores a NetAssetRef
+    there instead; those files have nothing to decode).  Observed layout
+    (little-endian, wrapped in a 14-byte outer header):
+
+      "SolidMesh" + 4 NUL
+      u32 vertex_count, u32 0
+      vertex_count x f32x3 positions            (bbox == part Size)
+      u32 face_count, u32 0
+      face_count x f32x3 per-face normals       (unused: we rebuild flat)
+      u32 0, u32 0, u32 color_count, u32 0
+      color_count x f32x3 per-face data         (unused)
+      u32 index_count, u32 0
+      delta-encoded vertex indices (same state machine as CSGMDL v5);
+      the first index_count indices are the render triangle list (matches
+      UnionOperation.TriangleCount).  Further delta lists belong to
+      additional hulls and are ignored.
+    """
+    try:
+        data = bytes(blob)
+        magic_at = data.find(_SOLID_MESH_MAGIC)
+        if magic_at < 0 or magic_at > 64:
+            return None
+        reader = _Reader(data, magic_at + 13)
+
+        vertex_count = reader.u32le()
+        if vertex_count == 0 or vertex_count > _CSGMDL_MAX_VERTICES:
+            return None
+        reader.read(4)  # zero padding
+        if reader.remaining() < vertex_count * 12:
+            return None
+        positions = [
+            struct.unpack_from("<3f", reader.read(12), 0)
+            for _ in range(vertex_count)
+        ]
+
+        face_count = reader.u32le()
+        reader.read(4)  # zero padding
+        if face_count > 4 * _CSGMDL_MAX_VERTICES or reader.remaining() < face_count * 12 + 16:
+            return None
+        reader.read(face_count * 12)  # per-face normals
+
+        reader.read(8)  # two u32 padding words
+        color_count = reader.u32le()
+        reader.read(4)  # zero padding
+        if color_count > 4 * _CSGMDL_MAX_VERTICES or reader.remaining() < color_count * 12 + 8:
+            return None
+        reader.read(color_count * 12)  # per-face data
+
+        index_count = reader.u32le()
+        reader.read(4)  # zero padding
+        if index_count % 3 != 0 or index_count > 3 * _CSGMDL_MAX_VERTICES:
+            return None
+        if reader.remaining() < index_count:
+            return None
+        # Decode only the first index_count indices; the stream may continue
+        # into further hull lists, which we do not need.
+        vertex_data = reader.read(reader.remaining())
+        indices: List[int] = []
+        data_pos = 0
+        data_len = len(vertex_data)
+        index_out = 0
+        for _ in range(index_count):
+            if data_pos >= data_len:
+                return None
+            v0 = vertex_data[data_pos]
+            data_pos += 1
+            if v0 < 64:
+                offset = v0
+            elif v0 < 128:
+                offset = v0 - 128
+            else:
+                if data_pos + 1 >= data_len:
+                    return None
+                v1 = vertex_data[data_pos]
+                v2 = vertex_data[data_pos + 1]
+                data_pos += 2
+                offset = v2 | (v1 << 8) | ((v0 - 128) << 16)
+            index_out = (index_out + offset) & 0xFFFFFFFF
+            indices.append(index_out & 0x007FFFFF)
+        if any(index >= vertex_count for index in indices):
+            return None
+        faces = [
+            (indices[i], indices[i + 1], indices[i + 2])
+            for i in range(0, index_count, 3)
+        ]
+        if not faces:
+            return None
+
+        # CSG is flat-shaded: rebuild per-vertex normals from the faces.
+        normals: List[Optional[Tuple[float, float, float]]] = [None] * vertex_count
+        for face in faces:
+            p0 = positions[face[0]]
+            p1 = positions[face[1]]
+            p2 = positions[face[2]]
+            ux, uy, uz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+            vx, vy, vz = p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            length = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if length > 1e-12:
+                normal = (nx / length, ny / length, nz / length)
+                for index in face:
+                    normals[index] = normal
+
+        return {
+            "positions": positions,
+            "normals": [normal or (0.0, 0.0, 0.0) for normal in normals],
+            "uvs": [],
+            "colors": [],
+            "faces": faces,
+        }
+    except RbxmError:
+        return None
+
+
+def _read_legacy_prop(cr: _Reader, instances: Dict[int, _Instance]) -> bool:
+    """Decode a 2012-era PROP chunk body that omits the class id.
+
+    Layout (after the leading u32 zero the caller already consumed as the
+    bogus class id): u32 name length, name bytes, u8 type, u32 value length,
+    value bytes.  Legacy union assets hold a single class, so the value is
+    stamped onto every instance.  Binary payloads (union MeshData, nested
+    ChildData docs) are kept as bytes — decoding them as UTF-8 would corrupt
+    them.  Returns False when the body is clearly not this layout.
+    """
+    try:
+        if cr.remaining() < 8:
+            return False
+        name_length = cr.u32le()
+        if name_length > 256 or name_length > cr.remaining():
+            return False
+        name = cr.read(name_length)
+        if not name or any(b < 0x20 and b not in (0x0A,) for b in name):
+            return False
+        type_id = cr.u8()
+        value_length = cr.u32le()
+        if value_length > _MAX_STRING_BYTES or value_length > cr.remaining():
+            return False
+        value = cr.read(value_length)
+        try:
+            prop_name = name.decode("ascii")
+        except UnicodeDecodeError:
+            return False
+        stored: Any = value
+        if type_id == _TYPE_STRING and prop_name not in ("Name",):
+            stored = value  # keep binary payloads as bytes
+        elif type_id == _TYPE_STRING:
+            stored = value.decode("utf-8", errors="replace")
+        for inst in instances.values():
+            if prop_name == "Name":
+                inst.name = stored if isinstance(stored, str) else str(stored)
+            else:
+                inst.props[prop_name] = stored
+        return True
+    except RbxmError:
+        return False
+
+
+def _union_asset_id_from_instance(inst: _Instance) -> Optional[int]:
+    """Numeric asset id from a legacy UnionOperation.AssetId content URL."""
+    asset = _first_prop(inst, "AssetId", "AssetIdString", "MeshID")
+    if not isinstance(asset, str):
+        return None
+    match = re.search(r"[?&]id=(\d+)", asset)
+    if match is None:
+        match = re.search(r"(\d{6,})", asset)
+    if match is None:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _extract_union_mesh(inst: _Instance) -> Optional[dict]:
     """Resolve a UnionOperation's embedded render mesh, if present.
 
-    Modern files carry it in the ``MeshData2`` SharedString; very old files
-    carried an unobfuscated CSGMDL blob directly in the ``MeshData`` string.
+    Modern files carry a CSGMDL blob in the ``MeshData2`` SharedString; very
+    old files carried an unobfuscated CSGMDL blob directly in the ``MeshData``
+    string; legacy unions keep their render mesh in ``SolidMeshHolder``.
     """
     candidates = []
     for prop_name in ("MeshData2", "MeshData", "SolidMeshHolder"):
@@ -1045,6 +1453,9 @@ def _extract_union_mesh(inst: _Instance) -> Optional[dict]:
             candidates.append(value)
     for blob in candidates:
         mesh = _parse_csgmdl(blob)
+        if mesh is not None:
+            return mesh
+        mesh = _parse_solid_mesh(blob)
         if mesh is not None:
             return mesh
     return None
@@ -1120,11 +1531,13 @@ def _vec3(value):
 
 def _content_to_str(value) -> str:
     if isinstance(value, str):
-        return value
+        # Studio sometimes writes trailing padding/whitespace into content
+        # URIs ("rbxassetid://123 ") — the asset fetch must never see it.
+        return value.strip()
     if isinstance(value, (bytes, bytearray)):
         # SharedString-stored Content values resolve to raw payload bytes.
         try:
-            return bytes(value).decode("utf-8").rstrip("\0")
+            return bytes(value).decode("utf-8").rstrip("\0").strip()
         except UnicodeDecodeError:
             return ""
     return ""
@@ -1541,17 +1954,44 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             entry["shape"] = "wedge"
         elif inst.class_name == "CornerWedgePart":
             entry["shape"] = "corner_wedge"
-        elif inst.class_name == "UnionOperation":
+        elif inst.class_name in ("UnionOperation", "NegateOperation", "PartOperation", "PartOperationAsset"):
             # Union/CSG part: the render mesh is embedded in the file (the
             # MeshData2 SharedString) rather than referenced by asset id.
             union_mesh = _extract_union_mesh(inst)
+            use_part_color = _first_prop(inst, "UsePartColor")
+            use_part_color = bool(use_part_color) if use_part_color is not None else False
+            if use_part_color:
+                # Studio's UsePartColor makes the union render with its own
+                # Color3 instead of the CSG mesher's baked vertex colors.
+                # The flag also has to survive the legacy AssetId fetch, so
+                # stamp it on the entry rather than acting only inline.
+                entry["union_use_part_color"] = True
             if union_mesh is not None:
                 entry["union_mesh"] = union_mesh
                 entry["mesh_class"] = "UnionOperation"
+                if use_part_color:
+                    entry["union_mesh"] = dict(union_mesh)
+                    entry["union_mesh"]["colors"] = []
             else:
-                # AssetId-referenced CSG assets and unsupported CSGMDL
-                # versions: no offline-decodable mesh is available.
+                # No decodable render mesh: either an AssetId-referenced CSG
+                # asset, an unsupported CSGMDL version, or a legacy union that
+                # carries only the SolidMesh physics hull + ChildData2 operand
+                # tree (Studio re-evaluates CSG at load; we cannot offline).
                 entry["union_unsupported"] = True
+                # 2012-era unions reference a render-mesh ASSET whose own
+                # PartOperationAsset holds the CSGMDL.  Stamp the id so the
+                # importer can fetch and decode it (legacy chunk layout +
+                # lz4-wrapped mesh).  The asset fetch path sets union_mesh
+                # and clears union_unsupported on success.
+                asset_id = _union_asset_id_from_instance(inst)
+                if asset_id is not None:
+                    entry["union_asset_id"] = asset_id
+                # Placeholder geometry so a union whose render mesh is gone
+                # (roblox purges old content from the delivery CDN) still
+                # imports as a correctly-sized, correctly-coloured block
+                # instead of vanishing.  Replaced by union_mesh when the
+                # asset resolves.
+                entry["shape"] = "block"
         elif inst.class_name == "Part" and _find_descendant_of_class(inst, "SpecialMesh") is None and character_mesh is None and character_mesh_data is None:
             # Plain primitive Part (no SpecialMesh child) → block/ball/cylinder/etc.
             shape_val = _first_prop(inst, "shape", "Shape")
@@ -1765,13 +2205,42 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             decals.append(decal_data)
         if decals:
             entry["decals"] = decals
-            if entry.get("name") == "Head" and _find_descendant_of_class(inst, "SpecialMesh") is None:
-                # Classic heads render the face decal. Dynamic heads carry a
-                # SpecialMesh and render ITS texture instead; the decal is
-                # legacy data that must not become the face texture.  Keep
-                # the whole instance (tint, transparency) so the clothing
-                # composite can honor Decal.Transparency.
+            special = _find_descendant_of_class(inst, "SpecialMesh")
+            # Classic R6 heads (Part class) render the face decal over the
+            # head mesh — the decal IS the face.  Newer saves reference the
+            # head mesh by asset id, so the MeshId alone cannot discriminate.
+            # A CUSTOM head instead carries its own face look on the
+            # SpecialMesh (TextureId or a SurfaceAppearance child); only
+            # then is the legacy Decal suppressed.  Keep the whole instance
+            # (tint, transparency) so the clothing composite can honor
+            # Decal.Transparency.
+            has_custom_look = bool(entry.get("texture_id")) or bool(
+                _find_descendants_of_class(inst, "SurfaceAppearance")
+            )
+            if (
+                entry.get("name") == "Head"
+                and inst.class_name == "Part"
+                and not has_custom_look
+            ):
                 entry["face_decal"] = dict(decals[0])
+                # The classic baked head mesh (rbxasset://fonts/head.mesh,
+                # SpecialShape HEAD_MESH) is the ONLY head the engine scales
+                # by (min(sx,sz), sy, min(sx,sz)) / 1.25 with the cylinder-cap
+                # Y extrude.  R15-style heads are FileMesh assets with an
+                # explicit MeshId: the engine scales those by
+                # SpecialMesh.Scale (already reflected in mesh_size), so they
+                # must NOT get the classic treatment.
+                if entry.get("mesh_id") == "rbxasset://fonts/head.mesh":
+                    entry["classic_head_mesh"] = True
+                    if special is not None:
+                        try:
+                            special_scale = _first_prop(special, "Scale")
+                            if isinstance(special_scale, (list, tuple)) and len(special_scale) == 3:
+                                entry["_special_mesh_scale"] = [
+                                    float(component) for component in special_scale
+                                ]
+                        except (TypeError, ValueError):
+                            pass
 
         # AvatarPartScaleType marker (drives HumanoidDescription scaling).
         scale_marker = _find_descendant_of_class(inst, "StringValue")
@@ -1846,6 +2315,29 @@ _R6_BODY_PART_NAMES = {
 
 _JOINT_CLASSES = ("Motor6D", "Weld", "WeldConstraint", "AnimationConstraint", "RigidConstraint", "Snap")
 _BASE_PART_CLASSES = ("MeshPart", "Part", "WedgePart", "CornerWedgePart", "UnionOperation")
+
+# Classes whose properties (or name) the rbxm consumers actually read.
+# PROP chunks for anything else are skipped during parsing, and those
+# instances do not count against _MAX_PROPS_INSTANCES.  Humanoid is
+# deliberately absent: only its class_name is ever inspected.
+_PROPS_CLASSES = frozenset({
+    # BaseParts.
+    "Part", "MeshPart", "WedgePart", "CornerWedgePart", "UnionOperation",
+    "NegateOperation", "PartOperation", "PartOperationAsset",
+    # Containers whose names build the collection hierarchy.
+    "Model", "Folder", "Accessory", "WorldModel", "Workspace", "Tool",
+    # Part decoration.
+    "SpecialMesh", "Texture", "Decal", "SurfaceAppearance", "WrapLayer", "WrapTarget",
+    "MaterialVariant", "CharacterMesh", "StringValue", "NumberValue",
+    # Rigging.
+    "Motor6D", "Weld", "WeldConstraint", "AnimationConstraint",
+    "RigidConstraint", "Snap", "Bone", "Attachment",
+    # Scene extras.
+    "Terrain", "Beam", "Shirt", "Pants", "HumanoidDescription", "BodyColors",
+    "Atmosphere", "ColorCorrectionEffect", "BloomEffect", "SunRaysEffect",
+    "MaterialService", "Sky", "Lighting",
+    "PointLight", "SpotLight", "SurfaceLight",
+})
 
 
 def _joint_parts(joint: _Instance) -> Tuple[Optional[int], Optional[int]]:
@@ -2304,6 +2796,50 @@ def _derive_mesh_to_bone(rig: Optional[dict]) -> Dict[str, str]:
     return mapping
 
 
+def _humanoid_description_data(inst: _Instance) -> Dict[str, Any]:
+    """Body colors, clothing ids, and scale from a HumanoidDescription."""
+    body_colors = {}
+    for key, prop in (
+        ("head", "HeadColor3"),
+        ("torso", "TorsoColor3"),
+        ("left_arm", "LeftArmColor3"),
+        ("right_arm", "RightArmColor3"),
+        ("left_leg", "LeftLegColor3"),
+        ("right_leg", "RightLegColor3"),
+    ):
+        color = _first_prop(inst, prop)
+        if isinstance(color, (list, tuple)) and len(color) >= 3:
+            # Legacy saves store Color3uint8 (0-255); modern saves write
+            # float Color3 (0-1). Normalize to 0-1 either way.
+            if any(float(component) > 1.0 for component in color[:3]):
+                color = [float(component) / 255.0 for component in color[:3]]
+            body_colors[key] = [float(color[0]), float(color[1]), float(color[2])]
+    ids = {}
+    for key, prop in (
+        ("hd_shirt_id", "Shirt"),
+        ("hd_pants_id", "Pants"),
+        ("hd_graphic_tshirt_id", "GraphicTShirt"),
+        ("hd_face_id", "Face"),
+    ):
+        value = _first_prop(inst, prop)
+        if isinstance(value, (int, float)) and value > 0:
+            ids[key] = int(value)
+    scale = {}
+    # NB: the serialized property names carry a "Scale" suffix that the
+    # Lua API names (Height/Width/...) do not.
+    for key, prop, default in (
+        ("height", "HeightScale", 1.0),
+        ("width", "WidthScale", 1.0),
+        ("depth", "DepthScale", 1.0),
+        ("head", "HeadScale", 1.0),
+        ("proportion", "ProportionScale", 0.0),
+        ("body_type", "BodyTypeScale", 0.0),
+    ):
+        value = _first_prop(inst, prop)
+        scale[key] = float(value) if isinstance(value, (int, float)) else default
+    return {"body_colors": body_colors, "ids": ids, "scale": scale}
+
+
 def parse_rbxm(data: bytes) -> Dict[str, Any]:
     """Parse a .rbxm buffer into a metadata dict mirroring the server export."""
     instances, roots = _parse_chunks(data)
@@ -2484,7 +3020,10 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
         if instance.class_name != "MaterialService":
             continue
         use_2022 = _first_prop(instance, "Use2022Materials")
-        meta["use_2022_materials"] = True if use_2022 is None else bool(use_2022)
+        # Only stamp the flag when the file DECLARES a material system;
+        # an absent MaterialService leaves the choice to the importer.
+        if use_2022 is not None:
+            meta["use_2022_materials"] = bool(use_2022)
         break
 
     for instance in instances.values():
@@ -2514,6 +3053,81 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
     if scene_rigs:
         meta["scene_rigs"] = scene_rigs
 
+    # Per-character clothing: a place can hold several characters, each with
+    # its OWN Shirt/Pants/HumanoidDescription.  Stamp every part entry with
+    # its model's clothing so the material bake never sees a neighbour's
+    # (the "bacon hair woman wearing the man's clothes" bug).
+    entry_by_ref = {
+        entry.get("inst_ref"): entry
+        for entry in meta["partAux"]
+        if entry.get("inst_ref") is not None
+    }
+    for entry in meta["partAux"]:
+        entry["_rbxm_clothing_scoped"] = True
+    if scene_rigs:
+        for rig in scene_rigs:
+            model_ref = rig.get("model_ref")
+            model = instances.get(model_ref) if isinstance(model_ref, int) else None
+            if model is None:
+                continue
+            shirt_template = None
+            pants_template = None
+            hd_data = None
+            stack = list(model.children)
+            while stack:
+                child = stack.pop()
+                if shirt_template is None and child.class_name == "Shirt":
+                    shirt_template = _content_to_str(
+                        _first_prop(child, "ShirtTemplate")
+                    ) or None
+                elif pants_template is None and child.class_name == "Pants":
+                    pants_template = _content_to_str(
+                        _first_prop(child, "PantsTemplate")
+                    ) or None
+                elif hd_data is None and child.class_name == "HumanoidDescription":
+                    hd_data = _humanoid_description_data(child)
+                stack.extend(child.children)
+            body_colors = (hd_data or {}).get("body_colors") or None
+            head_face_ref = None
+            head_face_transparency = 0.0
+            for ref in rig.get("part_refs") or []:
+                entry = entry_by_ref.get(ref)
+                if entry is None:
+                    continue
+                if shirt_template:
+                    entry["shirt_template"] = shirt_template
+                if pants_template:
+                    entry["pants_template"] = pants_template
+                if body_colors:
+                    entry["body_colors"] = body_colors
+                if (
+                    (entry.get("name") or "").strip().lower() == "head"
+                    and entry.get("class_name") == "Part"
+                ):
+                    face = entry.get("face_decal") or {}
+                    face_ref = face.get("texture") or entry.get("texture_id")
+                    if face_ref:
+                        head_face_ref = face_ref
+                        try:
+                            head_face_transparency = float(face.get("transparency") or 0.0)
+                        except (TypeError, ValueError):
+                            head_face_transparency = 0.0
+            if head_face_ref:
+                for ref in rig.get("part_refs") or []:
+                    entry = entry_by_ref.get(ref)
+                    if entry is None:
+                        continue
+                    entry["face_texture"] = head_face_ref
+                    entry["face_transparency"] = head_face_transparency
+            elif hd_data and hd_data.get("ids", {}).get("hd_face_id"):
+                for ref in rig.get("part_refs") or []:
+                    entry = entry_by_ref.get(ref)
+                    if entry is None:
+                        continue
+                    entry["face_texture"] = (
+                        f"rbxassetid://{hd_data['ids']['hd_face_id']}"
+                    )
+
     # Clothing templates (classic avatar shirt/pants). These are composited
     # onto body limbs by Roblox's renderer; capture the template ids so the
     # importer can reconstruct the look.
@@ -2533,47 +3147,13 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
     for inst in instances.values():
         if inst.class_name != "HumanoidDescription":
             continue
-        body_colors = {}
-        for key, prop in (
-            ("head", "HeadColor3"),
-            ("torso", "TorsoColor3"),
-            ("left_arm", "LeftArmColor3"),
-            ("right_arm", "RightArmColor3"),
-            ("left_leg", "LeftLegColor3"),
-            ("right_leg", "RightLegColor3"),
-        ):
-            color = _first_prop(inst, prop)
-            if isinstance(color, (list, tuple)) and len(color) >= 3:
-                # Legacy saves store Color3uint8 (0-255); modern saves write
-                # float Color3 (0-1). Normalize to 0-1 either way.
-                if any(float(component) > 1.0 for component in color[:3]):
-                    color = [float(component) / 255.0 for component in color[:3]]
-                body_colors[key] = [float(color[0]), float(color[1]), float(color[2])]
+        hd_data = _humanoid_description_data(inst)
+        body_colors = hd_data["body_colors"]
         if body_colors:
             meta["hd_body_colors"] = body_colors
-        for key, prop in (
-            ("hd_shirt_id", "Shirt"),
-            ("hd_pants_id", "Pants"),
-            ("hd_graphic_tshirt_id", "GraphicTShirt"),
-            ("hd_face_id", "Face"),
-        ):
-            value = _first_prop(inst, prop)
-            if isinstance(value, (int, float)) and value > 0:
-                meta[key] = int(value)
-        scale = {}
-        # NB: the serialized property names carry a "Scale" suffix that the
-        # Lua API names (Height/Width/...) do not.
-        for key, prop, default in (
-            ("height", "HeightScale", 1.0),
-            ("width", "WidthScale", 1.0),
-            ("depth", "DepthScale", 1.0),
-            ("head", "HeadScale", 1.0),
-            ("proportion", "ProportionScale", 0.0),
-            ("body_type", "BodyTypeScale", 0.0),
-        ):
-            value = _first_prop(inst, prop)
-            scale[key] = float(value) if isinstance(value, (int, float)) else default
-        meta["hd_scale"] = scale
+        for key, value in hd_data["ids"].items():
+            meta[key] = value
+        meta["hd_scale"] = hd_data["scale"]
         break
 
     # Classic characters keep their body colors in a BodyColors instance

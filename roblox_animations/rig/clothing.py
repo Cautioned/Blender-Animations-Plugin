@@ -136,7 +136,9 @@ def resolve_clothing_template_id(asset_id) -> Optional[str]:
             location = response.headers.get("Location")
             locations = [location] if location else _extract_locations_from_payload(data)
             if locations:
-                payload = _fetch_url_bytes(locations[0])
+                # Clothing asset (rbxm/xml), not a mesh: the version-marker
+                # trim in the mesh normalizer must not run on it.
+                payload = _fetch_url_bytes(locations[0], trim_mesh_header=False)
             else:
                 payload = data
             if payload:
@@ -427,6 +429,29 @@ _CLOTHING_CONTEXT = {
 }
 
 _BAKE_CACHE: Dict[str, object] = {}
+
+
+def _context_cache_tag() -> tuple:
+    """Content identity of the active clothing context.
+
+    Bake caches key off this tag so two characters can NEVER share a baked
+    limb image even when their bakes interleave (the woman wearing the
+    man's clothes bug)."""
+    body_colors = _CLOTHING_CONTEXT.get("body_colors") or {}
+    color_items = tuple(
+        sorted(
+            (str(key), tuple(round(float(component), 5) for component in value)
+             if isinstance(value, (list, tuple)) else str(value))
+            for key, value in body_colors.items()
+        )
+    )
+    return (
+        _CLOTHING_CONTEXT.get("shirt_template"),
+        _CLOTHING_CONTEXT.get("pants_template"),
+        _CLOTHING_CONTEXT.get("face_texture"),
+        _CLOTHING_CONTEXT.get("face_transparency"),
+        color_items,
+    )
 
 
 def set_clothing_context(shirt_template=None, pants_template=None, face_texture=None, body_colors=None, face_transparency=None):
@@ -880,21 +905,14 @@ def _write_image_pixels(image, buf):
 
 
 def _new_bake_image(name: str, w: int, h: int):
-    """Create (or recycle) the baked clothing image datablock.
+    """Create a fresh baked clothing image datablock.
 
-    Reusing the same name across imports avoids an unbounded trail of
-    .001/.002 copies; when dimensions change the old image is removed and
-    recreated."""
+    NEVER reuse an existing datablock by name: two characters' limb bakes
+    share a label ("rbx_cloth_torso") and reusing it would overwrite one
+    character's pixels with the other's.  Blender suffixes duplicates; old
+    images without users get purged between imports."""
     import bpy
 
-    existing = bpy.data.images.get(name)
-    if existing is not None:
-        if int(existing.size[0]) == w and int(existing.size[1]) == h:
-            return existing
-        try:
-            bpy.data.images.remove(existing)
-        except Exception:
-            pass
     return bpy.data.images.new(name, width=w, height=h, alpha=False)
 
 
@@ -903,7 +921,12 @@ def _bake_group_image(group: str, body_rgba):
     from . import textures
 
     def provider(ref):
-        image = textures.fetch_texture_image(ref, name=f"cloth_{group}")
+        # The bake is a synchronous dependency of the material build: a
+        # deferred fetch would skip the clothing layer entirely (place
+        # imports build sync meshes inside a defer window).
+        image = textures.fetch_texture_image(
+            ref, name=f"cloth_{group}", ignore_defer=True
+        )
         if image is None:
             print(f"[RbxClothing] fetch_texture_image returned None for {ref!r}")
             return None
@@ -1102,7 +1125,11 @@ def _bake_r6_limb_image(limb: str, body_rgba):
     from . import textures
 
     def provider(ref):
-        image = textures.fetch_texture_image(ref, name=f"cloth_r6_{limb}")
+        # Synchronous bake dependency — must not honor deferred loading
+        # (see _bake_group_image).
+        image = textures.fetch_texture_image(
+            ref, name=f"cloth_r6_{limb}", ignore_defer=True
+        )
         if image is None:
             print(f"[RbxClothing] fetch_texture_image returned None for {ref!r}")
             return None
@@ -1230,7 +1257,11 @@ def _bake_head_image(body_rgba, tint_ref=None):
     from . import textures
 
     def provider(ref):
-        image = textures.fetch_texture_image(ref, name="cloth_head")
+        # Synchronous bake dependency — must not honor deferred loading
+        # (see _bake_group_image).
+        image = textures.fetch_texture_image(
+            ref, name="cloth_head", ignore_defer=True
+        )
         if image is None:
             print(f"[RbxClothing] fetch_texture_image returned None for {ref!r}")
             return None
@@ -1288,14 +1319,15 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
     if _is_head(part_name):
         if not clothing_available() and not tint_ref:
             return None
-        if "head" in _BAKE_CACHE:
-            return _BAKE_CACHE["head"]
+        cache_key = ("head", tint_ref, _context_cache_tag())
+        if cache_key in _BAKE_CACHE:
+            return _BAKE_CACHE[cache_key]
         try:
             image = _bake_head_image(body_rgb, tint_ref=tint_ref)
         except Exception as exc:
             print(f"[RbxClothing] head bake failed: {exc}")
             image = None
-        _BAKE_CACHE["head"] = image
+        _BAKE_CACHE[cache_key] = image
         return image
 
     if not clothing_available():
@@ -1303,7 +1335,7 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
 
     r6_limb = _r6_limb(part_name)
     if r6_limb is not None:
-        cache_key = f"r6:{r6_limb}"
+        cache_key = ("r6", r6_limb, _context_cache_tag())
         if cache_key in _BAKE_CACHE:
             return _BAKE_CACHE[cache_key]
         try:
@@ -1317,12 +1349,13 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
     group = _limb_group(part_name)
     if group is None:
         return None
-    if group in _BAKE_CACHE:
-        return _BAKE_CACHE[group]
+    cache_key = (group, _context_cache_tag())
+    if cache_key in _BAKE_CACHE:
+        return _BAKE_CACHE[cache_key]
     try:
         image = _bake_group_image(group, body_rgb)
     except Exception as exc:
         print(f"[RbxClothing] bake failed for '{group}': {exc}")
         image = None
-    _BAKE_CACHE[group] = image
+    _BAKE_CACHE[cache_key] = image
     return image

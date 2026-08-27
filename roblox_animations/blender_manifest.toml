@@ -2,8 +2,8 @@ schema_version = "1.0.0"
 
 # Roblox Animations Blender Addon Manifest
 id = "roblox_animations_importer_exporter"
-version = "3.0.0"
-name = "Roblox Animations Importer/Exporter"
+version = "3.0.1"
+name = "RBXMonkey - Roblox Importer/Exporter"
 tagline = "Seamless animation workflow between Blender and Roblox Studio"
 maintainer = "Cautioned"
 type = "add-on"

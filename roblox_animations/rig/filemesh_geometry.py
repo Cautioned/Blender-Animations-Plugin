@@ -95,7 +95,8 @@ def _normalize_wrap_auto_skin(value):
 
 
 def _build_transformed_filemesh_vertices(mesh_data, part_cf=None, part_size=None,
-                                         mesh_size=None, local_cf=None, limb_scale=None):
+                                         mesh_size=None, local_cf=None, limb_scale=None,
+                                         entry=None):
     positions = mesh_data.get("positions") or []
     if not positions:
         return []
@@ -121,7 +122,25 @@ def _build_transformed_filemesh_vertices(mesh_data, part_cf=None, part_size=None
         normal_matrix = direction_matrix.inverted_safe().transposed()
     except Exception:
         normal_matrix = direction_matrix
-    scale = _compute_mesh_scale(part_size, mesh_size)
+    classic_head = bool(entry and entry.get("classic_head_mesh"))
+    if classic_head:
+        # Mirrors GeometryGenerator::getMeshScale for HEAD_MESH: the head
+        # mesh is baked at uniform 1.25, so the engine scales by
+        # (min(sx,sz), sy, min(sx,sz)) / 1.25 and extrudes the cylinder
+        # caps by ±0.625·(scaleY - scaleX) along Y.
+        size = list(entry.get("part_size") or (1.0, 2.0, 1.0))
+        special_scale = entry.get("_special_mesh_scale")
+        if special_scale and len(special_scale) == 3:
+            size = [
+                float(size[i]) * abs(float(special_scale[i])) for i in range(3)
+            ]
+        scale_xz = min(size[0], size[2]) / 1.25
+        scale_y = size[1] / 1.25
+        scale = [scale_xz, scale_y, scale_xz]
+        head_extrude = 0.625 * (scale_y - scale_xz)
+    else:
+        scale = _compute_mesh_scale(part_size, mesh_size)
+        head_extrude = 0.0
     if limb_scale is not None:
         scale = [scale[i] * float(limb_scale[i]) for i in range(3)]
     scale_x, scale_y, scale_z = scale
@@ -143,7 +162,16 @@ def _build_transformed_filemesh_vertices(mesh_data, part_cf=None, part_size=None
     m20, m21, m22, m23 = transform_matrix[2]
     for vertex_index, position in enumerate(positions):
         local_x = position[0] * scale_x
-        local_y = position[1] * scale_y
+        if classic_head:
+            # Caps scale by scaleX, the cylinder extrudes to keep the
+            # cumulative Y extents at 0.625 * scaleY.
+            local_y = (
+                position[1] * scale_xz + head_extrude
+                if position[1] > 0
+                else position[1] * scale_xz - head_extrude
+            )
+        else:
+            local_y = position[1] * scale_y
         local_z = position[2] * scale_z
         # Vector, not tuple: every downstream consumer (cage solver,
         # alignment, weight transfer) does Vector arithmetic on this.
@@ -203,6 +231,7 @@ def _compute_filemesh_world_positions(binding):
         part_size=entry.get("part_size"),
         mesh_size=_get_effective_mesh_size(entry, binding["mesh_data"]),
         limb_scale=avatar_scale.entry_limb_scale(entry),
+        entry=entry,
     )
     if not vertices:
         return None
@@ -210,7 +239,8 @@ def _compute_filemesh_world_positions(binding):
 
 
 def _build_transformed_filemesh_geometry(mesh_data, part_cf=None, part_size=None,
-                                         mesh_size=None, local_cf=None, limb_scale=None):
+                                         mesh_size=None, local_cf=None, limb_scale=None,
+                                         entry=None):
     vertices = _build_transformed_filemesh_vertices(
         mesh_data,
         part_cf=part_cf,
@@ -218,6 +248,7 @@ def _build_transformed_filemesh_geometry(mesh_data, part_cf=None, part_size=None
         mesh_size=mesh_size,
         local_cf=local_cf,
         limb_scale=limb_scale,
+        entry=entry,
     )
     if not vertices:
         return None, []

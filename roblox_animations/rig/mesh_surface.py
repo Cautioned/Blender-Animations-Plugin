@@ -22,6 +22,18 @@ def _set_mesh_smooth_shading(mesh):
             polygon.use_smooth = True
 
 
+def _set_mesh_flat_shading(mesh):
+    """Flat-shade every polygon (CSG unions: hard edges, winding normals)."""
+    polygons = getattr(mesh, "polygons", None)
+    if not polygons:
+        return
+    try:
+        polygons.foreach_set("use_smooth", [False] * len(polygons))
+    except Exception:
+        for polygon in polygons:
+            polygon.use_smooth = False
+
+
 def _bulk_set(attribute, name, values):
     """foreach_set with a list conversion fallback for older Blender builds."""
     try:
@@ -97,25 +109,20 @@ def _populate_mesh_geometry(mesh, positions, faces):
 
 
 def _apply_mesh_custom_normals(mesh, vertices):
-    # Blender 5.1's ``normals_split_custom_set`` access-violated on some very
-    # large FileMesh data (see Blender's mesh_normals_corner_custom_set).
-    # That is process-fatal and cannot be caught in Python.  With the strict
-    # finite-nonzero validation below it applies safely to normal-sized
-    # meshes (verified on 5.1.0); only pathological very-large meshes keep
-    # the derived-smooth-normals fallback.
-    if tuple(getattr(bpy.app, "version", (0, 0, 0))) >= (5, 1, 0):
-        if len(mesh.vertices) > 100_000:
-            return False
-    if not hasattr(mesh, "normals_split_custom_set_from_vertices") and not hasattr(mesh, "normals_split_custom_set"):
-        return False
+    """Custom corner normals via ``Mesh.corner_normals`` (Blender 4.1+).
+
+    The legacy ``normals_split_custom_set*`` APIs enter Blender's C
+    corner-normal bulk code, which access-violates process-fatally on some
+    systems (unrecoverable from Python — the "certain PCs crash" reports).
+    ``corner_normals.foreach_set`` is a plain RNA array write with no custom
+    C bulk operation, so it is the ONLY path used when available.  Pre-4.1
+    releases keep the legacy vertex API as a fallback.
+    """
     if not vertices or len(vertices) != len(mesh.vertices):
         return False
 
-    # ``normals_split_custom_set`` enters Blender's C mesh-normal code, where
-    # malformed source data can cause an access violation instead of a Python
-    # exception. FileMesh payloads are external, so reject anything other than
-    # a complete set of finite, non-zero vec3 normals before crossing that API
-    # boundary. Blender will derive safe normals from the mesh winding instead.
+    # FileMesh payloads are external: reject anything other than a complete
+    # set of finite, non-zero vec3 normals before writing either API.
     normals = []
     for vertex in vertices:
         normal = vertex.get("normal") if isinstance(vertex, dict) else None
@@ -135,19 +142,45 @@ def _apply_mesh_custom_normals(mesh, vertices):
         inverse_length = 1.0 / math.sqrt(length_squared)
         normals.append(tuple(component * inverse_length for component in normal))
 
-    try:
-        if hasattr(mesh, "use_auto_smooth"):
-            mesh.use_auto_smooth = True
-        if hasattr(mesh, "normals_split_custom_set"):
+    loop_count = len(mesh.loops)
+    corner_normals = getattr(mesh, "corner_normals", None)
+    if corner_normals is not None and loop_count:
+        try:
+            import numpy as np  # bundled with Blender
+
+            idx = np.empty(loop_count, dtype=np.int64)
+            mesh.loops.foreach_get("vertex_index", idx)
+            nrm = np.asarray(normals, dtype=np.float32)
+            flat = np.empty(loop_count * 3, dtype=np.float32)
+            flat[0::3] = nrm[idx][:, 0]
+            flat[1::3] = nrm[idx][:, 1]
+            flat[2::3] = nrm[idx][:, 2]
+            corner_normals.foreach_set("vector", flat)
+            return True
+        except Exception:
+            # Blender 3.6/4.0 expose corner_normals READ-ONLY: fall through
+            # to the legacy custom-normal APIs below instead of dropping
+            # the asset normals entirely.
+            pass
+
+    if hasattr(mesh, "use_auto_smooth"):
+        mesh.use_auto_smooth = True
+    if hasattr(mesh, "normals_split_custom_set_from_vertices"):
+        try:
+            mesh.normals_split_custom_set_from_vertices(normals)
+            return True
+        except Exception:
+            return False
+    if hasattr(mesh, "normals_split_custom_set"):
+        try:
             loop_normals = [normals[int(loop.vertex_index)] for loop in mesh.loops]
-            if len(loop_normals) != len(mesh.loops):
+            if len(loop_normals) != loop_count:
                 return False
             mesh.normals_split_custom_set(loop_normals)
-        else:
-            mesh.normals_split_custom_set_from_vertices(normals)
-        return True
-    except Exception:
-        return False
+            return True
+        except Exception:
+            return False
+    return False
 
 
 def _vertex_corner_value(vertices, vertex_index, key, default=None):
@@ -195,7 +228,13 @@ def _mesh_loop_uv_values(mesh, vertices, loop_uvs):
             import numpy as np  # bundled with Blender
 
             arr = np.asarray(loop_uvs[:loop_count], dtype=object)
-            valid = arr is not None
+            # ``arr is not None`` is a SCALAR check on the array object
+            # itself (always True), so flatnonzero(True) == [0] and only
+            # loop 0 kept its UV while every other face sampled the atlas
+            # corner — studs rendered as flat tinted colour.
+            valid = np.fromiter(
+                (uv is not None for uv in arr), dtype=bool, count=len(arr)
+            )
             uv_values = np.zeros(2 * loop_count, dtype=np.float32)
             filled = np.flatnonzero(valid)
             if filled.size:
@@ -228,7 +267,11 @@ def _mesh_loop_uv_values(mesh, vertices, loop_uvs):
         in_range = (idx_arr >= 0) & (idx_arr < len(vertex_uvs))
         clip = np.clip(idx_arr, 0, len(vertex_uvs) - 1)
         uva = np.asarray(vertex_uvs, dtype=object)
-        valid = in_range & (uva[clip] is not None)
+        # Same scalar-vs-elementwise trap as the loop_uvs branch above:
+        # ``uva[clip] is not None`` tests the array object, not the rows.
+        valid = in_range & np.fromiter(
+            (uv is not None for uv in uva[clip]), dtype=bool, count=loop_count
+        )
         uv_values = np.zeros(2 * loop_count, dtype=np.float32)
         filled = np.flatnonzero(valid)
         if filled.size:

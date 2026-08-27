@@ -40,6 +40,7 @@ from .mesh_surface import (
     _new_mesh_attribute,
     _new_mesh_color_attribute,
     _populate_mesh_geometry,
+    _set_mesh_flat_shading,
     _set_mesh_smooth_shading,
     _vertex_corner_value,
 )
@@ -558,6 +559,7 @@ def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, en
         vertices, faces = _build_transformed_filemesh_geometry(
             mesh_data, part_cf=entry.get("part_cf"), part_size=entry.get("part_size"),
             mesh_size=_get_effective_mesh_size(entry, mesh_data), local_cf=local_cf, limb_scale=limb_scale,
+            entry=entry,
         )
     if not vertices:
         return None
@@ -657,8 +659,24 @@ def _create_mesh_object_from_filemesh(parts_collection, part_name, mesh_data, en
         mesh_obj["RBXSynthesizedVertexColors"] = False
         mesh_obj["RBXSynthesizedTangents"] = False
     else:
+        # Embedded union (CSG) meshes are flat-shaded: Blender derives
+        # per-face normals from the triangle winding, which matches the
+        # file's stored normal ids.  Per-vertex custom normals would smear
+        # hard CSG edges at shared vertices.
+        embedded_union = bool(
+            isinstance(mesh_data, dict) and mesh_data.get("embedded_union")
+        )
         _configure_synthesized_mesh_surface(mesh_obj, vertices, mesh_data.get(
-            "loop_uvs"), apply_custom_normals=not skip_custom_normals)
+            "loop_uvs"),
+            apply_custom_normals=not skip_custom_normals and not embedded_union)
+        if embedded_union:
+            _set_mesh_flat_shading(mesh)
+        elif mesh_obj.get("RBXSynthesizedVertexColors") and isinstance(entry, dict):
+            # The FileMesh asset carries baked per-vertex colors (written to
+            # the mesh's RBXColor attribute); flag the entry so the material
+            # shader multiplies them into the tint chain instead of
+            # overwriting them with the flat part color.
+            entry["_mesh_vertex_colors"] = True
     _configure_synthesized_mesh_display(mesh_obj, entry)
     try:
         from .textures import apply_part_material
@@ -829,6 +847,7 @@ def _create_batched_filemesh_instances(parts_collection, batch_name, mesh_data, 
             part_cf=entry.get("part_cf"),
             part_size=entry.get("part_size"),
             mesh_size=_get_effective_mesh_size(entry, mesh_data),
+            entry=entry,
         )
         if not vertices:
             continue
