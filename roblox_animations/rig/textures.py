@@ -2074,21 +2074,24 @@ def _apply_builtin_material(material, principled, part_name, entry, builtin):
             principled.inputs["Emission Strength"].default_value = 2.0
             principled.inputs["Roughness"].default_value = 0.25
         elif name == "SmoothPlastic":
-            principled.inputs["Roughness"].default_value = 0.12
+            # Studio's smooth plastic reads nearly matte: a soft, broad
+            # highlight rather than a glossy mirror finish.  The old 0.12
+            # roughness + 0.5 specular made imported parts look wet.
+            principled.inputs["Roughness"].default_value = 0.4
             specular = (
                 principled.inputs.get("Specular IOR Level")
                 or principled.inputs.get("Specular")
             )
             if specular is not None:
-                specular.default_value = 0.5
+                specular.default_value = 0.2
     elif name == "SmoothPlastic":
-        principled.inputs["Roughness"].default_value = 0.12
+        principled.inputs["Roughness"].default_value = 0.4
         specular = (
             principled.inputs.get("Specular IOR Level")
             or principled.inputs.get("Specular")
         )
         if specular is not None:
-            specular.default_value = 0.5
+            specular.default_value = 0.2
 
     for ref, socket_name, location in (
         (normal_map, "Normal", (-400, -400)),
