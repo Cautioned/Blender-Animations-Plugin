@@ -416,14 +416,7 @@ def _corner_views(grid, cell_dims):
 
 
 def _surface_nets(xs, ys, zs, mats, occs, decimate):
-    """Shared surface-nets pass (port of Voxel2::Mesher).
-
-    One vertex per boundary cell, positioned along the cell's crossing
-    edges weighted by occupancy, quads between cells of differing
-    solidity.  Returns the full vertex/quad tables, the per-material face
-    chunks, and per-vertex material weights so both the legacy per-material
-    groups and the single splat mesh derive from one meshing pass.
-    """
+    """Surface-nets pass for a single dense region (see _surface_nets_core)."""
     import numpy as np
 
     if xs.size == 0:
@@ -431,6 +424,24 @@ def _surface_nets(xs, ys, zs, mats, occs, decimate):
     occ, mat, used, origin, step = _terrain_grid(
         xs, ys, zs, mats, occs, decimate
     )
+    return _surface_nets_core(occ, mat, used, origin, step)
+
+
+def _surface_nets_core(occ, mat, used, origin, step, face_filter=None):
+    """Shared surface-nets pass (port of Voxel2::Mesher).
+
+    One vertex per boundary cell, positioned along the cell's crossing
+    edges weighted by occupancy, quads between cells of differing
+    solidity.  Returns the full vertex/quad tables, the per-material face
+    chunks, and per-vertex material weights so both the legacy per-material
+    groups and the single splat mesh derive from one meshing pass.
+
+    ``face_filter`` (optional) receives the GLOBAL cell coordinate of each
+    candidate face's left cell and returns keep/drop; the chunked terrain
+    path uses it to assign boundary faces to exactly one chunk.
+    """
+    import numpy as np
+
     nx, ny, nz = occ.shape
     cx, cy, cz = nx - 1, ny - 1, nz - 1
     cell_size = float(step)
@@ -551,6 +562,21 @@ def _surface_nets(xs, ys, zs, mats, occs, decimate):
         nx_n = fi + 1
         ny_n = fj + 1
         nz_n = fk + 1
+        if face_filter is not None:
+            origin_arr = np.asarray(origin, dtype=np.int64)
+            keep_face = face_filter(
+                origin_arr[0] + nx_n - 1,
+                origin_arr[1] + ny_n - 1,
+                origin_arr[2] + nz_n - 1,
+            )
+            if not np.any(keep_face):
+                continue
+            fi = fi[keep_face]
+            fj = fj[keep_face]
+            fk = fk[keep_face]
+            nx_n = fi + 1
+            ny_n = fj + 1
+            nz_n = fk + 1
         quad = np.empty((fi.size, 4), dtype=np.int32)
         for corner_index, (ox, oy, oz) in enumerate(_FACE_CORNERS[axis]):
             quad[:, corner_index] = vertex_ids[nx_n + ox, ny_n + oy, nz_n + oz]
@@ -816,6 +842,116 @@ def terrain_mesh_groups(xs, ys, zs, mats, colors, voxel=_STUDS_PER_VOXEL, decima
     return groups
 
 
+def _terrain_chunked_groups(xs, ys, zs, mats, occs, colors, log2):
+    """Per-chunk surface nets for sparse maps too large for one dense grid.
+
+    Maps like freebuilds scatter material across a bounding box whose dense
+    representation would need tens of gigabytes.  Each 2^log2 chunk is
+    meshed independently with a one-cell overlap from its 26 neighbours;
+    boundary faces are assigned to the chunk owning the face's left cell,
+    so no face is duplicated and none is lost.  Returns legacy-style
+    per-material groups (material, verts, quads, normals, color).
+    """
+    import numpy as np
+
+    size = 1 << log2
+    cx = np.floor_divide(xs, size).astype(np.int64)
+    cy = np.floor_divide(ys, size).astype(np.int64)
+    cz = np.floor_divide(zs, size).astype(np.int64)
+    key = ((cx & 0x1FFFFF) << 42) | ((cy & 0x1FFFFF) << 21) | (cz & 0x1FFFFF)
+    order = np.argsort(key, kind="stable")
+    del cx, cy, cz
+    xs_s = xs[order]
+    ys_s = ys[order]
+    zs_s = zs[order]
+    mats_s = mats[order]
+    occs_s = occs[order]
+    key_s = key[order]
+    del xs, ys, zs, mats, occs, order, key
+    unique_keys, run_starts = np.unique(key_s, return_index=True)
+    run_ends = np.append(run_starts[1:], key_s.size)
+    del key_s
+    total_runs = int(run_ends.size)
+
+    merged_verts = {}
+    merged_normals = {}
+    merged_quads = {}
+    base = {}
+
+    for run_index in range(total_runs):
+        if run_index and run_index % 500 == 0:
+            print(f"[Terrain] chunked meshing {run_index}/{total_runs} chunks...")
+        packed = int(unique_keys[run_index])
+        raw = ((packed >> 42) & 0x1FFFFF, (packed >> 21) & 0x1FFFFF, packed & 0x1FFFFF)
+        chunk = tuple(int(v - (1 << 21)) if v >= (1 << 20) else int(v) for v in raw)
+        slices = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    neighbor = (
+                        ((chunk[0] + dx) & 0x1FFFFF) << 42
+                    ) | (
+                        ((chunk[1] + dy) & 0x1FFFFF) << 21
+                    ) | ((chunk[2] + dz) & 0x1FFFFF)
+                    j = np.searchsorted(unique_keys, neighbor)
+                    if j < total_runs and int(unique_keys[j]) == neighbor:
+                        slices.append((int(run_starts[j]), int(run_ends[j])))
+        if not slices:
+            continue
+        sel = np.concatenate([
+            np.arange(start, stop, dtype=np.int64)
+            for start, stop in slices
+        ])
+        occ, mat, used, origin, step = _terrain_grid(
+            xs_s[sel], ys_s[sel], zs_s[sel], mats_s[sel], occs_s[sel], 0
+        )
+
+        def keep(gx0, gy0, gz0):
+            return (
+                (np.floor_divide(gx0, size) == chunk[0])
+                & (np.floor_divide(gy0, size) == chunk[1])
+                & (np.floor_divide(gz0, size) == chunk[2])
+            )
+
+        core = _surface_nets_core(
+            occ, mat, used, origin, step, face_filter=keep
+        )
+        if core is None:
+            continue
+        vertex_count = core["vertex_count"]
+        for material in used:
+            chunks = core["face_slots"].get(material)
+            if not chunks:
+                continue
+            quads = np.concatenate(chunks, axis=0)
+            referenced = np.unique(quads)
+            remap = np.zeros(vertex_count, dtype=np.int32)
+            remap[referenced] = np.arange(referenced.size, dtype=np.int32)
+            offset = base.get(material, 0)
+            merged_quads.setdefault(material, []).append(
+                (remap[quads] + offset).astype(np.int32)
+            )
+            merged_verts.setdefault(material, []).append(
+                np.ascontiguousarray(core["verts"][referenced])
+            )
+            merged_normals.setdefault(material, []).append(
+                np.ascontiguousarray(core["normals"][referenced])
+            )
+            base[material] = offset + referenced.size
+
+    groups = []
+    for material, quad_list in merged_quads.items():
+        color = colors[material] if material < len(colors) else (0.8, 0.8, 0.8)
+        groups.append((
+            material,
+            np.concatenate(merged_verts[material], axis=0),
+            np.concatenate(quad_list, axis=0),
+            np.concatenate(merged_normals[material], axis=0),
+            color,
+        ))
+    return groups
+
+
 def prepare_terrain(terrain_meta):
     """Decode and mesh terrain without touching Blender RNA.
 
@@ -843,7 +979,29 @@ def prepare_terrain(terrain_meta):
     solid_count = int(xs.size)
     colors = decode_material_colors(colors_raw)
     try:
-        if smooth and blend:
+        log2 = int(smoothgrid[1]) if isinstance(smoothgrid, (bytes, bytearray)) else 5
+    except (IndexError, TypeError, ValueError):
+        log2 = 5
+    # The dense meshing path builds one grid over the material bounding box.
+    # Sparse freebuilds scatter cells across an enormous box, so estimate
+    # that box first and fall back to per-chunk meshing when it would not
+    # fit in memory.
+    dense_total = (
+        int(xs.max() - xs.min() + 3)
+        * int(ys.max() - ys.min() + 3)
+        * int(zs.max() - zs.min() + 3)
+    )
+    try:
+        if smooth and dense_total > 512 * 1024 * 1024:
+            print(
+                f"[Terrain] Sparse map ({solid_count} cells over "
+                f"{dense_total} bounding cells); meshing per chunk."
+            )
+            splat = None
+            groups = _terrain_chunked_groups(
+                xs, ys, zs, mats, occs, colors, log2
+            )
+        elif smooth and blend:
             splat, water_group = terrain_smooth_mesh_splat(
                 xs, ys, zs, mats, occs, colors, decimate=decimate
             )

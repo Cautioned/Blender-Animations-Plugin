@@ -14,6 +14,7 @@ except ModuleNotFoundError:
 from ..animation.face_controls import (
     face_control_property_name,
     grouped_face_controls,
+    facs_sliders_drive_armature,
     load_facs_payload_from_armature,
 )
 from ..animation.serialization import is_deform_bone_rig
@@ -153,7 +154,7 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                 icon="LINKED",
             )
         else:
-            account_box.label(text="Not logged in, required for deform/skinned rigs.", icon="INFO")
+            account_box.label(text="Log in before importing Roblox models or places.", icon="INFO")
             account_box.operator(
                 "rbx.oauth_login",
                 text="Log In to Roblox",
@@ -424,13 +425,20 @@ class OBJECT_PT_RbxAnimations(bpy.types.Panel):
                 emboss=False,
                 icon="TRIA_DOWN" if settings.rbx_face_controls_expanded else "TRIA_RIGHT",
             )
+            face_props = selected_armature.rbx_face_controls
+            header.prop(face_props, "rbx_facs_eval_mode", text="")
             if settings.rbx_face_controls_expanded:
-                face_box.label(text="sliders drive decoded facs pose solves", icon="INFO")
-                face_props = selected_armature.rbx_face_controls
+                sliders_active = facs_sliders_drive_armature(selected_armature)
+                if not sliders_active:
+                    face_box.label(
+                        text="Choose Sliders to edit the face.",
+                        icon="INFO",
+                    )
                 for group_label, control_names in facs_groups:
                     group_box = face_box.box()
                     group_box.label(text=group_label)
                     group_col = group_box.column(align=True)
+                    group_col.enabled = sliders_active
                     for control_name in control_names:
                         group_col.prop(
                             face_props,

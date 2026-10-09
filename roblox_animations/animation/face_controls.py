@@ -16,6 +16,12 @@ FACE_DEFORM_BONE_PROP = "rbx_face_deform_bone"
 FACE_FACS_DATA_PROP = "rbx_facs_data_json"
 FACE_FACS_CONTROLS_PROP = "rbx_facs_controls_json"
 FACE_FACS_UI_SYNC_PROP = "_rbx_facs_ui_syncing"
+FACE_EVAL_MODE_PROP = "rbx_facs_eval_mode"
+FACE_EVAL_MODE_AUTO = "AUTO"
+FACE_EVAL_MODE_SLIDERS = "SLIDERS"
+FACE_EVAL_MODE_BAKED = "BAKED"
+
+_FACE_BONE_FCURVE_PATH_RE = re.compile(r'^pose\.bones\["([^"]+)"\]')
 
 _FACS_ARMATURE_RUNTIME_CACHE = {}
 _FACS_ACTIVE_ARMATURES = {}
@@ -203,6 +209,7 @@ def _apply_runtime_solution(
     state_signature: tuple[float, ...],
     persist_state: bool = True,
     apply_token=None,
+    write_pose: bool = True,
 ) -> dict:
     if (
         runtime_entry.get("last_signature") == state_signature
@@ -217,7 +224,7 @@ def _apply_runtime_solution(
         solved = _solve_runtime_facs_bone_transforms(runtime, pose_weights)
     pose = getattr(armature_obj, "pose", None)
     pose_bones = getattr(pose, "bones", None)
-    if pose_bones is not None:
+    if write_pose and pose_bones is not None:
         for bone_name in payload.get("face_bone_names") or []:
             pose_bone = pose_bones.get(bone_name)
             if pose_bone is None:
@@ -661,6 +668,127 @@ def apply_facs_snapshot_to_armature(armature_obj, control_state=None, payload=No
     )
 
 
+def _facs_eval_mode_for_armature(armature_obj) -> str:
+    control_holder = getattr(armature_obj, "rbx_face_controls", None)
+    if control_holder is not None:
+        try:
+            mode = getattr(control_holder, FACE_EVAL_MODE_PROP, None)
+        except Exception:
+            mode = None
+        if mode in (FACE_EVAL_MODE_AUTO, FACE_EVAL_MODE_SLIDERS, FACE_EVAL_MODE_BAKED):
+            return mode
+    return FACE_EVAL_MODE_AUTO
+
+
+def _facs_detection_fcurves(action, animation_data=None, strip=None):
+    if action is None:
+        return ()
+    slot = None
+    if strip is not None:
+        slot = getattr(strip, "action_slot", None)
+    try:
+        from ..core.utils import get_action_fcurves, get_animation_data_action_slot
+
+        if slot is None and animation_data is not None:
+            slot = get_animation_data_action_slot(animation_data, action=action)
+        return get_action_fcurves(action, slot=slot)
+    except Exception:
+        return getattr(action, "fcurves", None) or ()
+
+
+def _action_drives_face_bones(action, face_bone_names, animation_data=None, strip=None) -> bool:
+    if action is None or not face_bone_names:
+        return False
+    for fcurve in _facs_detection_fcurves(action, animation_data, strip):
+        data_path = getattr(fcurve, "data_path", "") or ""
+        if not data_path.startswith('pose.bones["'):
+            continue
+        match = _FACE_BONE_FCURVE_PATH_RE.match(data_path)
+        if match is None or match.group(1) not in face_bone_names:
+            continue
+        try:
+            if len(getattr(fcurve, "keyframe_points", ())) == 0:
+                continue
+        except Exception:
+            continue
+        return True
+    return False
+
+
+def _drivers_drive_face_bones(animation_data, face_bone_names) -> bool:
+    if animation_data is None or not face_bone_names:
+        return False
+    for fcurve in getattr(animation_data, "drivers", None) or ():
+        data_path = getattr(fcurve, "data_path", "") or ""
+        if not data_path.startswith('pose.bones["'):
+            continue
+        match = _FACE_BONE_FCURVE_PATH_RE.match(data_path)
+        if match is not None and match.group(1) in face_bone_names:
+            return True
+    return False
+
+
+def face_bone_animation_active(armature_obj, payload=None) -> bool:
+    """Return True when keyframes/drivers drive any decoded facs face bone."""
+    if armature_obj is None:
+        return False
+    if payload is None:
+        runtime_entry = _get_armature_facs_runtime(armature_obj)
+        if not runtime_entry:
+            return False
+        payload = runtime_entry["payload"]
+    face_bone_names = set(payload.get("face_bone_names") or [])
+    if not face_bone_names:
+        return False
+
+    animation_data = getattr(armature_obj, "animation_data", None)
+    if animation_data is None:
+        return False
+
+    if _drivers_drive_face_bones(animation_data, face_bone_names):
+        return True
+    if _action_drives_face_bones(
+        getattr(animation_data, "action", None),
+        face_bone_names,
+        animation_data,
+    ):
+        return True
+    if getattr(animation_data, "use_nla", False):
+        for track in getattr(animation_data, "nla_tracks", None) or ():
+            if getattr(track, "mute", False):
+                continue
+            for strip in getattr(track, "strips", None) or ():
+                if getattr(strip, "mute", False):
+                    continue
+                if _action_drives_face_bones(
+                    getattr(strip, "action", None),
+                    face_bone_names,
+                    animation_data,
+                    strip,
+                ):
+                    return True
+    return False
+
+
+def facs_sliders_drive_armature(armature_obj, runtime_entry=None) -> bool:
+    """Resolve the armature's facs evaluation mode to a boolean.
+
+    True means slider state may be written to face bones; False means
+    baked animation owns the face bones and slider writes must not happen.
+    """
+    mode = _facs_eval_mode_for_armature(armature_obj)
+    if mode == FACE_EVAL_MODE_SLIDERS:
+        return True
+    if mode == FACE_EVAL_MODE_BAKED:
+        return False
+
+    if runtime_entry is None:
+        runtime_entry = _get_armature_facs_runtime(armature_obj)
+    if not runtime_entry:
+        return True
+    return not face_bone_animation_active(armature_obj, runtime_entry["payload"])
+
+
 def apply_facs_properties_to_armature(
     armature_obj,
     payload=None,
@@ -684,6 +812,7 @@ def apply_facs_properties_to_armature(
         state_signature,
         persist_state=persist_state,
         apply_token=apply_token,
+        write_pose=facs_sliders_drive_armature(armature_obj, runtime_entry=runtime_entry),
     )
 
 

@@ -248,7 +248,7 @@ class TestRigBoneLoading(unittest.TestCase):
 
         self.assertIn("Root", armature_obj.data.edit_bones)
 
-    def test_load_rigbone_preserves_deform_axes_without_nice_reorientation(self):
+    def test_load_rigbone_records_deform_axis_compensation(self):
         bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
         armature_obj = bpy.context.object
 
@@ -303,13 +303,18 @@ class TestRigBoneLoading(unittest.TestCase):
 
         child_bone = armature_obj.data.edit_bones["Child"]
         nicetransform = creation.Matrix(child_bone["nicetransform"])
+        self.assertLess(
+            (child_bone.tail - armature_obj.data.edit_bones["Grandchild"].head).length,
+            0.0001,
+        )
+        restored = child_bone.matrix @ nicetransform.inverted()
+        expected_rest = constants.get_transform_to_blender() @ utils.cf_to_mat(child_node["transform"])
 
         for row_index in range(4):
             for col_index in range(4):
-                expected = 1.0 if row_index == col_index else 0.0
                 self.assertAlmostEqual(
-                    nicetransform[row_index][col_index],
-                    expected,
+                    restored[row_index][col_index],
+                    expected_rest[row_index][col_index],
                     places=4,
                 )
 

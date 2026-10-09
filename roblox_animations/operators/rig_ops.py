@@ -10,6 +10,7 @@ from ..core.utils import (
     pose_bone_set_selected,
     iter_scene_objects,
     get_object_by_name,
+    find_master_collection_for_object,
 )
 
 
@@ -92,67 +93,27 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
             for obj in iter_scene_objects(context.scene)
         )
 
-    def create_rig_meta_from_armature(self, armature_obj):
-        """Create a temporary rig meta object from an armature with Motor6D properties"""
-        # Find the root bone (bone with no parent) or first bone with Motor6D properties
-        root_bone_name = None
-        for bone in armature_obj.data.bones:
-            if not bone.parent and (
-                "transform" in bone and "transform1" in bone and "nicetransform" in bone
-            ):
-                root_bone_name = bone.name
-                break
-
-        # Fallback to first bone if no root found
-        if not root_bone_name and armature_obj.data.bones:
-            root_bone_name = armature_obj.data.bones[0].name
-
-        # Generate a basic rig structure based on the armature
-        rig_structure = {
-            "rigName": armature_obj.name.replace("__", "").replace("_Armature", "").replace(
-                "Armature", ""
-            ),
-            "rig": {
-                "jname": root_bone_name or "RootPart",
-                "transform": [
-                    1,
-                    0,
-                    0,
-                    0,
-                    0,
-                    1,
-                    0,
-                    0,
-                    0,
-                    0,
-                    1,
-                    0,
-                    0,
-                    0,
-                    0,
-                    1,
-                ],  # Identity matrix
-                "jointtransform0": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-                "jointtransform1": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-                "aux": [root_bone_name or "RootPart"],
-                "children": [],
-            },
-        }
-
-        # Create temporary meta object
-        meta_obj_name = f"__{rig_structure['rigName']}Meta_Detected"
-        meta_obj = get_object_by_name(meta_obj_name, bpy.context.scene)
-        if meta_obj:
-            bpy.data.objects.remove(meta_obj, do_unlink=True)
-
-        bpy.ops.object.add(type="EMPTY", location=(0, 0, 0))
-        temp_meta = bpy.context.object
-        temp_meta.name = meta_obj_name
-        temp_meta["RigMeta"] = str(rig_structure).replace(
-            "'", '"'
-        )  # Convert to JSON-like string
-
-        return meta_obj_name
+    def resolve_rig_meta_from_armature(self, armature_obj):
+        """Use the import's complete metadata, including skin and part bindings."""
+        master = find_master_collection_for_object(armature_obj)
+        if master:
+            candidates = [
+                obj for obj in master.all_objects
+                if "RigMeta" in obj
+                and find_master_collection_for_object(obj) == master
+            ]
+            source_name = armature_obj.get("rbx_rig_meta_name")
+            for candidate in candidates:
+                if candidate.name == source_name:
+                    return candidate.name
+            # Older imports have no source tag. Their owning collection still
+            # identifies the metadata without guessing from object names.
+            if len(candidates) == 1:
+                return candidates[0].name
+        raise ValueError(
+            "Original rig metadata could not be identified. Reimport the Roblox "
+            "model before rebuilding this armature."
+        )
 
     def execute(self, context):
         try:
@@ -170,13 +131,8 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
                     for bone in selected_obj.data.bones
                 )
             ):
-                # New case: armature with Motor6D properties
-                meta_obj_name = self.create_rig_meta_from_armature(selected_obj)
-                create_rig(self.pr_rigging_type, meta_obj_name)
-                # Clean up temporary meta object
-                meta_obj = get_object_by_name(meta_obj_name, bpy.context.scene)
-                if meta_obj:
-                    bpy.data.objects.remove(meta_obj, do_unlink=True)
+                meta_obj_name = self.resolve_rig_meta_from_armature(selected_obj)
+                create_rig(self.pr_rigging_type, meta_obj_name, target_armature=selected_obj)
                 self.report(
                     {"INFO"},
                     f"Rig rebuilt from detected armature {self.pr_rig_meta_name}.",
@@ -215,6 +171,9 @@ class OBJECT_OT_GenRig(bpy.types.Operator):
                 item = (obj.name, display_name, "Detected via Motor6D properties")
                 OBJECT_OT_GenRig.rig_meta_items_cache.append(item)
 
+        active = context.active_object
+        if active and any(item[0] == active.name for item in self.rig_meta_items_cache):
+            self.pr_rig_meta_name = active.name
         return wm.invoke_props_dialog(self)
 
 
@@ -1019,15 +978,66 @@ class OBJECT_OT_ToggleWeldBones(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _worldspace_dependencies(ao):
+    """Objects whose animation can affect this armature."""
+    seen, pending = set(), [ao]
+    while pending:
+        obj = pending.pop()
+        if obj in seen:
+            continue
+        seen.add(obj)
+        if obj.parent:
+            pending.append(obj.parent)
+        yield obj
+        constraints = list(obj.constraints)
+        if obj.type == 'ARMATURE':
+            constraints.extend(c for pb in obj.pose.bones for c in pb.constraints)
+        for constraint in constraints:
+            for attr in ('target', 'pole_target'):
+                target = getattr(constraint, attr, None)
+                if target:
+                    pending.append(target)
+            pending.extend(item.target for item in getattr(constraint, 'targets', ()) if item.target)
+
 def _get_action_frame_range(ao):
-    """Return (start, end) frame range from the action, or scene range as fallback."""
-    action = ao.animation_data and ao.animation_data.action
-    if action:
-        # action.frame_range gives the range covering all fcurves
-        r = action.frame_range
-        return int(r[0]), int(r[1])
+    """Include animation on constraint targets and NLA strip scene ranges."""
+    import math
+    ranges = []
+    for obj in _worldspace_dependencies(ao):
+        animation = obj.animation_data
+        if not animation:
+            continue
+        if animation.action:
+            ranges.append(tuple(animation.action.frame_range))
+        for track in animation.nla_tracks:
+            if not track.mute:
+                ranges.extend((strip.frame_start, strip.frame_end) for strip in track.strips if not strip.mute)
+    if ranges:
+        return math.floor(min(r[0] for r in ranges)), math.ceil(max(r[1] for r in ranges))
     scene = bpy.context.scene
     return scene.frame_start, scene.frame_end
+
+
+def _worldspace_sample_frames(ao, start, end, substeps):
+    from ..core.utils import get_action_fcurves
+    frames = {tick / substeps for tick in range(start * substeps, end * substeps + 1)}
+    if substeps > 1:
+        for obj in _worldspace_dependencies(ao):
+            animation = obj.animation_data
+            if not animation or not animation.action:
+                continue
+            for curve in get_action_fcurves(animation.action, slot=getattr(animation, 'action_slot', None)):
+                previous = None
+                for point in curve.keyframe_points:
+                    frame = float(point.co.x)
+                    if start <= frame <= end:
+                        frames.add(frame)
+                        if previous and previous.interpolation == 'CONSTANT' and frame > start:
+                            # Keep a hold up to the discontinuity instead of
+                            # turning it into a quarter-frame linear ramp.
+                            frames.add(max(start, frame - 0.02))
+                    previous = point
+    return sorted(frames)
 
 
 def _has_any_keys(ao, bone_names):
@@ -1046,25 +1056,34 @@ def _has_any_keys(ao, bone_names):
     return False
 
 
-def _sample_world_matrices(ao, bone_names, frame_start, frame_end):
-    """Sample world-space matrices for bones at EVERY frame in range.
+def _sample_world_matrices(ao, bone_names, frame_start, frame_end, substeps=1):
+    """Sample evaluated armature-space matrices, including hidden controls."""
+    from ..core.evaluation import rig_evaluation_context
 
-    Sampling every frame (not just keyed frames) avoids interpolation drift
-    and handles bones that have no keys but move via parent inheritance.
-    Returns {name: {frame: Matrix}}.
-    """
     scene = bpy.context.scene
     result = {n: {} for n in bone_names}
-    orig_frame = scene.frame_current
-    for f in range(frame_start, frame_end + 1):
-        scene.frame_set(f)
-        bpy.context.view_layer.update()
-        for name in bone_names:
-            pb = ao.pose.bones.get(name)
-            if pb:
-                result[name][f] = pb.matrix.copy()
-    scene.frame_set(orig_frame)
+    orig_frame, orig_subframe = scene.frame_current, scene.frame_subframe
+    try:
+        with rig_evaluation_context(ao):
+            for f in _worldspace_sample_frames(ao, frame_start, frame_end, substeps):
+                scene.frame_set(int(f // 1), subframe=f % 1)
+                bpy.context.view_layer.update()
+                evaluated = ao.evaluated_get(bpy.context.evaluated_depsgraph_get())
+                for name in bone_names:
+                    pb = evaluated.pose.bones.get(name)
+                    if pb:
+                        result[name][f] = pb.matrix.copy()
+    finally:
+        scene.frame_set(orig_frame, subframe=orig_subframe)
     return result
+
+
+def _bone_transform_path(path, escaped_name):
+    return path in {
+        f'pose.bones["{escaped_name}"].{channel}'
+        for channel in ("location", "rotation_quaternion", "rotation_euler",
+                        "rotation_axis_angle", "scale")
+    }
 
 
 def _rotation_data_path(pb):
@@ -1089,13 +1108,13 @@ def _clear_bone_fcurves(ao, bone_names):
     if not action:
         return
     from ..core.utils import get_action_fcurves
-    fcurves = get_action_fcurves(action)
+    fcurves = get_action_fcurves(action, slot=getattr(ao.animation_data, "action_slot", None))
     escaped = {n: bpy.utils.escape_identifier(n) for n in bone_names}
     to_remove = []
     for fc in fcurves:
         dp = getattr(fc, "data_path", "")
         for name, esc in escaped.items():
-            if dp.startswith(f'pose.bones["{esc}"]'):
+            if _bone_transform_path(dp, esc):
                 to_remove.append(fc)
                 break
     for fc in reversed(to_remove):
@@ -1112,22 +1131,30 @@ def _snapshot_bone_fcurves(ao, bone_names):
     and easing — enough to perfectly reconstruct the original curves.
     Returns {bone_name: [{data_path, array_index, keyframes: [...]}]}.
     """
-    snapshot = {}
+    snapshot = {name: [] for name in bone_names}
     action = ao.animation_data and ao.animation_data.action
     if not action:
         return snapshot
     from ..core.utils import get_action_fcurves
-    fcurves = get_action_fcurves(action)
+    fcurves = get_action_fcurves(action, slot=getattr(ao.animation_data, "action_slot", None))
     escaped = {n: bpy.utils.escape_identifier(n) for n in bone_names}
     for fc in fcurves:
         dp = getattr(fc, "data_path", "")
         for name, esc in escaped.items():
-            if not dp.startswith(f'pose.bones["{esc}"]'):
+            if not _bone_transform_path(dp, esc):
                 continue
             curve_data = {
                 "data_path": dp,
                 "array_index": fc.array_index,
                 "keyframes": [],
+                "extrapolation": fc.extrapolation,
+                "modifiers": [
+                    {"type": modifier.type, "values": {
+                        prop.identifier: (list(getattr(modifier, prop.identifier)) if getattr(prop, "is_array", False) else getattr(modifier, prop.identifier))
+                        for prop in modifier.bl_rna.properties
+                        if not prop.is_readonly and prop.type in {'BOOLEAN', 'INT', 'FLOAT', 'STRING', 'ENUM'}
+                    }} for modifier in fc.modifiers
+                ],
             }
             for kp in fc.keyframe_points:
                 curve_data["keyframes"].append({
@@ -1138,6 +1165,9 @@ def _snapshot_bone_fcurves(ao, bone_names):
                     "easing": kp.easing,
                     "ht": kp.handle_left_type,
                     "hrt": kp.handle_right_type,
+                    "amplitude": kp.amplitude,
+                    "back": kp.back,
+                    "period": kp.period,
                 })
             snapshot.setdefault(name, []).append(curve_data)
             break
@@ -1154,43 +1184,19 @@ def _store_fcurve_snapshot(ao, snapshot, prop_name="worldspace_original_fcurves"
 
 
 def _fcurves_match_snapshot(ao, bone_name, prop_name):
-    """Check if a bone's current fcurves match a stored snapshot.
-
-    Compares keyframe count and values (to 4 decimal places) per-curve.
-    Returns True if unchanged, False if the user edited anything.
-    """
+    """Detect channel, handle, interpolation, and value edits."""
     import json
-    from ..core.utils import get_action_fcurves
-    data_bone = ao.data.bones.get(bone_name)
-    if not data_bone:
-        return False
-    raw = data_bone.get(prop_name)
-    if not raw:
+    raw = ao.data.bones[bone_name].get(prop_name)
+    if raw is None:
         return False
     try:
-        stored_curves = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+        stored = json.loads(raw)
+    except (ValueError, TypeError):
         return False
-
-    action = ao.animation_data and ao.animation_data.action
-    if not action:
-        return not stored_curves  # both empty = match
-
-    fcurves = get_action_fcurves(action)
-    for curve_data in stored_curves:
-        dp = curve_data["data_path"]
-        idx = curve_data["array_index"]
-        fc = fcurves.find(dp, index=idx)
-        if fc is None:
-            return False
-        stored_kfs = curve_data["keyframes"]
-        if len(fc.keyframe_points) != len(stored_kfs):
-            return False
-        for kp, skf in zip(fc.keyframe_points, stored_kfs):
-            if (round(kp.co.x, 4) != round(skf["co"][0], 4) or
-                    round(kp.co.y, 4) != round(skf["co"][1], 4)):
-                return False
-    return True
+    current = _snapshot_bone_fcurves(ao, [bone_name]).get(bone_name, [])
+    def key(curve):
+        return curve["data_path"], curve["array_index"]
+    return sorted(stored, key=key) == sorted(current, key=key)
 
 
 def _restore_fcurve_snapshot(ao, bone_names):
@@ -1217,7 +1223,7 @@ def _restore_fcurve_snapshot(ao, bone_names):
         except (json.JSONDecodeError, TypeError):
             continue
 
-        fcurves = get_action_fcurves(action)
+        fcurves = get_action_fcurves(action, slot=getattr(ao.animation_data, "action_slot", None))
         for curve_data in curves:
             dp = curve_data["data_path"]
             idx = curve_data["array_index"]
@@ -1231,6 +1237,14 @@ def _restore_fcurve_snapshot(ao, bone_names):
                 while len(fc.keyframe_points) > 0:
                     fc.keyframe_points.remove(fc.keyframe_points[0])
 
+            fc.extrapolation = curve_data.get("extrapolation", "CONSTANT")
+            for modifier in list(fc.modifiers):
+                fc.modifiers.remove(modifier)
+            for stored in curve_data.get("modifiers", []):
+                modifier = fc.modifiers.new(stored["type"])
+                for key, value in stored["values"].items():
+                    setattr(modifier, key, value)
+
             for kf in curve_data["keyframes"]:
                 kp = fc.keyframe_points.insert(kf["co"][0], kf["co"][1])
                 kp.handle_left_type = kf.get("ht", "AUTO_CLAMPED")
@@ -1239,6 +1253,9 @@ def _restore_fcurve_snapshot(ao, bone_names):
                 kp.handle_right = (kf["hr"][0], kf["hr"][1])
                 kp.interpolation = kf.get("interp", "BEZIER")
                 kp.easing = kf.get("easing", "AUTO")
+                for key in ("amplitude", "back", "period"):
+                    if key in kf:
+                        setattr(kp, key, kf[key])
 
             fc.update()
         restored_any = True
@@ -1247,37 +1264,59 @@ def _restore_fcurve_snapshot(ao, bone_names):
 
 
 def _rekey_bones_with_matrices(ao, world_mats):
-    """Write world matrices back as local transforms, inserting keyframes.
+    """Bake parent-first with explicit linear samples and continuous rotations."""
+    from ..core.evaluation import rig_evaluation_context
+    with rig_evaluation_context(ao):
+        if not ao.animation_data or not ao.animation_data.action:
+            name = next(iter(world_mats))
+            ao.pose.bones[name].keyframe_insert(data_path='location')
+        _clear_bone_fcurves(ao, set(world_mats))
+        scene = bpy.context.scene
+        orig_frame, orig_subframe = scene.frame_current, scene.frame_subframe
+        names = sorted(world_mats, key=lambda name: len(ao.data.bones[name].parent_recursive))
+        previous, channels = {}, {}
+        try:
+            for f in sorted({f for samples in world_mats.values() for f in samples}):
+                scene.frame_set(int(f // 1), subframe=f % 1)
+                bpy.context.view_layer.update()
+                for name in names:
+                    mat = world_mats[name].get(f)
+                    if mat is None:
+                        continue
+                    pb = ao.pose.bones[name]
+                    pb.matrix = mat
+                    if pb.rotation_mode == 'QUATERNION':
+                        rotation = pb.rotation_quaternion.copy()
+                        if name in previous:
+                            rotation.make_compatible(previous[name])
+                        pb.rotation_quaternion = rotation
+                        previous[name] = rotation
+                    elif pb.rotation_mode not in {'AXIS_ANGLE'}:
+                        rotation = pb.rotation_euler.copy()
+                        if name in previous:
+                            rotation.make_compatible(previous[name])
+                        pb.rotation_euler = rotation
+                        previous[name] = rotation
+                    for path in ('location', _rotation_data_path(pb), 'scale'):
+                        for index, value in enumerate(getattr(pb, path)):
+                            channels.setdefault((pb.path_from_id(path), index), []).append((f, value))
+                    bpy.context.view_layer.update()
+            from ..core.utils import get_action_fcurves
+            action = ao.animation_data.action
+            curves = get_action_fcurves(action, slot=getattr(ao.animation_data, "action_slot", None))
+            for (path, component), samples in channels.items():
+                fc = curves.new(path, index=component)
+                # Write the sampled channels without insertion-time merging.
+                # Hold guards stay outside Blender's 0.01-frame dedup tolerance.
+                fc.keyframe_points.add(len(samples))
+                for index, (point, sample) in enumerate(zip(fc.keyframe_points, samples)):
+                    point.co = sample
+                    near_step = index + 1 < len(samples) and 0 < samples[index + 1][0] - sample[0] <= 0.0201
+                    point.interpolation = 'CONSTANT' if near_step else 'LINEAR'
+                fc.update()
+        finally:
+            scene.frame_set(orig_frame, subframe=orig_subframe)
 
-    After hierarchy changes, setting pb.matrix = world_mat lets blender
-    decompose it into the correct local basis relative to the (new) parent.
-    Respects each bone's rotation mode (quaternion/euler/axis-angle).
-    """
-    # clear old fcurves first — stale keys downstream cause bad bezier
-    # handle auto-computation and visible glitches between frames
-    _clear_bone_fcurves(ao, set(world_mats.keys()))
-
-    scene = bpy.context.scene
-    orig_frame = scene.frame_current
-    all_frames = sorted({f for per_bone in world_mats.values() for f in per_bone})
-    for f in all_frames:
-        scene.frame_set(f)
-        bpy.context.view_layer.update()
-        for name, per_frame in world_mats.items():
-            mat = per_frame.get(f)
-            if mat is None:
-                continue
-            pb = ao.pose.bones.get(name)
-            if not pb:
-                continue
-            pb.matrix = mat
-            pb.keyframe_insert(data_path="location", frame=f)
-            pb.keyframe_insert(data_path=_rotation_data_path(pb), frame=f)
-            pb.keyframe_insert(data_path="scale", frame=f)
-    scene.frame_set(orig_frame)
-
-    # decimate the baked fcurves to remove redundant keys
-    _decimate_bone_fcurves(ao, set(world_mats.keys()))
 
 
 def _decimate_bone_fcurves(ao, bone_names, error_threshold=0.001):
@@ -1407,6 +1446,13 @@ class OBJECT_OT_WorldSpaceUnparent(bpy.types.Operator):
 
         bone_names = [t[0] for t in targets]
 
+        import json
+        for name in bone_names:
+            pb = ao.pose.bones[name]
+            pb.bone["worldspace_original_basis"] = [v for row in pb.matrix_basis for v in row]
+            pb.bone["worldspace_original_connected"] = pb.bone.use_connect
+            pb.bone["worldspace_constraints"] = json.dumps({c.name: c.mute for c in pb.constraints})
+
         # snapshot the original parent-local fcurves so reparent can
         # restore them losslessly, no matter how many round-trips
         fcurve_snapshot = _snapshot_bone_fcurves(ao, bone_names)
@@ -1415,7 +1461,11 @@ class OBJECT_OT_WorldSpaceUnparent(bpy.types.Operator):
         # this handles: bones with no keys (animated via parent), interpolation
         # drift, and ensures exact visual fidelity after hierarchy change.
         frame_start, frame_end = _get_action_frame_range(ao)
-        world_mats = _sample_world_matrices(ao, bone_names, frame_start, frame_end)
+        world_mats = _sample_world_matrices(ao, bone_names, frame_start, frame_end, substeps=4)
+
+        for name in bone_names:
+            for constraint in ao.pose.bones[name].constraints:
+                constraint.mute = True
 
         # switch to edit mode to do the actual unparent
         bpy.ops.object.mode_set(mode="EDIT")
@@ -1496,6 +1546,11 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
 
         bone_names = [t[0] for t in targets]
 
+        missing = [parent for _, parent in targets if parent not in amt.bones]
+        if missing:
+            self.report({'WARNING'}, "Cannot restore missing parent: " + ", ".join(sorted(set(missing))))
+            return {'CANCELLED'}
+
         # per-bone: detect if the user edited the world-space animation.
         # compare current fcurves against the baked snapshot from unparent.
         # edited bones → bake current world-space into parent-local (preserves edits).
@@ -1514,13 +1569,9 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
             else:
                 bones_edited.add(name)
 
-        # sample world matrices for edited bones BEFORE reparenting
-        world_mats = None
-        if bones_edited:
-            frame_start, frame_end = _get_action_frame_range(ao)
-            world_mats = _sample_world_matrices(
-                ao, list(bones_edited), frame_start, frame_end
-            )
+        frame_start, frame_end = _get_action_frame_range(ao)
+        all_world_mats = _sample_world_matrices(ao, bone_names, frame_start, frame_end, substeps=4)
+        world_mats = {name: all_world_mats[name] for name in bones_edited}
 
         bpy.ops.object.mode_set(mode="EDIT")
 
@@ -1530,19 +1581,57 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
             parent_edit = amt.edit_bones.get(parent_name)
             if edit_bone and parent_edit:
                 edit_bone.parent = parent_edit
-                edit_bone.use_connect = False
+                edit_bone.use_connect = bone_name in bones_lossless and bool(amt.bones[bone_name].get("worldspace_original_connected", False))
                 restored += 1
 
         bpy.ops.object.mode_set(mode="POSE")
+
+        import json
+        from mathutils import Matrix
+        for name in bones_lossless:
+            pb = ao.pose.bones[name]
+            basis = pb.bone.get("worldspace_original_basis")
+            if basis is not None:
+                pb.matrix_basis = Matrix([basis[i:i + 4] for i in range(0, 16, 4)])
+            for constraint_name, muted in json.loads(pb.bone.get("worldspace_constraints", "{}")).items():
+                constraint = pb.constraints.get(constraint_name)
+                if constraint:
+                    constraint.mute = muted
 
         # restore lossless bones from snapshot
         if bones_lossless:
             _clear_bone_fcurves(ao, bones_lossless)
             _restore_fcurve_snapshot(ao, list(bones_lossless))
 
+        # Unchanged child keys are not enough: a parent or proxy target may
+        # have changed. Keep the lossless restore only when its visual motion
+        # still matches the detached animation.
+        if bones_lossless:
+            restored_mats = _sample_world_matrices(ao, list(bones_lossless), frame_start, frame_end, substeps=4)
+            for name in list(bones_lossless):
+                if any(max(abs(restored_mats[name][f][r][c] - mat[r][c])
+                           for r in range(4) for c in range(4)) > 1e-4
+                       for f, mat in all_world_mats[name].items()):
+                    bones_lossless.remove(name)
+                    bones_edited.add(name)
+                    world_mats[name] = all_world_mats[name]
+                    for constraint in ao.pose.bones[name].constraints:
+                        constraint.mute = True
+
+        # A connected bone cannot keep an independently edited translation.
+        # Restore connection only on the genuinely lossless path.
+        if any(amt.bones[name].use_connect for name in bones_edited):
+            bpy.ops.object.mode_set(mode="EDIT")
+            for name in bones_edited:
+                amt.edit_bones[name].use_connect = False
+            bpy.ops.object.mode_set(mode="POSE")
+
         # bake edited bones from world-space matrices
         if world_mats:
             _rekey_bones_with_matrices(ao, world_mats)
+
+        if any(ao.pose.bones[name].constraints for name in bones_edited):
+            self.report({'INFO'}, "Kept constraints muted on edited bones to preserve their baked motion")
 
         # clear all custom props
         for bone_name, _ in targets:
@@ -1550,7 +1639,8 @@ class OBJECT_OT_WorldSpaceReparent(bpy.types.Operator):
             if data_bone:
                 for key in ("worldspace_bone", "worldspace_original_parent",
                             "worldspace_original_fcurves",
-                            "worldspace_baked_fcurves"):
+                            "worldspace_baked_fcurves", "worldspace_original_basis",
+                            "worldspace_original_connected", "worldspace_constraints"):
                     if key in data_bone:
                         del data_bone[key]
 

@@ -685,6 +685,7 @@ class TestFileMeshParsing(unittest.TestCase):
         # addon's bundled copy (no local Roblox install required).
         uris = [
             "rbxasset://fonts/head.mesh",
+            "rbxasset://fonts/sword.mesh",
             "rbxasset://fonts/torso.mesh",
             "rbxasset://fonts/leftarm.mesh",
             "rbxasset://fonts/rightarm.mesh",
@@ -701,6 +702,7 @@ class TestFileMeshParsing(unittest.TestCase):
             "rbxasset://avatar/compositing/CompositShirtTemplate.mesh",
             "rbxasset://avatar/compositing/CompositPantsTemplate.mesh",
             "rbxasset://textures/face.png",
+            "rbxasset://textures/SwordTexture.png",
         ]
         for uri in uris:
             path = filemesh._resolve_rbxasset_path(uri)

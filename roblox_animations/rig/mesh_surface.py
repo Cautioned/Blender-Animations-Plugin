@@ -109,14 +109,12 @@ def _populate_mesh_geometry(mesh, positions, faces):
 
 
 def _apply_mesh_custom_normals(mesh, vertices):
-    """Custom corner normals via ``Mesh.corner_normals`` (Blender 4.1+).
+    """Persist validated asset normals in Blender's custom-normal storage.
 
-    The legacy ``normals_split_custom_set*`` APIs enter Blender's C
-    corner-normal bulk code, which access-violates process-fatally on some
-    systems (unrecoverable from Python — the "certain PCs crash" reports).
-    ``corner_normals.foreach_set`` is a plain RNA array write with no custom
-    C bulk operation, so it is the ONLY path used when available.  Pre-4.1
-    releases keep the legacy vertex API as a fallback.
+    ``corner_normals`` exposes calculated normals, not custom-normal storage.
+    Writing its RNA vectors can appear to succeed without creating custom
+    normals, and the next mesh update discards the values (including 5.2).
+    Use the supported setters after validating all external normal data.
     """
     if not vertices or len(vertices) != len(mesh.vertices):
         return False
@@ -143,32 +141,15 @@ def _apply_mesh_custom_normals(mesh, vertices):
         normals.append(tuple(component * inverse_length for component in normal))
 
     loop_count = len(mesh.loops)
-    corner_normals = getattr(mesh, "corner_normals", None)
-    if corner_normals is not None and loop_count:
-        try:
-            import numpy as np  # bundled with Blender
-
-            idx = np.empty(loop_count, dtype=np.int64)
-            mesh.loops.foreach_get("vertex_index", idx)
-            nrm = np.asarray(normals, dtype=np.float32)
-            flat = np.empty(loop_count * 3, dtype=np.float32)
-            flat[0::3] = nrm[idx][:, 0]
-            flat[1::3] = nrm[idx][:, 1]
-            flat[2::3] = nrm[idx][:, 2]
-            corner_normals.foreach_set("vector", flat)
-            return True
-        except Exception:
-            # Blender 3.6/4.0 expose corner_normals READ-ONLY: fall through
-            # to the legacy custom-normal APIs below instead of dropping
-            # the asset normals entirely.
-            pass
+    if not loop_count or getattr(mesh, "is_editmode", False):
+        return False
 
     if hasattr(mesh, "use_auto_smooth"):
         mesh.use_auto_smooth = True
     if hasattr(mesh, "normals_split_custom_set_from_vertices"):
         try:
             mesh.normals_split_custom_set_from_vertices(normals)
-            return True
+            return bool(mesh.has_custom_normals)
         except Exception:
             return False
     if hasattr(mesh, "normals_split_custom_set"):
@@ -177,7 +158,7 @@ def _apply_mesh_custom_normals(mesh, vertices):
             if len(loop_normals) != loop_count:
                 return False
             mesh.normals_split_custom_set(loop_normals)
-            return True
+            return bool(mesh.has_custom_normals)
         except Exception:
             return False
     return False

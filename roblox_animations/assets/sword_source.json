@@ -1,0 +1,9 @@
+{
+  "mesh": "rbxasset://fonts/sword.mesh",
+  "texture": "rbxasset://textures/SwordTexture.png",
+  "source": "Roblox Studio AssetService.CreateEditableMeshAsync and CreateEditableImageAsync",
+  "captured": "2026-10-08",
+  "encoding": "FileMesh 1.01 with per-face normals and UVs; lossless RGBA PNG",
+  "triangles": 198,
+  "texture_dimensions": [128, 128]
+}

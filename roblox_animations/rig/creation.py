@@ -21,6 +21,7 @@ from ..core.utils import (
     get_object_by_name,
     find_master_collection_for_object,
     find_parts_collection_in_master,
+    invalidate_armature_cache,
 )
 
 # Leaf helpers moved out of this module; re-imported here so the public
@@ -2281,18 +2282,9 @@ def load_rigbone(
         # Store neutral matrix before any transforms (needed for all modes)
         pre_mat = bone.matrix
 
-        # NOTE: do NOT repoint Bone tails at child heads. Blender forces the
-        # bone Y axis along head->tail, so moving the tail rotates matrix_local
-        # away from the Roblox bone's rest frame. The deform import path applies
-        # the Roblox delta directly as matrix_basis and requires matrix_local to
-        # equal the Roblox rest frame (modulo the axis swizzle), otherwise
-        # rotations come out wrong. Keep the tail on the bone's local Z stub.
-
-        # Deform bones need their imported local axes preserved exactly.
-        # The "nice" articulated-chain adjustments are useful for Motor6D helper
-        # rigs, but they skew skinned bone bases and cause imported animation
-        # axes to drift.
-        if rigging_type != "RAW" and not is_deform_bone:
+        # nicetransform records the displayed basis relative to the Roblox
+        # joint frame. Both import and export compensate it, including Bones.
+        if rigging_type != "RAW":
             # For other rigging types, apply "nice" transforms for better visualization/IK
             chain_children = _articulated_chain_children(rigsubdef)
             if len(chain_children) == 1:
@@ -2303,20 +2295,12 @@ def load_rigbone(
                 if rigging_type == "CONNECT":  # Instantly connect
                     bone.tail = next_joint_pos
                 else:
-                    # For LOCAL_AXIS_EXTEND, determine best axis (calculation kept for consistency with backup.py)
-                    if rigging_type == "LOCAL_AXIS_EXTEND":  # Allow non-Y too
-                        invtrf = pre_mat.inverted() @ next_joint_pos
-                        bestdist = abs(invtrf.y)
-                        for paxis in ["x", "z"]:
-                            dist = abs(getattr(invtrf, paxis))
-                            if dist > bestdist:
-                                bestdist = dist
-
-                    ppd_nr_dir = real_tail - bone.head
-                    ppd_nr_dir.normalize()
-                    proj = ppd_nr_dir.dot(next_joint_pos - bone.head)
-                    vis_world_root = ppd_nr_dir * proj
-                    bone.tail = bone.head + vis_world_root
+                    local_target = pre_mat.inverted() @ next_joint_pos
+                    axis = 1
+                    if rigging_type == "LOCAL_AXIS_EXTEND":
+                        axis = max(range(3), key=lambda i: abs(local_target[i]))
+                    direction = pre_mat.to_3x3().col[axis].normalized()
+                    bone.tail = bone.head + direction * local_target[axis]
 
             else:
                 bone.tail = bone.head + (bone.head - neutral_pos) * -2
@@ -2446,7 +2430,7 @@ def _configure_weld_bones(armature_obj):
     amt = armature_obj.data
 
     settings = bpy.context.scene.rbx_anim_settings
-    hide_welds = getattr(settings, "rbx_hide_weld_bones", False)
+    hide_welds = getattr(settings, "rbx_hide_weld_bones", True)
     weld_shape = _get_or_create_weld_bone_shape()
 
     _safe_mode_set("POSE", armature_obj)
@@ -2496,7 +2480,7 @@ def _configure_weld_bones(armature_obj):
     _safe_mode_set("OBJECT", armature_obj)
 
 
-def create_rig(rigging_type, rig_meta_obj_name):
+def create_rig(rigging_type, rig_meta_obj_name, target_armature=None):
     """Create a complete rig from metadata"""
     # Ensure a clean slate by deselecting everything
     if bpy.ops.object.select_all.poll():
@@ -2535,14 +2519,21 @@ def create_rig(rigging_type, rig_meta_obj_name):
         parts_collection,
     )
 
-    # --- Deletion of old Armature ---
-    # Find and delete any existing armature within this rig's master collection
-    # (all_objects recurses into the Rig/Parts subcollections).
-    old_armature = None
-    for obj in master_collection.all_objects:
-        if obj.type == "ARMATURE":
-            old_armature = obj
-            break
+    # Resolve the source skeleton before deleting anything. Control armatures
+    # can share the collection and must not win by collection iteration order.
+    old_armature = target_armature
+    if old_armature is None:
+        candidates = [
+            obj for obj in master_collection.all_objects
+            if obj.type == "ARMATURE"
+            and find_master_collection_for_object(obj) == master_collection
+        ]
+        tagged = [obj for obj in candidates if obj.get("rbx_rig_meta_name") == rig_meta_obj.name]
+        imported = [obj for obj in candidates if any("nicetransform" in bone for bone in obj.data.bones)]
+        candidates = tagged or imported or candidates
+        if len(candidates) > 1:
+            raise ValueError("Several armatures use this rig data. Select the armature to rebuild.")
+        old_armature = candidates[0] if candidates else None
 
     if old_armature:
         bpy.data.objects.remove(old_armature, do_unlink=True)
@@ -2721,6 +2712,8 @@ def create_rig(rigging_type, rig_meta_obj_name):
     # Set a unique name for the armature based on the rig name
     rig_name = meta_loaded.get("rigName", "Rig")
     ao.name = get_unique_name(f"__{rig_name}_Armature")
+    ao["rbx_rig_meta_name"] = rig_meta_obj.name
+    ao["rbx_rigging_type"] = rigging_type
     amt = ao.data
     amt.name = get_unique_name(f"__{rig_name}_RigArm")
     amt.show_axes = True
@@ -2809,5 +2802,10 @@ def create_rig(rigging_type, rig_meta_obj_name):
     applied_skinning = _apply_skinned_mesh_bindings(ao, skinned_mesh_bindings)
     if applied_skinning:
         print(f"[RigCreate] Applied skinned mesh weights to {applied_skinning} mesh object(s)")
+
+    invalidate_armature_cache()
+    settings = getattr(bpy.context.scene, "rbx_anim_settings", None)
+    if settings is not None:
+        settings.rbx_anim_armature = ao.name
 
     return {}

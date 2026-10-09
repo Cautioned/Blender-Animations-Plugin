@@ -23,40 +23,11 @@ local RigPart = {}
 RigPart.__index = RigPart
 
 local Pose = require(script.Parent.Pose)
-local TweenService = game:GetService("TweenService")
 
 local MAX_MOTOR6D_DEPTH = 1024 -- extreme depth guard to catch pathological rigs before Luau overflows
 
 type ConnectedJoint = Motor6D | Weld | WeldConstraint
 type CacheableJoint = ConnectedJoint | AnimationConstraint
-
-local tweenStyleByPoseStyle = {
-	Cubic = Enum.EasingStyle.Cubic,
-	CubicV2 = Enum.EasingStyle.Cubic,
-	Bounce = Enum.EasingStyle.Bounce,
-	Elastic = Enum.EasingStyle.Elastic,
-}
-
-local function getPoseInterpolationAlpha(alpha: number, poseStyle: string?, poseDirection: string?): number
-	if poseStyle == nil or poseStyle == "Linear" then
-		return alpha
-	end
-	local tweenStyle = tweenStyleByPoseStyle[poseStyle]
-	if tweenStyle == nil then
-		return alpha
-	end
-	-- Pose easing names are reversed relative to TweenService's names.
-	local tweenDirection = if poseDirection == "In" then Enum.EasingDirection.Out
-		elseif poseDirection == "InOut" then Enum.EasingDirection.InOut
-		else Enum.EasingDirection.In
-	local ok, eased = pcall(function()
-		return TweenService:GetValue(alpha, tweenStyle, tweenDirection)
-	end)
-	if ok and type(eased) == "number" then
-		return math.clamp(eased, 0, 1)
-	end
-	return alpha
-end
 
 local function getConnectedJointParts(joint: ConnectedJoint): (BasePart?, BasePart?)
 	return joint.Part0, joint.Part1
@@ -380,63 +351,16 @@ function RigPart:PoseToRobloxAnimation(t)
 		end
 	end
 
-	-- If this part has no keyframe at this exact time, synthesize one so
-	-- Roblox doesn't treat the missing Pose as CFrame.identity (which would
-	-- snap the bone to rest mid-animation).
-	if not poseToApply then
-		local prevTime, nextTime = nil, nil
-		for poseTime, _ in pairs(poses) do
-			if poseTime < t then
-				if prevTime == nil or poseTime > prevTime then
-					prevTime = poseTime
-				end
-			end
-			if poseTime > t then
-				if nextTime == nil or poseTime < nextTime then
-					nextTime = poseTime
-				end
-			end
-		end
-
-		local prevPose = prevTime and poses[prevTime] or nil
-		local nextPose = nextTime and poses[nextTime] or nil
-
-		if prevPose then
-			local easingStyle = prevPose.easingStyle or "Linear"
-			if easingStyle == "Constant" or not nextPose or nextTime == nil then
-				-- Constant easing or no future keyframe: hold previous value
-				poseToApply = prevPose
-			else
-				-- Interpolate between prev and next (Linear/other)
-				local alpha = (t - (prevTime :: number)) / ((nextTime :: number) - (prevTime :: number))
-				alpha = getPoseInterpolationAlpha(alpha, easingStyle, prevPose.easingDirection)
-				local interpCFrame = prevPose.transform:Lerp(nextPose.transform, alpha)
-				poseToApply = {
-					transform = interpCFrame,
-					-- Carry forward prev's easing so the segment from this
-					-- synthetic keyframe to the next real one stays consistent
-					easingStyle = easingStyle,
-					easingDirection = prevPose.easingDirection or "Out",
-				}
-			end
-		elseif nextPose then
-			-- Before the bone's first keyframe: use the next available pose.
-			-- Roblox will interpolate from this value forward, so projecting
-			-- the first real keyframe backwards keeps the bone stable until
-			-- its first actual keyframe is reached.
-			poseToApply = nextPose
-		end
-		-- else: bone has no poses at all; poseToApply stays nil → identity below
-
-		-- If no pose and no children, prune this branch entirely
-		if not poseToApply and #childrenPoses == 0 then
-			return nil
-		end
+	-- Missing keys must remain missing. The Animator interpolates each channel
+	-- across its own authored keys. Synthesizing intermediate keys restarts
+	-- nonlinear easing whenever a sibling has a key and causes visible drift.
+	if not poseToApply and #childrenPoses == 0 then
+		return nil
 	end
 
 	local pose = Instance.new("Pose")
 	pose.Name = part.Name
-	pose.Weight = enabled and 1 or 0
+	pose.Weight = (enabled and poseToApply ~= nil) and 1 or 0
 	pose.EasingStyle = Enum.PoseEasingStyle.Linear
 	if self.isDeformRig and self.parent == nil and not part:IsA("Bone") then
 		-- This BasePart pose only carries the nested Bone hierarchy. It is not an

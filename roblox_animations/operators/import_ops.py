@@ -14,7 +14,7 @@ from collections import deque
 from mathutils import Matrix, Vector
 from bpy_extras.io_utils import ImportHelper
 from ..core.utils import get_unique_name, get_object_by_name, iter_scene_objects
-from ..core.utils import cf_to_mat, mat_to_cf, find_constraint_driven_armature
+from ..core.utils import cf_to_mat, mat_to_cf
 from ..core.schema import WeaponImportPayload
 from typing import Any, Dict
 from ..core.constants import get_transform_to_blender
@@ -1920,41 +1920,6 @@ def _infer_weapon_parent_bone_from_transform(armature, joints_tree):
     return best_name, best_dist
 
 
-def _should_redirect_weapon_import(selected_armature, source_armature, meta_loaded):
-    """Decide whether to redirect weapon import from selected rig to source rig.
-    Redirect when the selected rig looks like a proxy/control rig, or when it
-    is missing suggested attach bones that exist on the detected source rig."""
-    if not selected_armature or not source_armature:
-        return False
-
-    # Prefer armatures that carry imported Roblox bone transforms.
-    # Proxy/control rigs typically do not have these custom props.
-    selected_has_transform = any(
-        "transform" in b for b in selected_armature.data.bones
-    )
-    source_has_transform = any(
-        "transform" in b for b in source_armature.data.bones
-    )
-    if source_has_transform and not selected_has_transform:
-        return True
-
-    suggested_bones = _collect_weapon_suggested_bones(meta_loaded)
-    if not suggested_bones:
-        return False
-
-    missing_on_selected = [
-        bone_name for bone_name in suggested_bones
-        if not _find_bone_case_insensitive(selected_armature, bone_name)
-    ]
-    if not missing_on_selected:
-        return False
-
-    return all(
-        _find_bone_case_insensitive(source_armature, bone_name)
-        for bone_name in missing_on_selected
-    )
-
-
 def _dims_to_ratios(sorted_dims):
     """Compute scale-invariant aspect ratios from sorted dimensions.
 
@@ -3148,12 +3113,10 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
 
     @staticmethod
     def _find_source_armature(armature):
-        """Detect if this armature is a proxy/control rig by scanning for
-        Copy Transform/Location/Rotation constraints pointing to another armature.
-        Returns (source_armature, constraint_map) or (None, {}).
-        constraint_map: {bone_name: (target_armature, subtarget_bone)} for bones
-        that have copy constraints."""
-        return find_constraint_driven_armature(armature)
+        """Resolve the export rig through incoming or outgoing bone constraints."""
+        from ..rig.weapon_proxy import resolve_weapon_rigs
+        source, _ = resolve_weapon_rigs(armature)
+        return (source, {}) if source != armature else (None, {})
 
     def _get_suggested_bones(self):
         data = _pending_weapon_import.get("data")
@@ -3206,7 +3169,7 @@ class OBJECT_OT_ConfirmWeaponTarget(bpy.types.Operator):
                 if src:
                     col.label(text=f"Source rig: {src.name}")
                 col.label(text="Weapon bones will be created on the source rig")
-                col.label(text="with copy constraints mirrored to the proxy")
+                col.label(text="with editable controls on the proxy")
 
             box = layout.box()
             col = box.column(align=True)
@@ -3305,30 +3268,27 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                 if isinstance(ref, int) and ref in refs and obj not in rig_part_objs:
                     rig_part_objs.append(obj)
 
-        # detect proxy rig — if so, import onto the source armature
+        from ..rig.weapon_proxy import resolve_weapon_rigs, clone_weapon_controls
+
         actual_rig_name = self.target_rig
+        source_arm_obj = None
         proxy_armature = None
         if actual_rig_name and actual_rig_name != "NONE":
             selected_arm = get_object_by_name(actual_rig_name, context.scene)
             if selected_arm and selected_arm.type == "ARMATURE":
-                source_arm, constraint_map = OBJECT_OT_ConfirmWeaponTarget._find_source_armature(selected_arm)
-                if source_arm and _should_redirect_weapon_import(selected_arm, source_arm, meta_loaded):
-                    print(
-                        f"[WeaponImport] Proxy rig redirect: {selected_arm.name} -> {source_arm.name} "
-                        f"({len(constraint_map)} constrained bones)"
-                    )
-                    proxy_armature = selected_arm
-                    actual_rig_name = source_arm.name
-                elif source_arm:
-                    print(
-                        f"[WeaponImport] Keeping selected rig '{selected_arm.name}' "
-                        "for import (suggested bones resolved on selected rig)"
-                    )
+                source_arm_obj, proxy_armature = resolve_weapon_rigs(selected_arm, context.scene)
+                actual_rig_name = source_arm_obj.name
+        original_bones = set(source_arm_obj.data.bones.keys()) if source_arm_obj else set()
 
         # override the armature setting so _import_weapon picks it up
         settings = getattr(context.scene, "rbx_anim_settings", None)
         old_arm = settings.rbx_anim_armature if settings else None
         if settings and actual_rig_name != "NONE":
+            if source_arm_obj is None:
+                self.report({"ERROR"}, "The target armature is no longer available. Select a rig and import the weapon again.")
+                return {"CANCELLED"}
+            from ..core.utils import invalidate_armature_cache
+            invalidate_armature_cache()
             settings.rbx_anim_armature = actual_rig_name
 
         # use a lightweight proxy so _import_weapon can call self.report()
@@ -3340,28 +3300,37 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
         # corrupts the undo stack and causes a build_materials crash on
         # ctrl+z (null material pointer after partial undo restore).
 
+        from ..core.evaluation import rig_evaluation_context
+        result = None
         try:
-            if pending_mode == "rbxm":
-                # rbxm weapon exports carry grip attributes instead of the
-                # OBJ weapon schema — attach through the grip-based path.
-                result = self._apply_rbxm_weapon(context, meta_loaded, rig_part_objs)
-            else:
-                # call as unbound method — proxy duck-types as `self`
-                result = OBJECT_OT_ImportModel._import_weapon(proxy, context, meta_loaded, rig_part_objs)
+            with rig_evaluation_context(source_arm_obj, proxy_armature):
+                if pending_mode == "rbxm":
+                    # rbxm weapon exports carry grip attributes instead of the
+                    # OBJ weapon schema — attach through the grip-based path.
+                    result = self._apply_rbxm_weapon(context, meta_loaded, rig_part_objs)
+                else:
+                    # call as unbound method — proxy duck-types as `self`
+                    result = OBJECT_OT_ImportModel._import_weapon(proxy, context, meta_loaded, rig_part_objs)
 
-            # if proxy rig detected, clone weapon bones onto the proxy
-            # with copy constraints mirroring the source
-            if result == {"FINISHED"} and proxy_armature and pending_mode != "rbxm":
-                source_arm_obj = get_object_by_name(actual_rig_name, context.scene)
-                if source_arm_obj:
-                    OBJECT_OT_ApplyWeaponImport._clone_weapon_bones_to_proxy(
-                        context, source_arm_obj, proxy_armature, meta_loaded
-                    )
+                if result == {"FINISHED"} and proxy_armature and source_arm_obj:
+                    created_bones = set(source_arm_obj.data.bones.keys()) - original_bones
+                    try:
+                        clone_weapon_controls(context, source_arm_obj, proxy_armature, created_bones)
+                    except ValueError as exc:
+                        self.report({"WARNING"}, f"Weapon attached to the export rig, but controls could not be created: {exc}")
         finally:
-            # restore original setting
-            if settings and old_arm is not None:
-                settings.rbx_anim_armature = old_arm
-
+            if settings:
+                # A dynamic enum can read as "" when unset or stale, but that
+                # value cannot be assigned back. Never let cleanup mask an
+                # import result or its original exception with an enum error.
+                from ..core.utils import invalidate_armature_cache
+                invalidate_armature_cache()
+                selection = actual_rig_name if result == {"FINISHED"} and source_arm_obj else old_arm
+                armature = get_object_by_name(selection, context.scene)
+                if armature and armature.type == "ARMATURE":
+                    # Controls drive motion; successful imports select the
+                    # export skeleton directly, without restoring the old enum.
+                    settings.rbx_anim_armature = armature.name
         return result
 
     def _apply_rbxm_weapon(self, context, meta_loaded, rig_part_objs):
@@ -3817,185 +3786,6 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
             )
         return {"FINISHED"}
 
-    @staticmethod
-    def _clone_weapon_bones_to_proxy(context, source_armature, proxy_armature, meta_loaded):
-        """Create matching weapon bones on the proxy armature with COPY_TRANSFORMS
-        constraints pointing back to the source armature's weapon bones."""
-        from ..rig.creation import _safe_mode_set
-
-        def _ensure_object_in_view_layer(ctx, obj):
-            """Ensure object is available in current window view layer.
-
-            Returns True if available (or switched to a view layer that has it),
-            else False.
-            """
-            if not obj:
-                return False
-            try:
-                if ctx.view_layer.objects.get(obj.name) == obj:
-                    return True
-            except Exception:
-                pass
-
-            scene = getattr(ctx, "scene", None)
-            win = getattr(ctx, "window", None)
-            if scene is None:
-                return False
-
-            for vl in scene.view_layers:
-                try:
-                    if vl.objects.get(obj.name) == obj:
-                        if win is not None:
-                            try:
-                                win.view_layer = vl
-                            except Exception:
-                                pass
-                        return True
-                except Exception:
-                    continue
-            return False
-
-        # find weapon bones on source (they were just created by _import_weapon)
-        # weapon bones are parented under the suggested bone
-        suggested = meta_loaded.get("suggestedBone", "")
-        suggested_bones = set()
-        if suggested:
-            suggested_bones.add(suggested.lower())
-        attachments = meta_loaded.get("weaponAttachments")
-        if isinstance(attachments, list):
-            for att in attachments:
-                if isinstance(att, dict):
-                    sb = att.get("suggestedBone")
-                    if isinstance(sb, str) and sb:
-                        suggested_bones.add(sb.lower())
-        weapon_bones = []
-        for bone in source_armature.data.bones:
-            # weapon bones are typically named after the weapon parts
-            # and are children (direct or indirect) of the suggested bone
-            parent = bone.parent
-            while parent:
-                if parent.name.lower() in suggested_bones:
-                    weapon_bones.append(bone.name)
-                    break
-                parent = parent.parent
-
-        if not weapon_bones:
-            print(
-                f"[WeaponImport] No weapon bones found under suggested roots {sorted(suggested_bones)} to clone to proxy")
-            return
-
-        print(
-            f"[WeaponImport] Cloning {len(weapon_bones)} weapon bones to proxy '{proxy_armature.name}': {weapon_bones}")
-
-        if not _ensure_object_in_view_layer(context, source_armature):
-            print(
-                f"[WeaponImport] Cannot clone weapon bones: source armature "
-                f"'{source_armature.name}' is not in any accessible view layer."
-            )
-            return
-        if not _ensure_object_in_view_layer(context, proxy_armature):
-            print(
-                f"[WeaponImport] Skipping proxy clone: armature "
-                f"'{proxy_armature.name}' is not in any accessible view layer."
-            )
-            return
-
-        # collect bone data from SOURCE in edit mode (only way to get real roll)
-        context.view_layer.objects.active = source_armature
-        source_armature.select_set(True)
-        with _ensure_all_bone_collections_visible(source_armature):
-            _safe_mode_set("EDIT", source_armature)
-
-            bone_data = {}  # name -> {head, tail, roll, parent_name}
-            for bone_name in weapon_bones:
-                eb = source_armature.data.edit_bones.get(bone_name)
-                if eb:
-                    bone_data[bone_name] = {
-                        "head": eb.head.copy(),
-                        "tail": eb.tail.copy(),
-                        "roll": eb.roll,
-                        "parent": eb.parent.name if eb.parent else None,
-                    }
-
-            _safe_mode_set("OBJECT", source_armature)
-
-        # collect custom properties from source bones (object mode)
-        # these are critical for serialization (transform, transform0/1, nicetransform, etc.)
-        def _deep_convert_idprop(val):
-            """recursively convert IDPropertyArray/IDPropertyGroup to plain python types
-            so blender can re-create them as new IDProperties without crashing."""
-            if hasattr(val, "to_dict"):
-                # IDPropertyGroup → dict with recursively converted values
-                return {k: _deep_convert_idprop(v) for k, v in val.items()}
-            if hasattr(val, "to_list"):
-                # IDPropertyArray → list with recursively converted elements
-                return [_deep_convert_idprop(x) for x in val.to_list()]
-            if isinstance(val, (list, tuple)):
-                return [_deep_convert_idprop(x) for x in val]
-            # scalar: int, float, str, bool — pass through
-            return val
-
-        bone_props = {}  # name -> dict of custom props
-        for bone_name in weapon_bones:
-            src_bone = source_armature.data.bones.get(bone_name)
-            if src_bone:
-                props = {}
-                for key in src_bone.keys():
-                    if key.startswith("_"):
-                        continue  # skip internal blender props
-                    props[key] = _deep_convert_idprop(src_bone[key])
-                bone_props[bone_name] = props
-
-        # create matching bones on PROXY in edit mode
-        context.view_layer.objects.active = proxy_armature
-        proxy_armature.select_set(True)
-        with _ensure_all_bone_collections_visible(proxy_armature):
-            _safe_mode_set("EDIT", proxy_armature)
-
-            for bone_name in weapon_bones:
-                bd = bone_data.get(bone_name)
-                if not bd:
-                    continue
-                if bone_name not in proxy_armature.data.edit_bones:
-                    new_bone = proxy_armature.data.edit_bones.new(bone_name)
-                    new_bone.head = bd["head"]
-                    new_bone.tail = bd["tail"]
-                    new_bone.roll = bd["roll"]
-                    # parent to the matching parent if it exists on proxy
-                    if bd["parent"] and bd["parent"] in proxy_armature.data.edit_bones:
-                        new_bone.parent = proxy_armature.data.edit_bones[bd["parent"]]
-
-            _safe_mode_set("POSE", proxy_armature)
-
-        # copy custom properties to proxy bones (must be done after edit mode)
-        # values are already deep-converted to plain python types
-        for bone_name, props in bone_props.items():
-            proxy_bone = proxy_armature.data.bones.get(bone_name)
-            if proxy_bone:
-                for key, value in props.items():
-                    try:
-                        proxy_bone[key] = value
-                    except Exception as e:
-                        print(
-                            f"[WeaponImport] Failed to copy prop '{key}' to proxy bone '{bone_name}': {type(value).__name__} = {value!r}: {e}")
-
-        # add copy transforms constraints
-        for bone_name in weapon_bones:
-            if bone_name in proxy_armature.pose.bones:
-                pose_bone = proxy_armature.pose.bones[bone_name]
-                # skip if already has a copy constraint for this bone
-                has_copy = any(
-                    c.type == "COPY_TRANSFORMS" and c.target == source_armature and c.subtarget == bone_name
-                    for c in pose_bone.constraints
-                )
-                if not has_copy:
-                    c = pose_bone.constraints.new(type="COPY_TRANSFORMS")
-                    c.target = source_armature
-                    c.subtarget = bone_name
-                    c.name = f"WeaponCopy_{bone_name}"
-
-        _safe_mode_set("OBJECT", proxy_armature)
-        print("[WeaponImport] Cloned weapon bones to proxy with COPY_TRANSFORMS constraints")
 
 
 class OBJECT_OT_ImportModel(bpy.types.Operator, ImportHelper):
@@ -6669,6 +6459,22 @@ def _hydrate_rbxl_beam_images(deferred_image_materials):
     return hydrated
 
 
+def _require_rbxm_login(operator):
+    """Validate or refresh the login before the importer can change the scene."""
+    from ..core import auth
+
+    if not auth.is_online_access_allowed():
+        message = "Enable Online Access in Blender Preferences, then log in under Roblox Account before importing."
+    elif auth.is_login_in_progress():
+        message = "Finish logging in to Roblox before importing the model or place."
+    elif not auth.get_auth_headers().get("Authorization"):
+        message = "Roblox login is required. Click Log In to Roblox under Roblox Account, then import again."
+    else:
+        return True
+    operator.report({"ERROR"}, message)
+    return False
+
+
 class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
     """Import a character/rig directly from a Roblox .rbxm binary model.
 
@@ -6679,7 +6485,7 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
 
     bl_label = "Import Roblox model/place (.rbxm/.rbxl)"
     bl_idname = "object.rbxanims_import_rbxm"
-    bl_description = "Import supported geometry from a Roblox .rbxm model or .rbxl place"
+    bl_description = "Import a Roblox .rbxm model or .rbxl place. Roblox login is required"
 
     filename_ext = ".rbxm"
     filter_glob: bpy.props.StringProperty(default="*.rbxm;*.rbxl", options={"HIDDEN"})
@@ -6759,6 +6565,8 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
     directory: bpy.props.StringProperty(maxlen=1024, default="", options={"HIDDEN"})
 
     def invoke(self, context, event):
+        if not _require_rbxm_login(self):
+            return {"CANCELLED"}
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -6782,6 +6590,11 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         import os
+
+        # Recheck after the file browser: the user may have logged out or the
+        # saved session may have expired. Direct operator calls use this gate too.
+        if not _require_rbxm_login(self):
+            return {"CANCELLED"}
 
         def release_transient_import_memory():
             # These caches contain raw network payloads and parsed Python data,
@@ -7415,9 +7228,10 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             print(f"[RbxmImport]   skipped: {note}")
 
         if built == 0 and not meta_loaded.get("terrain"):
+            reason = skipped[0] if skipped else "No supported geometry was produced."
             self.report(
                 {"ERROR"},
-                f"'{rig_name}': no MeshPart or Part geometry could be built.",
+                f"'{rig_name}': could not load mesh geometry. {reason}",
             )
             return "CANCELLED"
 

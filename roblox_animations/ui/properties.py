@@ -180,6 +180,17 @@ for _control_name in FACE_CONTROL_ORDER:
         update=_on_face_control_update,
     )
 
+RobloxFaceControlState.__annotations__["rbx_facs_eval_mode"] = EnumProperty(
+    name="Face Controls",
+    description="Choose whether to adjust the face with sliders or use its animation",
+    items=[
+        ("AUTO", "Auto", "Use sliders unless the face is animated"),
+        ("SLIDERS", "Sliders", "Adjust the face with sliders instead of its animation"),
+        ("BAKED", "Animation", "Use the existing face animation"),
+    ],
+    default="AUTO",
+)
+
 
 class RobloxAnimationSettings(PropertyGroup):
     rbx_anim_armature: EnumProperty(
@@ -287,8 +298,8 @@ class RobloxAnimationSettings(PropertyGroup):
 
     rbx_hide_weld_bones: BoolProperty(
         name="Hide Weld Bones",
-        description="hide weld/weldconstraint bones in the viewport (they're still there, just invisible)",
-        default=False,
+        description="Hide weld bones in the viewport while keeping them in the rig",
+        default=True,
     )
 
     rbx_face_controls_expanded: BoolProperty(

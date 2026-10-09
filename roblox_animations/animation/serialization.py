@@ -25,7 +25,7 @@ from ..core.utils import (
     get_scene_fps,
     iter_scene_objects,
 )
-from .easing import map_blender_to_roblox_easing
+from .easing import map_blender_to_roblox_easing, easing_requires_bake
 from .face_controls import (
     face_control_property_name,
     is_face_control_bone,
@@ -34,7 +34,6 @@ from .face_controls import (
 )
 from .ir import KeyframePayload, PoseEntry, keyframes_equivalent, pose_entries_equivalent
 from .planning import (
-    _ROBLOX_MAPPED_INTERPOLATIONS,
     build_bake_plan,
     frame_in_set,
     lookup_interp_for_frame,
@@ -262,7 +261,7 @@ def get_ik_affected_bones(armature_obj: "bpy.types.Object") -> Set[str]:
 
     for bone in armature_obj.pose.bones:
         for constraint in bone.constraints:
-            if constraint.type == "IK":
+            if constraint.type in {"IK", "SPLINE_IK"}:
                 add_ik_chain(bone, getattr(constraint, "chain_count", 0))
     return ik_bones
 
@@ -294,7 +293,7 @@ def get_all_constrained_bones(armature_obj: "bpy.types.Object") -> Set[str]:
         if bone.constraints:
             constrained_bones.add(bone.name)
             for constraint in bone.constraints:
-                if constraint.type == "IK":
+                if constraint.type in {"IK", "SPLINE_IK"}:
                     add_ik_chain(bone, getattr(constraint, "chain_count", 0))
     return constrained_bones
 
@@ -579,14 +578,27 @@ def _analyze_export(
                         ),
                     )
                     requires_dense_bake = any(
-                        kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS
+                        easing_requires_bake(kp.interpolation, kp.easing)
                         for fc in strip_fcurves
                         for kp in fc.keyframe_points
                     )
                 except Exception:
                     requires_dense_bake = False
 
-                if requires_dense_bake:
+                # Action keys are scene keys only for an unmodified strip.
+                # Retiming, repetition and blending must be evaluated by NLA.
+                direct_action_timing = (
+                    abs(single_strip.frame_start - single_strip.action_frame_start) < 1e-6
+                    and abs(single_strip.scale - 1.0) < 1e-6
+                    and abs(single_strip.repeat - 1.0) < 1e-6
+                    and single_strip.blend_type == "REPLACE"
+                    and single_strip.blend_in == 0
+                    and single_strip.blend_out == 0
+                    and not single_strip.use_animated_time
+                    and not single_strip.use_animated_influence
+                    and animation_data.action is None
+                )
+                if requires_dense_bake or not direct_action_timing:
                     use_nla_bake = True
                 else:
                     nla_single_action = strip_action
@@ -1030,7 +1042,7 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
             # If still no interpolation and this is a constrained bone, use the
             # pre-computed constraint target easing.
             if not interpolation and is_constrained and bone_name in plan.constraint_target_easing:
-                cached_constraint = plan.constraint_target_easing[bone_name].get(frame)
+                cached_constraint = lookup_interp_for_frame(plan.constraint_target_easing[bone_name], frame)
                 if cached_constraint:
                     interpolation, easing = cached_constraint
 
@@ -1076,43 +1088,14 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
                     previous_state.direction,
                 )
 
-            has_explicit_easing = (
-                bone_name in plan.per_bone_interpolation
-                or bone_name in plan.constraint_target_easing
-            )
+            # These poses were already evaluated through the constraint stack.
+            # Applying the target's curve again between samples double-eases it.
+            if is_constrained and interpolation != "CONSTANT":
+                roblox_style, roblox_direction = "Linear", "Out"
 
-            # For constrained mapped easing styles, only emit on keys/boundaries.
-            # Unsupported interpolation is handled by the dense segment path.
-            if (
-                analysis.nla_single_action is not None
-                and is_constrained
-                and not is_non_inheriting
-                and has_explicit_easing
-                and not is_sparse_key
-                and not is_boundary_frame
-            ):
-                if interpolation in {"CONSTANT", "LINEAR", "CUBIC", "BOUNCE", "ELASTIC"}:
-                    continue
-                if (
-                    interpolation is None
-                    and previous_state is not None
-                    and previous_state.style in {"Constant", "Linear", "CubicV2", "Bounce", "Elastic"}
-                ):
-                    continue
-
-            # Avoid emitting boundary frames for constrained mapped easing when no key exists.
-            if (
-                analysis.nla_single_action is not None
-                and is_constrained
-                and not is_non_inheriting
-                and has_explicit_easing
-                and is_boundary_frame
-                and not is_sparse_key
-                and previous_state is not None
-                and previous_state.style in {"Constant", "Linear", "CubicV2", "Bounce", "Elastic"}
-                and interpolation is None
-            ):
-                continue
+            # A constraint's target easing does not describe its evaluated
+            # output (IK, offsets and blended constraints are nonlinear).
+            # Keep evaluated constraint samples even for a single NLA strip.
 
             # For CONSTANT holds, clamp to previous pose to avoid blending.
             # For cyclic boundary frames (e.g. frame_end) that aren't explicit
@@ -1152,11 +1135,8 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
 
             final_kf_state[bone_name] = candidate_state
 
-        # Roblox treats a Pose absent from a Keyframe as CFrame.identity,
-        # not as "hold previous."  When siblings have staggered keys a
-        # constant-hold bone would be missing from keyframes created by
-        # its siblings, snapping to identity.  Ensure every bone that is
-        # mid-constant-hold appears in every emitted keyframe.
+        # Retain explicit constant holds in the flat payload at sibling keys.
+        # These redundant constant keys preserve the same hold in Studio.
         if final_kf_state:
             for held_bone, held_state in last_baked_states.items():
                 if held_bone in final_kf_state:
@@ -1241,11 +1221,19 @@ def serialize(
     ao: "bpy.types.Object",
     target_bone_rest: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Evaluate hidden export rigs as well as visible controls."""
+    from ..core.evaluation import rig_evaluation_context
+    with rig_evaluation_context(ao):
+        return _serialize_evaluated(ao, target_bone_rest)
+
+
+def _serialize_evaluated(ao, target_bone_rest=None):
     """Main serialization entry point: analyze -> plan -> sample -> emit."""
     ctx = bpy.context
 
     # Store the current frame to restore it later.
     original_frame = ctx.scene.frame_current
+    original_subframe = ctx.scene.frame_subframe
     analysis = _analyze_export(ao, target_bone_rest)
 
     try:
@@ -1270,7 +1258,7 @@ def serialize(
         }
     finally:
         # Always restore the original frame, even on failure.
-        ctx.scene.frame_set(original_frame)
+        ctx.scene.frame_set(original_frame, subframe=original_subframe)
 
     if analysis.is_skinned_rig:
         result["is_deform_bone_rig"] = True
