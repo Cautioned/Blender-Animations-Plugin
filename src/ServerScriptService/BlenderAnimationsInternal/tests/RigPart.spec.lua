@@ -490,7 +490,7 @@ return function()
 				part:Destroy()
 			end)
 
-			it("should interpolate linearly between keyframes", function()
+			it("should leave intermediate leaf keys to the Animator", function()
 				local rp, part = singlePartWithPoses({
 					[0] = { cf = CFrame.new(0, 0, 0) },
 					[1] = { cf = CFrame.new(10, 0, 0) },
@@ -498,13 +498,12 @@ return function()
 
 				local pose = rp:PoseToRobloxAnimation(0.5)
 
-				expect(pose).to.be.ok()
-				expect(pose.CFrame.Position.X).to.be.near(5, 0.001)
+				expect(pose).to.never.be.ok()
 
 				part:Destroy()
 			end)
 
-			it("should hold previous value for Constant easing", function()
+			it("should preserve sparse Constant channels without adding keys", function()
 				local rp, part = singlePartWithPoses({
 					[0] = { cf = CFrame.new(0, 0, 0), easing = "Constant" },
 					[1] = { cf = CFrame.new(10, 0, 0) },
@@ -512,9 +511,7 @@ return function()
 
 				local pose = rp:PoseToRobloxAnimation(0.5)
 
-				expect(pose).to.be.ok()
-				-- constant hold = previous value, which is 0
-				expect(pose.CFrame.Position.X).to.be.near(0, 0.001)
+				expect(pose).to.never.be.ok()
 
 				part:Destroy()
 			end)
@@ -546,26 +543,24 @@ return function()
 				part:Destroy()
 			end)
 
-			it("should fall back to nearest pose when time is before first keyframe", function()
+			it("should not invent a key before the first authored pose", function()
 				local rp, part = singlePartWithPoses({
 					[1] = { cf = CFrame.new(5, 0, 0) },
 				})
 
 				local pose = rp:PoseToRobloxAnimation(0)
-				expect(pose).to.be.ok()
-				expect(pose.CFrame.Position.X).to.be.near(5, 0.001)
+				expect(pose).to.never.be.ok()
 
 				part:Destroy()
 			end)
 
-			it("should fall back to nearest pose when time is after last keyframe", function()
+			it("should not invent a key after the last authored pose", function()
 				local rp, part = singlePartWithPoses({
 					[0] = { cf = CFrame.new(3, 0, 0) },
 				})
 
 				local pose = rp:PoseToRobloxAnimation(5)
-				expect(pose).to.be.ok()
-				expect(pose.CFrame.Position.X).to.be.near(3, 0.001)
+				expect(pose).to.never.be.ok()
 
 				part:Destroy()
 			end)
@@ -611,18 +606,14 @@ return function()
 				part:Destroy()
 			end)
 
-			it("should carry forward easing direction on synthetic interpolated poses", function()
+			it("should not restart easing at an unauthored leaf key", function()
 				local rp, part = singlePartWithPoses({
 					[0] = { cf = CFrame.new(0, 0, 0), easing = "Linear", dir = "InOut" },
 					[2] = { cf = CFrame.new(10, 0, 0), easing = "Linear", dir = "In" },
 				})
 
-				-- At t=1, synthetic pose should carry prevPose's direction (InOut)
 				local pose = rp:PoseToRobloxAnimation(1)
-				expect(pose).to.be.ok()
-				expect(pose.EasingDirection).to.equal(Enum.PoseEasingDirection.InOut)
-				-- Value should be linearly interpolated
-				expect(pose.CFrame.Position.X).to.be.near(5, 0.001)
+				expect(pose).to.never.be.ok()
 
 				part:Destroy()
 			end)
@@ -660,9 +651,8 @@ return function()
 				child:Destroy()
 			end)
 
-			it("should synthesize fill for parent with children when between keyframes", function()
+			it("should give structural parents zero weight between authored keys", function()
 				-- Parent has keyframes at t=0 and t=2, child has keyframe at t=0,1,2
-				-- At t=1 parent should get an interpolated synthetic value
 				local root = Instance.new("Part")
 				root.Name = "Root"
 				local child = Instance.new("Part")
@@ -682,10 +672,9 @@ return function()
 				rp.children[1]:AddPose(1, CFrame.new(0, 2, 0), false, "Linear", "In")
 				rp.children[1]:AddPose(2, CFrame.new(0, 3, 0), false, "Linear", "In")
 
-				-- At t=1, parent should be interpolated to (5,0,0)
 				local pose = rp:PoseToRobloxAnimation(1)
 				expect(pose).to.be.ok()
-				expect(pose.CFrame.Position.X).to.be.near(5, 0.001)
+				expect(pose.Weight).to.equal(0)
 
 				-- Child should have its exact pose at t=1
 				local subPoses = pose:GetChildren()
@@ -696,8 +685,7 @@ return function()
 				child:Destroy()
 			end)
 
-			it("should hold previous pose for Constant easing with children", function()
-				-- Same setup but Constant easing: parent should HOLD, not interpolate
+			it("should preserve a Constant parent channel while emitting child keys", function()
 				local root = Instance.new("Part")
 				root.Name = "Root"
 				local child = Instance.new("Part")
@@ -718,7 +706,7 @@ return function()
 				-- At t=1, Constant easing should hold the t=0 value (0,0,0)
 				local pose = rp:PoseToRobloxAnimation(1)
 				expect(pose).to.be.ok()
-				expect(pose.CFrame.Position.X).to.be.near(0, 0.001)
+				expect(pose.Weight).to.equal(0)
 
 				root:Destroy()
 				child:Destroy()

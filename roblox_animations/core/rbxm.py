@@ -50,6 +50,10 @@ _MAX_INSTANCES = 10_000_000
 # count against this limit.
 _MAX_PROPS_INSTANCES = 2_000_000
 _MAX_STRING_BYTES = 8 * 1024 * 1024
+# Binary String props smuggle big blobs (smooth-terrain grids routinely
+# exceed 8 MiB on real maps).  Gate them by the chunk cap instead of the
+# text-string cap so terrain does not get silently dropped.
+_MAX_BINARY_STRING_BYTES = 64 * 1024 * 1024
 _MAX_SHARED_STRING_BYTES = 128 * 1024 * 1024
 
 # Property value type ids (subset we care about).
@@ -204,12 +208,13 @@ class _Reader:
         """Read a length-prefixed string, preserving binary payloads as bytes.
 
         Roblox abuses ``String`` properties to smuggle binary blobs (union
-        ChildData operand trees, EditableImage data, ...). ``str`` decoding
-        with ``errors="replace"`` corrupts those payloads, so this returns
-        ``bytes`` whenever the payload is not clean UTF-8.
+        ChildData operand trees, EditableImage data, smooth-terrain grids,
+        ...). ``str`` decoding with ``errors="replace"`` corrupts those
+        payloads, so this returns ``bytes`` whenever the payload is not
+        clean UTF-8.
         """
         length = self.u32le()
-        if length > _MAX_STRING_BYTES:
+        if length > _MAX_BINARY_STRING_BYTES:
             raise RbxmError("binary string exceeds import safety limit")
         data = self.read(length)
         try:
@@ -2373,6 +2378,28 @@ def _resolve_joint_endpoint(instances: Dict[int, _Instance], ref: Optional[int])
         parent = instances.get(parent_ref) if parent_ref is not None else None
         if parent is not None and parent.class_name in _BASE_PART_CLASSES:
             return parent_ref, _cf(_first_prop(inst, "CFrame"))
+        if parent is not None and parent.class_name == "Bone":
+            # Newer body types (Mannequin and later) mount rig attachments
+            # on BONES (NeckRigAttachment on Chest, shoulder attachments on
+            # Clavicles) instead of the mesh part.  Climb the bone chain to
+            # its owning BasePart and compose the bone-local CFrames into
+            # the attachment's part-space CFrame (bone CFrames are relative
+            # to their parent bone/part, so the product is part-space).
+            chain_cf = _cf(_first_prop(inst, "CFrame"))
+            cur = parent
+            while cur is not None and cur.class_name == "Bone":
+                bone_cf = _cf(_first_prop(cur, "CFrame"))
+                if bone_cf is not None:
+                    chain_cf = (
+                        _cf_multiply(bone_cf, chain_cf)
+                        if chain_cf is not None
+                        else bone_cf
+                    )
+                owner_ref = cur.parent
+                owner = instances.get(owner_ref) if owner_ref is not None else None
+                if owner is not None and owner.class_name in _BASE_PART_CLASSES:
+                    return owner_ref, chain_cf
+                cur = owner
     return None, None
 
 
@@ -2571,14 +2598,11 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
         # Cyclic or fully-connected graph; fall back to the first parent.
         root_candidates = sorted(parent_refs)
     if not root_candidates:
-        # No joints at all. A bone-only skinned rig (MeshParts with Bone
-        # children, no Motor6Ds) still needs a rig tree so the armature
-        # picks the bones up — root it at the first part that owns Bones.
-        bone_parents = {
-            inst.parent
-            for inst in instances.values()
-            if inst.class_name == "Bone" and inst.parent is not None
-        }
+        # No joints at all. A bone-only rig (the newer body types such as
+        # Mannequin keep NO Motor6D joints: MeshParts parent one another and
+        # carry Bone children that deform the skinned meshes) still needs a
+        # full rig tree.  Walk the PART parent hierarchy for the skeleton and
+        # let attach_bones hang the deform Bones off their owning parts.
         part_refs = [
             ref
             for ref, inst in instances.items()
@@ -2587,9 +2611,35 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
         ]
         if not part_refs:
             return None
-        rooted = [ref for ref in part_refs if ref in bone_parents]
-        root_ref = rooted[0] if rooted else part_refs[0]
-        root = node_for(root_ref)
+
+        def build_part_tree(part_ref: int) -> dict:
+            node = node_for(part_ref)
+            part = instances[part_ref]
+            for child_inst in (part.children or []):
+                if child_inst is None:
+                    continue
+                if child_inst.class_name not in _BASE_PART_CLASSES:
+                    continue
+                if allowed_parts is not None and child_inst.referent not in allowed_parts:
+                    continue
+                child_node = build_part_tree(child_inst.referent)
+                child_node["pname"] = part.name
+                # No joint exists between parent and child part; identity
+                # transforms keep the child bone exactly at its own world
+                # CFrame inside the parent's chain.
+                child_node["jointtransform0"] = list(_IDENTITY_CF)
+                child_node["jointtransform1"] = list(_IDENTITY_CF)
+                node["children"].append(child_node)
+            return node
+
+        top_refs = [
+            ref
+            for ref in part_refs
+            if instances[ref].parent not in instances
+            or instances[instances[ref].parent].class_name not in _BASE_PART_CLASSES
+        ]
+        root_ref = top_refs[0] if top_refs else part_refs[0]
+        root = build_part_tree(root_ref)
         root["pname"] = instances[root_ref].name
     else:
         root_ref = root_candidates[0]

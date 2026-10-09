@@ -1738,16 +1738,29 @@ def _draco_lib_name() -> str:
     return "libextern_draco.so"
 
 
+def _draco_bridge_lib_name() -> str:
+    # Blender 5.2 dropped the extern_draco shim in favor of
+    # bf_intern_draco_bridge, kept in the same io_scene_gltf2 directory
+    # (see io_scene_gltf2/io/com/library.py in a 5.2 install).
+    if sys.platform == "win32":
+        return "bf_intern_draco_bridge.dll"
+    if sys.platform == "darwin":
+        return "libbf_intern_draco_bridge.dylib"
+    return "libbf_intern_draco_bridge.so"
+
+
 def _get_blender_draco_dll_paths() -> List[Path]:
-    """Candidate paths for the extern_draco decoder, best first.
+    """Candidate paths for the draco decoder, best first.
 
     The glTF importer ships the decoder as ``io_scene_gltf2/extern_draco.*``
     next to its python module, but the layout varies across versions
-    (standard, portable, Blender Launcher, extensions platform), and
-    Blender 5.2 replaced the extern_draco shim with a bridge DLL, so a
-    bundled copy of the decoder ships with the addon as the last resort.
+    (standard, portable, Blender Launcher, extensions platform).  Blender
+    5.2 replaced the extern_draco shim with ``bf_intern_draco_bridge``,
+    which sits in the same addon directory, so both names are probed for
+    every io_scene_gltf2 directory below.
     """
     lib_name = _draco_lib_name()
+    bridge_name = _draco_bridge_lib_name()
     candidates: List[Path] = []
 
     def add(path):
@@ -1758,6 +1771,10 @@ def _get_blender_draco_dll_paths() -> List[Path]:
                 return
             if resolved not in candidates:
                 candidates.append(resolved)
+
+    def add_gltf_dir(gltf_dir):
+        add(gltf_dir / lib_name)
+        add(gltf_dir / bridge_name)
 
     # 1. The glTF module itself knows where its DLL lives (pre-5.2).
     try:
@@ -1790,33 +1807,25 @@ def _get_blender_draco_dll_paths() -> List[Path]:
         if local:
             for scripts_name in ("scripts",):
                 for addons_name in ("addons_core", "addons"):
-                    add(
-                        Path(local) / scripts_name / addons_name
-                        / "io_scene_gltf2" / lib_name
+                    add_gltf_dir(
+                        Path(local) / scripts_name / addons_name / "io_scene_gltf2"
                     )
         for scripts_dir in bpy.utils.script_paths():
             for addons_name in ("addons_core", "addons"):
-                add(
-                    Path(scripts_dir) / addons_name
-                    / "io_scene_gltf2" / lib_name
-                )
+                add_gltf_dir(Path(scripts_dir) / addons_name / "io_scene_gltf2")
     except Exception:
         pass
 
     # 3. Climb upward from the executable for launcher layouts where the
-    # versioned script dir (and Blender 5.2's blender.shared) sit one or
-    # more levels above python.exe.
+    # versioned script dir sits one or more levels above python.exe.
     if sys.executable:
         current = Path(sys.executable).resolve().parent
         for _ in range(8):
             for scripts_name in ("scripts",):
                 for addons_name in ("addons_core", "addons"):
-                    candidate = (
-                        current / scripts_name / addons_name
-                        / "io_scene_gltf2" / lib_name
-                    )
-                    if candidate.exists():
-                        add(candidate)
+                    gltf_dir = current / scripts_name / addons_name / "io_scene_gltf2"
+                    if gltf_dir.exists():
+                        add_gltf_dir(gltf_dir)
             # Pre-4.2 Blender bundled the shim with the python modules
             # (lib/site-packages on Windows, sometimes versioned on mac).
             py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
@@ -1827,13 +1836,9 @@ def _get_blender_draco_dll_paths() -> List[Path]:
                 candidate = current / site_base / lib_name
                 if candidate.exists():
                     add(candidate)
-            candidate = current / "io_scene_gltf2" / lib_name
-            if candidate.exists():
-                add(candidate)
-            # Blender 5.2 keeps the raw draco library in blender.shared/.
-            candidate = current / "blender.shared" / "draco.dll"
-            if candidate.exists():
-                add(candidate)
+            gltf_dir = current / "io_scene_gltf2"
+            if gltf_dir.exists():
+                add_gltf_dir(gltf_dir)
             if current.parent == current:
                 break
             current = current.parent

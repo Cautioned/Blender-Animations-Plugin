@@ -59,7 +59,7 @@ _MAX_IMAGE_BYTES = 64 * 1024 * 1024
 # add-on build or a previous import in the same Blender session carry this
 # stamp; a mismatch forces an in-place rebuild so old datablocks never
 # outlive a graph change.
-_MATERIAL_GRAPH_VERSION = 21
+_MATERIAL_GRAPH_VERSION = 23
 
 # ShaderNodeMix arrived in Blender 3.4; the legacy 3.x build needs the
 # MixRGB equivalent (same blend modes, Fac instead of Factor).
@@ -1463,7 +1463,7 @@ _MATERIAL_MAPS_2022 = {
 }
 
 # Pre-2022 legacy base textures (MaterialService.Use2022Materials=false).
-# Materials missing here render as flat part-colour plastic in legacy places.
+# Materials without a legacy definition use their newer texture set.
 _MATERIAL_MAPS_LEGACY = {
     "Brick": ("7546648254", "7546649654", "", "7546650017"),
     "Cobblestone": ("7546651802", "7546652689", "", "7546652892"),
@@ -1493,8 +1493,10 @@ def _builtin_material_entry(material_id, use_2022=True):
     name = _MATERIAL_NAME_BY_ID.get(material_id)
     if name is None:
         return None
-    table = _MATERIAL_MAPS_2022 if use_2022 else _MATERIAL_MAPS_LEGACY
-    return {"name": name, "maps": table.get(name, ("", "", "", ""))}
+    maps = _MATERIAL_MAPS_2022.get(name, ("", "", "", ""))
+    if not use_2022:
+        maps = _MATERIAL_MAPS_LEGACY.get(name, maps)
+    return {"name": name, "maps": maps}
 
 
 def _effective_material_id(entry: dict):
@@ -2392,7 +2394,7 @@ def build_part_material(
     # MeshPart.TextureID (classic accessories without SurfaceAppearance).
     # Only when no SurfaceAppearance color map was bound, since the two
     # address the same Base Color slot and SurfaceAppearance wins on Roblox.
-    # Skinned/rthro heads skip this: their TextureID is a grayscale+alpha tint
+    # Skinned/rthro heads skip this: their TextureID is an RGBA face
     # map that the clothing pipeline bakes into an opaque composite (raw
     # binding renders black and vanishes in solid/texture viewport mode).
     # Classic R6 dynamic heads also skip it: their SpecialMesh.TextureId is
@@ -2576,7 +2578,7 @@ def _apply_clothing_bake(material, principled, part_name, entry):
     # Classic R6 dynamic heads are plain Parts whose SpecialMesh.TextureId
     # is a full-colour face texture; the standard TextureID path renders it.
     # The clothing bake would overwrite it with a body-colour tint composite.
-    # R15 rthro heads (MeshParts) keep the grayscale tint bake.
+    # R15 dynamic heads (MeshParts) keep the face-over-skin bake.
     if (
         clothing._is_head(part_name)
         and not clothing._CLOTHING_CONTEXT.get("face_texture")

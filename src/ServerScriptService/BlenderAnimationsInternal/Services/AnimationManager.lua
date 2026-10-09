@@ -1170,15 +1170,17 @@ function AnimationManager:loadRig(animationToLoad: KeyframeSequence?, progressCo
 		progressContext:set(0.58, "Preparing animation preview", "syncing keyframes", false)
 	end
 
-	if State.scaleFactor:get() ~= 1 then
-		kfs = Utils.scaleAnimation(kfs, State.scaleFactor:get()) -- Scale the animation
-	end
-
-	-- Ensure the rig holds the loaded animation data so saving back to rig works (even for CurveAnimation-derived clips)
+	-- Keep the rig in source space. Playback and export apply the resizer to
+	-- their generated sequences; syncing a resized preview here applies it
+	-- twice on import and compounds it on subsequent preview rebuilds.
 	if not skipRigSync then
 		pcall(function()
 			syncRigAnimationFromKeyframeSequence(self.animationSerializerService, State.activeRig, kfs)
 		end)
+	end
+
+	if State.scaleFactor:get() ~= 1 then
+		kfs = Utils.scaleAnimation(kfs, State.scaleFactor:get())
 	end
 
 	-- Detect torso animation data on R6 rigs

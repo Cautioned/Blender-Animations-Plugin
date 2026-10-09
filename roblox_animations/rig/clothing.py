@@ -1153,10 +1153,8 @@ def _bake_r6_limb_image(limb: str, body_rgba):
 def _bake_head_pixels_np(np, body_rgba, template_provider, tint_ref=None):
     """Vectorized face-decal/tint-map composite (numpy)."""
     ref = _CLOTHING_CONTEXT.get("face_texture")
-    tint = False
     if not ref and tint_ref:
         ref = tint_ref
-        tint = True
     if not ref:
         return None
     template = template_provider(ref)
@@ -1177,18 +1175,10 @@ def _bake_head_pixels_np(np, body_rgba, template_provider, tint_ref=None):
         # color, exactly like the decal-plane path's alpha multiply.
         sa_arr = sa_arr * face_fade
     buf = np.empty(th * tw * 4, dtype=np.float32).reshape(th, tw, 4)
-    if tint:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            straight = np.where(
-                sa_arr[:, :, None] > 1e-3,
-                np.minimum(tpl_v[:, :, :3] / sa_arr[:, :, None], 1.0),
-                1.0,
-            )
-        inv = (1.0 - sa_arr)[:, :, None]
-        buf[:, :, :3] = straight * sa_arr[:, :, None] + (body * straight) * inv
-    else:
-        inv = (1.0 - sa_arr)[:, :, None]
-        buf[:, :, :3] = tpl_v[:, :, :3] * sa_arr[:, :, None] + body * inv
+    # PNG/native byte images supply straight RGB. Alpha reveals skin; it
+    # must not amplify RGB or multiply the skin by hidden texture colors.
+    inv = (1.0 - sa_arr)[:, :, None]
+    buf[:, :, :3] = tpl_v[:, :, :3] * sa_arr[:, :, None] + body * inv
     buf[:, :, 3] = 1.0
     return tw, th, _encode_rgb(buf.reshape(-1))
 
@@ -1197,21 +1187,16 @@ def _bake_head_pixels(body_rgba, template_provider, tint_ref=None):
     """Body color fill with the face decal alpha-over, 1:1 in the decal's
     own pixel space (the head mesh's UVs address the decal directly).
 
-    When ``tint_ref`` is given instead (rthro/skinned heads with no face
-    decal), the texture is treated as a luminance tint map: output is
-    headColor x straight(rgb), matching Roblox's MeshPart rendering of
-    grayscale+alpha head textures. Blender hands us premultiplied pixels,
-    so rgb is un-premultiplied defensively — the skin region of these
-    maps is white-with-low-alpha and would otherwise read as black.
+    ``tint_ref`` supplies a dynamic head's TextureID when no face decal
+    exists. Both contain straight RGB with alpha revealing the skin color.
+    Composite in linear light, then encode the opaque result for Blender.
     Returns (width, height, buffer) or None."""
     np = _numpy()
     if np is not None:
         return _bake_head_pixels_np(np, body_rgba, template_provider, tint_ref)
     ref = _CLOTHING_CONTEXT.get("face_texture")
-    tint = False
     if not ref and tint_ref:
         ref = tint_ref
-        tint = True
     if not ref:
         return None
     template = template_provider(ref)
@@ -1227,27 +1212,10 @@ def _bake_head_pixels(body_rgba, template_provider, tint_ref=None):
     face_fade = 1.0 - float(_CLOTHING_CONTEXT.get("face_transparency") or 0.0)
     for i in range(0, tw * th * 4, 4):
         sa = (tpl[i + 3] if has_alpha else 1.0) * face_fade
-        if tint:
-            # Rthro tint maps: base = headColor x straight(gray); then the
-            # straight texture alpha-overs on top. Skin is white+transparent
-            # (tint zone -> headColor), eyes are opaque white (stay white),
-            # features are opaque dark.
-            if sa > 1e-3:
-                inv_a = 1.0 / sa
-                sr = min(tpl[i] * inv_a, 1.0)
-                sg = min(tpl[i + 1] * inv_a, 1.0)
-                sb = min(tpl[i + 2] * inv_a, 1.0)
-            else:
-                sr = sg = sb = 1.0
-            inv = 1.0 - sa
-            buf[i] = sr * sa + (br * sr) * inv
-            buf[i + 1] = sg * sa + (bg * sg) * inv
-            buf[i + 2] = sb * sa + (bb * sb) * inv
-        else:
-            inv = 1.0 - sa
-            buf[i] = tpl[i] * sa + br * inv
-            buf[i + 1] = tpl[i + 1] * sa + bg * inv
-            buf[i + 2] = tpl[i + 2] * sa + bb * inv
+        inv = 1.0 - sa
+        buf[i] = tpl[i] * sa + br * inv
+        buf[i + 1] = tpl[i + 1] * sa + bg * inv
+        buf[i + 2] = tpl[i + 2] * sa + bb * inv
         buf[i + 3] = 1.0
     return tw, th, _encode_rgb(buf)
 
@@ -1319,7 +1287,7 @@ def get_limb_texture(part_name: str, body_rgba=None, tint_ref=None):
     if _is_head(part_name):
         if not clothing_available() and not tint_ref:
             return None
-        cache_key = ("head", tint_ref, _context_cache_tag())
+        cache_key = ("head", tint_ref, body_rgb, _context_cache_tag())
         if cache_key in _BAKE_CACHE:
             return _BAKE_CACHE[cache_key]
         try:

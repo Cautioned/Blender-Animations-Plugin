@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core.utils import get_action_fcurves, get_animation_data_action_slot
+from .easing import easing_requires_bake
 
 # Interpolation types with direct Roblox EasingStyle mappings. Every other
 # interpolation is sampled densely so linear Roblox segments reproduce it.
@@ -21,10 +22,42 @@ _ROBLOX_MAPPED_INTERPOLATIONS = {
     "CONSTANT",
     "CUBIC",
     "BOUNCE",
-    "ELASTIC",
 }
 
-FRAME_KEY_PRECISION = 4
+FRAME_KEY_PRECISION = 6
+
+
+def _adaptive_curve_frames(curve, start, end, tolerance=0.0005):
+    """Refine curved samples where a frame-wide linear chord loses motion.
+
+    Nonuniform probes detect overshoot that a midpoint-only check can miss.
+    The depth bound protects export from pathological drivers/modifiers.
+    """
+    evaluate = getattr(curve, "evaluate", None)
+    if evaluate is None or end <= start:
+        return set()
+    result = set()
+
+    def refine(a, b, va, vb, depth):
+        if depth >= 18 or b - a <= 0.000004:
+            return
+        # Nonuniform probes avoid aliasing periodic curves whose quarter and
+        # midpoint samples all happen to lie on the same chord.
+        fractions = (0.2113248654, 0.5, 0.7886751346)
+        probes = [a + (b - a) * fraction for fraction in fractions]
+        values = [evaluate(frame) for frame in probes]
+        if max(abs(value - (va + (vb - va) * fraction))
+               for value, fraction in zip(values, fractions)) <= tolerance:
+            return
+        middle = probes[1]
+        result.add(_norm_frame(middle))
+        refine(a, middle, va, values[1], depth + 1)
+        refine(middle, b, values[1], vb, depth + 1)
+
+    edges = [start] + list(range(math.floor(start) + 1, math.ceil(end))) + [end]
+    for a, b in zip(edges, edges[1:]):
+        refine(a, b, evaluate(a), evaluate(b), 0)
+    return result
 
 
 @dataclass
@@ -98,7 +131,7 @@ def _cyclic_curve_requires_dense(fc) -> bool:
     """
     try:
         for kp in getattr(fc, "keyframe_points", []):
-            if kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS:
+            if easing_requires_bake(kp.interpolation, kp.easing):
                 return True
 
         for mod in getattr(fc, "modifiers", []):
@@ -139,6 +172,7 @@ def build_bake_plan(
     bone_name_pattern = re.compile(r'pose\.bones\["(.+?)"\]')
 
     dense_interpolation_segments: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
+    adaptive_frames = set()
 
     # Interpolations with direct Roblox easing style mappings in this exporter.
     # Any interpolation outside that set is treated as unsupported and
@@ -156,10 +190,18 @@ def build_bake_plan(
             if frame_start <= frame <= frame_end:
                 keyframe_times.add(frame)
 
+            if (i + 1 < len(fcurve.keyframe_points)
+                    and kp.interpolation not in {"LINEAR", "CONSTANT"}
+                    and (has_constraints_local or easing_requires_bake(kp.interpolation, kp.easing))):
+                adaptive_frames.update(_adaptive_curve_frames(
+                    fcurve, max(float(kp.co.x), frame_start),
+                    min(float(fcurve.keyframe_points[i + 1].co.x), frame_end),
+                ))
+
             # The evaluated samples use Linear between adjacent frames, which
             # preserves BEZIER, SINE, QUAD, EXPO, and other unsupported curves.
             if (
-                kp.interpolation not in _ROBLOX_MAPPED_INTERPOLATIONS
+                easing_requires_bake(kp.interpolation, kp.easing)
                 and i + 1 < len(fcurve.keyframe_points)
             ):
                 next_kp = fcurve.keyframe_points[i + 1]
@@ -294,22 +336,24 @@ def build_bake_plan(
             bone_transform_curves[match.group(1)].append(fcurve)
 
     for bone_name_for_curve, curves in bone_transform_curves.items():
-        boundaries = sorted({
-            float(kp.co.x)
+        # Snapshot RNA values once and advance through each curve monotonically.
+        # Baked actions can have thousands of keys per channel; restarting the
+        # scan at every boundary makes their export quadratic in the key count.
+        curve_keys = [
+            [(float(kp.co.x), kp.interpolation) for kp in fcurve.keyframe_points]
             for fcurve in curves
-            for kp in fcurve.keyframe_points
-        })
+        ]
+        boundaries = sorted({frame for keys in curve_keys for frame, _ in keys})
+        cursors = [-1] * len(curve_keys)
         for segment_start, segment_end in zip(boundaries, boundaries[1:]):
             styles = set()
-            for fcurve in curves:
-                outgoing = None
-                for kp in fcurve.keyframe_points:
-                    if kp.co.x <= segment_start + 1e-6:
-                        outgoing = kp
-                    else:
-                        break
-                if outgoing is not None:
-                    styles.add(outgoing.interpolation)
+            for curve_index, keys in enumerate(curve_keys):
+                cursor = cursors[curve_index]
+                while cursor + 1 < len(keys) and keys[cursor + 1][0] <= segment_start + 1e-6:
+                    cursor += 1
+                cursors[curve_index] = cursor
+                if cursor >= 0:
+                    styles.add(keys[cursor][1])
             if len(styles) > 1:
                 mixed_interpolation_segments[bone_name_for_curve].add(
                     (segment_start, segment_end)
@@ -617,10 +661,10 @@ def build_bake_plan(
                 for frame in range(int(math.floor(seg_start)) + 1, int(math.ceil(seg_end)))
                 if frame_start <= frame <= frame_end
             )
-    if subframe_keys or dense_interpolation_frames or mixed_dense_frames:
+    if subframe_keys or dense_interpolation_frames or mixed_dense_frames or adaptive_frames:
         frames = sorted(
             frame for frame in (
-                set(base_frames).union(subframe_keys).union(dense_interpolation_frames).union(mixed_dense_frames)
+                set(base_frames).union(subframe_keys).union(dense_interpolation_frames).union(mixed_dense_frames).union(adaptive_frames)
             )
             if frame_start <= frame <= frame_end
         )

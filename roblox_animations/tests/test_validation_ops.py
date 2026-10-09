@@ -429,12 +429,36 @@ class TestValidationDisplayMapping(unittest.TestCase):
             places=6,
         )
 
-    def test_duration_limit_is_exclusive(self):
-        scene = SimpleNamespace(frame_start=1, frame_end=300)
-
-        self.assertTrue(validation_ops._validate_animation_duration(scene, 30.0))
-        scene.frame_end = 299
+    def test_duration_limits_match_current_curve_validator(self):
+        scene = SimpleNamespace(frame_start=1, frame_end=301)
         self.assertFalse(validation_ops._validate_animation_duration(scene, 30.0))
+        scene.frame_end = 302
+        self.assertTrue(validation_ops._validate_animation_duration(scene, 30.0))
+        scene.frame_end = 1
+        self.assertTrue(validation_ops._validate_animation_duration(scene, 30.0))
+        scene.frame_end = 2
+        self.assertFalse(validation_ops._validate_animation_duration(scene, 30.0))
+
+    def test_duration_uses_exported_time_at_different_frame_rates(self):
+        for fps in (24.0, 30.0, 60.0, 120.0):
+            scene = SimpleNamespace(frame_start=11, frame_end=11 + int(10 * fps))
+            self.assertFalse(validation_ops._validate_animation_duration(scene, fps))
+            scene.frame_end += 1
+            self.assertTrue(validation_ops._validate_animation_duration(scene, fps))
+
+    def test_final_pose_between_sampling_grid_points_is_checked(self):
+        end = 1.005
+        times = validation_ops._build_validation_sample_times(end, 1.0 / 70.0)
+        self.assertEqual(times[-1], end)
+        self.assertTrue(all(a < b for a, b in zip(times, times[1:])))
+        self.assertTrue(all(t <= end for t in times))
+        # A violation occurring only after the final grid point was missed.
+        violations = [t for t in times if t > 1.002]
+        self.assertEqual(violations, [end])
+
+    def test_short_animation_still_checks_both_endpoints(self):
+        self.assertEqual(validation_ops._build_validation_sample_times(0.005, 1.0 / 70.0), [0.0, 0.005])
+
 
     def test_body_envelope_checks_are_relative_to_humanoid_root_part(self):
         root = validation_ops.Vector((0.0, 0.0, 0.0))

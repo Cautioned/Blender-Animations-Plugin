@@ -587,15 +587,15 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     )
 
                     if is_deform_bone:
-                        # Bones built from .rbxm Bone instances have a rest frame
-                        # (matrix_local) that exactly matches the Roblox bone's
-                        # CFrame, so the Roblox-local delta maps directly onto
-                        # matrix_basis with no axis swizzle. Legacy/OBJ deform
-                        # bones use the (-x, y, -z) swizzle basis instead.
+                        # Imported Bone deltas use the Roblox rest basis. A
+                        # rebuilt display bone may point along a different axis;
+                        # conjugate by nicetransform to preserve the same motion.
                         if pose_bone.bone.get("rbx_joint_type") == "Bone" and "transform" in pose_bone.bone:
                             basis = bone_transform.copy()
                             if deform_translation_scale != 1.0:
                                 basis.translation = basis.to_translation() * float(deform_translation_scale)
+                            nice = utils.to_matrix(pose_bone.bone.get("nicetransform"))
+                            basis = nice.inverted() @ basis @ nice
                             pose_bone.matrix_basis = basis
                         else:
                             pose_bone.matrix_basis = _roblox_deform_delta_to_blender(

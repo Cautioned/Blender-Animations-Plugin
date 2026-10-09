@@ -6,6 +6,15 @@ import bpy
 from ..core.utils import get_action_fcurves
 
 
+def easing_requires_bake(interpolation, easing):
+    """Whether Pose easing can reproduce this Blender segment exactly."""
+    return (
+        interpolation not in {"LINEAR", "CONSTANT", "CUBIC", "BOUNCE"}
+        # Studio's Bounce InOut differs from Blender's combined bounce curve.
+        or (interpolation == "BOUNCE" and easing == "EASE_IN_OUT")
+    )
+
+
 def get_easing_for_bone(action, bone_name, frame):
     """
     Gets the interpolation and easing for a bone at a specific frame by checking its f-curves.
@@ -49,13 +58,14 @@ def map_blender_to_roblox_easing(interpolation, easing):
     Maps Blender's f-curve interpolation and easing properties to Roblox's
     EasingStyle and EasingDirection enums.
     """
+    if easing_requires_bake(interpolation, easing):
+        return "Linear", "Out"
     # Define the direct mappings from Blender interpolation types to Roblox EasingStyles.
     style_map = {
         "LINEAR": "Linear",
         "CONSTANT": "Constant",
         "CUBIC": "CubicV2",
         "BOUNCE": "Bounce",
-        "ELASTIC": "Elastic",
     }
 
     roblox_style = style_map.get(interpolation, None)
@@ -65,17 +75,19 @@ def map_blender_to_roblox_easing(interpolation, easing):
     if roblox_style is None:
         return "Linear", "Out"
 
-    # Constant easing in Roblox doesn't use a direction, but "Out" is the closest
-    # semantic equivalent to Blender's "hold" behavior.
-    if roblox_style == "Constant":
-        return "Constant", "Out"
+    # Constant Out holds the previous pose; In jumps to the next pose immediately.
+    # Linear is independent of direction, so use a canonical value.
+    if roblox_style in {"Constant", "Linear"}:
+        return roblox_style, "Out"
 
     # If the style was supported, map the easing direction.
-    # PoseEasingDirection has the opposite In/Out convention to Blender and
-    # TweenService: Pose.Out is the forward (slow-start) curve.
+    # Verified against Animator:StepAnimations, not just enum names.
+    # Blender AUTO uses ease-out for bounce/elastic and ease-in for cubic.
+    if easing == "AUTO":
+        easing = "EASE_OUT" if interpolation in {"BOUNCE", "ELASTIC"} else "EASE_IN"
     direction_map = {
-        "EASE_IN": "Out",
-        "EASE_OUT": "In",
+        "EASE_IN": "In",
+        "EASE_OUT": "Out",
         "EASE_IN_OUT": "InOut",
     }
     # Default to "Out" if the Blender easing type is something unexpected.

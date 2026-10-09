@@ -241,6 +241,14 @@ class TestAnimationSerialization(unittest.TestCase):
             # The setUp will handle the full cleanup.
             pass
 
+    def assert_frame_coverage(self, keyframes, count):
+        """Dense exports may add subframes, but must retain every whole frame."""
+        scene = bpy.context.scene
+        fps = scene.render.fps / scene.render.fps_base
+        frames = {round(row["t"] * fps + scene.frame_start, 5) for row in keyframes}
+        expected = set(range(scene.frame_start, scene.frame_start + count))
+        self.assertTrue(expected <= frames, f"Missing evaluated frames: {sorted(expected - frames)}")
+
     def set_action_interpolation(self, action, interpolation="LINEAR"):
         """Helper to set interpolation for all keyframes in an action."""
         from ..core.utils import get_action_fcurves
@@ -520,11 +528,7 @@ class TestAnimationSerialization(unittest.TestCase):
         expected_frames = (
             bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
         )
-        self.assertEqual(
-            len(keyframes),
-            expected_frames,
-            f"Expected {expected_frames} keyframes for full-range bake, but got {len(keyframes)}.",
-        )
+        self.assert_frame_coverage(keyframes, expected_frames)
 
         # Check that the unanimated root bone is not in the keyframes
         for kf in keyframes:
@@ -634,11 +638,7 @@ class TestAnimationSerialization(unittest.TestCase):
         expected_frames = (
             bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
         )
-        self.assertEqual(
-            len(keyframes),
-            expected_frames,
-            f"Expected {expected_frames} baked frames for complex rig, but got {len(keyframes)}.",
-        )
+        self.assert_frame_coverage(keyframes, expected_frames)
 
         # Check that the main animated bones are present
         constrained_bones = {"UpperLeg", "LowerLeg", "Foot"}
@@ -725,11 +725,7 @@ class TestAnimationSerialization(unittest.TestCase):
         # The 'ParentBone' is animated sparsely, but the hybrid bake logic will also
         # insert keys for it at frames where other significant events happen (like the constraint's influence changing).
         # Frames 1, 5, 10, 20 are the key moments.
-        self.assertEqual(
-            len(keyframes),
-            20,
-            "Expected 20 frames for a rig with an animated constraint.",
-        )
+        self.assert_frame_coverage(keyframes, 20)
 
         child_bone_name = "ChildBone"
         parent_bone_name = "ParentBone"
@@ -750,7 +746,7 @@ class TestAnimationSerialization(unittest.TestCase):
         )
         self.assertEqual(
             parent_keyframe_count,
-            expected_frames,
+            len(keyframes),
             f"Parent bone should appear in all {expected_frames} frames with full-range bake.",
         )
 
@@ -987,11 +983,7 @@ class TestAnimationSerialization(unittest.TestCase):
         )
         keyframes = result["kfs"]
 
-        self.assertEqual(
-            len(keyframes),
-            20,
-            "Expected a full 20 frames for the branched rig with constraints.",
-        )
+        self.assert_frame_coverage(keyframes, 20)
 
         constrained_bones = {"L_UpperArm", "L_LowerArm", "R_UpperArm", "R_LowerArm"}
         sparse_bone = "Torso"
@@ -1013,7 +1005,7 @@ class TestAnimationSerialization(unittest.TestCase):
         )
         self.assertEqual(
             torso_keyframe_count,
-            expected_torso_frames,
+            len(keyframes),
             f"Expected {expected_torso_frames} keyframes for full-range baked 'Torso' bone, but found {torso_keyframe_count}.",
         )
 
@@ -1334,11 +1326,7 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertTrue(result, "Serialization returned no result for easing test.")
         keyframes = result["kfs"]
 
-        self.assertEqual(
-            len(keyframes),
-            20,
-            "Unsupported interpolation should be densely sampled for fidelity.",
-        )
+        self.assert_frame_coverage(keyframes, 20)
 
         first_frame_kf = keyframes[0]["kf"]
 
@@ -1388,7 +1376,7 @@ class TestAnimationSerialization(unittest.TestCase):
             constant_data[2], "Out", "Constant easing direction did not map correctly."
         )
 
-        # Pose easing uses the opposite In/Out convention to Blender.
+        # Linear interpolation is independent of direction.
         # Check LinearEase (LINEAR, EASE_IN) -> ("Linear", "Out")
         linear_data = first_frame_kf.get("LinearEase")
         self.assertIsNotNone(linear_data, "LinearEase bone missing from keyframe.")
@@ -1399,21 +1387,21 @@ class TestAnimationSerialization(unittest.TestCase):
             linear_data[2], "Out", "Linear easing direction did not map correctly."
         )
 
-        # Check BounceEase (BOUNCE, EASE_OUT) -> ("Bounce", "In")
+        # Check BounceEase (BOUNCE, EASE_OUT) -> ("Bounce", "Out")
         bounce_data = first_frame_kf.get("BounceEase")
         self.assertIsNotNone(bounce_data, "BounceEase bone missing from keyframe.")
         self.assertEqual(
             bounce_data[1], "Bounce", "Bounce easing style did not map correctly."
         )
         self.assertEqual(
-            bounce_data[2], "In", "Bounce easing direction did not map correctly."
+            bounce_data[2], "Out", "Bounce easing direction did not map correctly."
         )
 
-        # Check ElasticEase (ELASTIC, EASE_IN) -> ("Elastic", "Out")
+        # Elastic must be sampled: Roblox uses a different elastic curve.
         elastic_data = first_frame_kf.get("ElasticEase")
         self.assertIsNotNone(elastic_data, "ElasticEase bone missing from keyframe.")
         self.assertEqual(
-            elastic_data[1], "Elastic", "Elastic easing style did not map correctly."
+            elastic_data[1], "Linear", "Elastic samples must use linear interpolation."
         )
         self.assertEqual(
             elastic_data[2], "Out", "Elastic easing direction did not map correctly."
@@ -1550,7 +1538,7 @@ class TestAnimationSerialization(unittest.TestCase):
         )
 
     def test_easing_with_external_copy_transforms_rig(self):
-        """Ensure constrained rig inherits easing from the target rig."""
+        """Evaluated constraint samples must not apply the source easing twice."""
         # --- SETUP: Master rig ---
         bpy.ops.object.add(type="ARMATURE", enter_editmode=True, location=(0, 0, 0))
         master_obj = bpy.context.object
@@ -1661,17 +1649,17 @@ class TestAnimationSerialization(unittest.TestCase):
         # --- ASSERTION ---
         self.assertTrue(result, "Serialization returned no result for constrained easing test.")
         keyframes = result["kfs"]
-        self.assertEqual(len(keyframes), 10, "Expected a full 10 frames for constrained rig.")
+        self.assertGreaterEqual(len(keyframes), 10, "Expected every frame plus curved subframe samples.")
 
         first_kf = keyframes[0]["kf"]
         last_kf = keyframes[-1]["kf"]
 
         expected = {
-            "FollowerLinear": ("Linear", "In"),
-            "FollowerCubic": ("CubicV2", "InOut"),
+            "FollowerLinear": ("Linear", "Out"),
+            "FollowerCubic": ("Linear", "Out"),
             "FollowerConstant": ("Constant", "Out"),
-            "FollowerBounce": ("Bounce", "Out"),
-            "FollowerElastic": ("Elastic", "In"),
+            "FollowerBounce": ("Linear", "Out"),
+            "FollowerElastic": ("Linear", "Out"),
         }
 
         for bone_name, (style, direction) in expected.items():
@@ -2265,11 +2253,7 @@ class TestAnimationSerialization(unittest.TestCase):
         expected_frames = (
             bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
         )
-        self.assertEqual(
-            len(result["kfs"]),
-            expected_frames,
-            f"Expected {expected_frames} keyframes for full-range deform rig animation.",
-        )
+        self.assert_frame_coverage(result["kfs"], expected_frames)
 
         last_frame_data = result["kfs"][-1]["kf"]
         self.assertIn(
@@ -2935,11 +2919,7 @@ class TestAnimationSerialization(unittest.TestCase):
         # --- ASSERTION ---
         self.assertIsNotNone(result, "Serialization returned None for stress test.")
         # Due to the IK constraint, we expect a full bake
-        self.assertEqual(
-            len(result["kfs"]),
-            FRAME_COUNT,
-            f"Expected {FRAME_COUNT} keyframes for stress test.",
-        )
+        self.assert_frame_coverage(result["kfs"], FRAME_COUNT)
         # Check that the last bone in the chain is present in a keyframe
         self.assertIn(
             last_bone_name,
@@ -3085,11 +3065,7 @@ class TestAnimationSerialization(unittest.TestCase):
             expected_sparse_frames,
             f"Sparse with full-range should have {expected_sparse_frames} keyframes",
         )
-        self.assertEqual(
-            len(full_result["kfs"]),
-            FRAME_COUNT,
-            f"Full should have {FRAME_COUNT} keyframes",
-        )
+        self.assert_frame_coverage(full_result["kfs"], FRAME_COUNT)
 
         # Verify keyframe ordering
         sparse_times = [kf["t"] for kf in sparse_result["kfs"]]
@@ -3226,11 +3202,7 @@ class TestAnimationSerialization(unittest.TestCase):
         # The bezier curve is between frame 1 and 10.
         # This means we expect 10 frames of data (1, 2, 3, 4, 5, 6, 7, 8, 9, 10).
         self.assertIn("kfs", result, "Result should have keyframes.")
-        self.assertEqual(
-            len(result["kfs"]),
-            10,
-            "Expected 10 baked keyframes for the 10-frame bezier segment.",
-        )
+        self.assert_frame_coverage(result["kfs"], 10)
 
         # Check that the bone is present in all keyframes
         for kf in result["kfs"]:
@@ -3743,7 +3715,7 @@ class TestAnimationSerialization(unittest.TestCase):
         expected_frames = (
             bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
         )
-        self.assertEqual(len(result["kfs"]), expected_frames)
+        self.assert_frame_coverage(result["kfs"], expected_frames)
         self.assertTrue(
             result.get("is_deform_bone_rig"), "Skinned rig should be flagged as deform"
         )
@@ -3941,7 +3913,7 @@ class TestAnimationSerialization(unittest.TestCase):
 
         result = serialize(armature_obj)
 
-        self.assertEqual(len(result["kfs"]), 3)
+        self.assert_frame_coverage(result["kfs"], 3)
         for keyframe in result["kfs"]:
             self.assertIn("Control", keyframe["kf"])
             self.assertIn("DeformChild", keyframe["kf"])
@@ -4025,7 +3997,7 @@ class TestAnimationSerialization(unittest.TestCase):
         result = serialize(armature_obj)
 
         self.assertNotIn("deform_rest_world", result)
-        self.assertEqual(len(result["kfs"]), 3)
+        self.assert_frame_coverage(result["kfs"], 3)
         lower_torso_samples = []
         for keyframe in result["kfs"]:
             self.assertIn("LowerTorso", keyframe["kf"])
@@ -4468,7 +4440,7 @@ class TestAnimationSerialization(unittest.TestCase):
         expected_frames = (
             bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
         )
-        self.assertEqual(len(result["kfs"]), expected_frames)
+        self.assert_frame_coverage(result["kfs"], expected_frames)
 
         helper_cframe = result["kfs"][-1]["kf"].get("HelperChild")
         self.assertIsNotNone(helper_cframe, "Helper child data missing from export")

@@ -3,7 +3,7 @@ validation operators and viewport overlay for roblox animation validation.
 
 performs comprehensive validation checks including:
 - per-frame world displacement of each limb (bone) against max studs/frame threshold
-- animation duration limits (strictly less than 10 seconds)
+- animation duration limits (greater than zero, at most 10 seconds)
 - root displacement from its initial position
 - body-part height and distance from HumanoidRootPart
 - standard R15 hierarchy checks
@@ -50,17 +50,19 @@ _validation_display_armature_name: str = ""  # armature the overlay maps onto
 _validation_display_units_per_stud: float = 1.0  # world units per stud of that armature
 
 # Values below match the live Roblox UGC CurveAnimation validator
-# (ValidateCurveAnimation.lua + FFlag tracker, 2026-08-22). The user-facing
-# motion benchmark remains configurable.
+# (ValidateCurveAnimation.lua at 41ab074bc29dd2a51a5bb17bc3498e0465842794,
+# checked against clientsettingscdn.roblox.com PCStudioApp on 2026-10-08).
+# The user-facing motion benchmark remains configurable.
 #   UGCValidationMaxAnimationDeltas   = 1 (studs/frame at the 30 fps benchmark)
 #   UGCValidationMaxAnimationBounds   = 5 (studs from HumanoidRootPart)
 #   UGCValidateAnimationHeightTol     = -3.1 (studs below HumanoidRootPart)
 #   UGCValidateMaxAnimationFPS        = 70 (tracker sampling rate)
-#   UGCValidationMaxAnimationLength   = 10 (seconds; the limit is exclusive)
+#   UGCValidationMaxAnimationLength   = 10 (seconds; the upper limit is inclusive)
 #   UGCValidateCurveAnimationMinLength = 0
 #   UGCValidateCurveAnimRotationSpeed = false (rotation-speed check disabled)
 #   UGCValidateMaxAnimationMovement   = 100 (positional separation effectively off)
-ANIM_MAX_DURATION = 10.0  # seconds; the limit is exclusive
+ANIM_MAX_DURATION = 10.0  # seconds; the upper limit is inclusive
+ANIM_MIN_DURATION = 0.0  # seconds; the lower limit is exclusive
 ANIM_FPS = 30.0  # default-frame benchmark used by the Roblox movement flag
 ANIM_VALIDATION_FPS = 70.0  # Roblox's CurveAnimation sampler
 ANIM_MAX_DELTA = 1.0  # studs per frame at ANIM_FPS
@@ -466,15 +468,22 @@ def _collect_rig_display_positions(
 def _build_validation_sample_times(
     anim_length_seconds: float, sample_delta: float
 ) -> List[float]:
-    """Mirror the tracker's sampling grid: t = 0..length inclusive at a fixed
-    delta (1/UGCValidateMaxAnimationFPS)."""
+    """Sample the fixed grid and the exact endpoint, as Roblox now does.
+
+    UGCValidateCurveAnimFinalFrameBug is enabled in Studio. The final pose
+    must be checked even when it falls between two 70 Hz samples.
+    """
+    if not math.isfinite(sample_delta) or sample_delta <= 0:
+        raise ValueError("Validation sample interval must be positive and finite")
+    if not math.isfinite(anim_length_seconds):
+        raise ValueError("Animation length must be finite")
+    end = max(0.0, anim_length_seconds)
     sample_times: List[float] = []
     time_s = 0.0
-    while time_s <= anim_length_seconds + _VALIDATION_SCALE_EPSILON:
+    while time_s < end - _VALIDATION_SCALE_EPSILON:
         sample_times.append(time_s)
         time_s += sample_delta
-    if not sample_times:
-        sample_times = [0.0]
+    sample_times.append(end)
     return sample_times
 
 
@@ -814,16 +823,16 @@ def _draw_motionpath_labels():
 
 
 def _validate_animation_duration(scene, fps: float) -> List[str]:
-    """Validate animation duration against Roblox limits."""
-    warnings = []
-    duration = (scene.frame_end - scene.frame_start + 1) / fps
-
-    if duration >= ANIM_MAX_DURATION:
-        warnings.append(
-            f"Animation duration {duration:.2f}s must be less than {ANIM_MAX_DURATION}s"
-        )
-
-    return warnings
+    """Use the last exported key's time, not an inclusive frame count."""
+    if not math.isfinite(fps) or fps <= 0:
+        return ["Animation frame rate must be positive and finite"]
+    duration = (scene.frame_end - scene.frame_start) / fps
+    if duration <= ANIM_MIN_DURATION or duration > ANIM_MAX_DURATION:
+        return [
+            f"Animation duration {duration:.3f}s must be greater than "
+            f"{ANIM_MIN_DURATION:g} and at most {ANIM_MAX_DURATION:g} seconds"
+        ]
+    return []
 
 
 def _resolve_motion_threshold_for_fps(
@@ -1088,8 +1097,8 @@ class OBJECT_OT_ValidateMotionPaths(Operator):
         duration_warnings = _validate_animation_duration(scene, fps)
         all_warnings.extend(duration_warnings)
         source_warning = (
-            "CurveAnimation hierarchy, loop state, marker count, and Marketplace-only "
-            "duration minimum cannot be verified in Blender; verify them in Studio."
+            "Blender checks motion only. Verify upload structure, looping, "
+            "curve key limits, face controls, and markers in Studio."
         )
         all_warnings.append(source_warning)
         self.report({"WARNING"}, source_warning)
