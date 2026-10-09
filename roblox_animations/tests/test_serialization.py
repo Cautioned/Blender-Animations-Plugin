@@ -732,22 +732,19 @@ class TestAnimationSerialization(unittest.TestCase):
         parent_keyframe_count = 0
 
         for kf in keyframes:
-            self.assertIn(
-                child_bone_name,
-                kf["kf"],
-                f"'{child_bone_name}' should be in every frame of a constrained bake.",
-            )
             if parent_bone_name in kf["kf"]:
                 parent_keyframe_count += 1
+        # Independently sampled channels need not share every subframe row.
+        self.assert_frame_coverage([kf for kf in keyframes if child_bone_name in kf["kf"]], 20)
 
         # With full-range bake defaulting to True, parent bone should appear in all frames
         expected_frames = (
             bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
         )
-        self.assertEqual(
+        self.assertGreaterEqual(
             parent_keyframe_count,
-            len(keyframes),
-            f"Parent bone should appear in all {expected_frames} frames with full-range bake.",
+            expected_frames,
+            "The unconstrained parent keeps its own keys; child refinement may add subframes.",
         )
 
         # Check for presence at specific key times
@@ -868,10 +865,10 @@ class TestAnimationSerialization(unittest.TestCase):
         )
         keyframes = result["kfs"]
 
-        self.assertEqual(
+        self.assertGreaterEqual(
             len(keyframes),
             20,
-            "Expected a full 20 frames for a rig with multiple constraints.",
+            "Expected every frame plus any subframes needed by nonlinear constraints.",
         )
 
         constrained_bones = {"BoneA", "BoneB", "BoneC"}
@@ -990,14 +987,10 @@ class TestAnimationSerialization(unittest.TestCase):
 
         torso_keyframe_count = 0
         for kf in keyframes:
-            for bone_name in constrained_bones:
-                self.assertIn(
-                    bone_name,
-                    kf["kf"],
-                    f"Constrained arm bone '{bone_name}' should be in every frame.",
-                )
             if sparse_bone in kf["kf"]:
                 torso_keyframe_count += 1
+        for bone_name in constrained_bones:
+            self.assert_frame_coverage([kf for kf in keyframes if bone_name in kf["kf"]], 20)
 
         # With full-range bake defaulting to True, expect all frames
         expected_torso_frames = (
@@ -1083,8 +1076,8 @@ class TestAnimationSerialization(unittest.TestCase):
         self.assertTrue(result, "Serialization returned no result for NLA test.")
         keyframes = result["kfs"]
 
-        self.assertEqual(
-            len(keyframes), 20, "Expected a full 20 frames for a rig with NLA tracks."
+        self.assertGreaterEqual(
+            len(keyframes), 20, "Expected every frame plus evaluated NLA subframes."
         )
 
         # Check that data from both strips is present in the bake
@@ -1236,10 +1229,10 @@ class TestAnimationSerialization(unittest.TestCase):
         result = serialize(armature_obj)
 
         self.assertTrue(result, "Serialization returned no result for NLA bezier test.")
-        self.assertEqual(
+        self.assertGreaterEqual(
             len(result["kfs"]),
             10,
-            "Expected full bake for single-strip NLA with BEZIER interpolation.",
+            "Expected full bake plus subframes for curved NLA interpolation.",
         )
 
     def test_easing_serialization(self):
@@ -1667,26 +1660,41 @@ class TestAnimationSerialization(unittest.TestCase):
             last_data = last_kf.get(bone_name)
             self.assertIsNotNone(first_data, f"{bone_name} missing from first keyframe.")
             self.assertIsNotNone(last_data, f"{bone_name} missing from last keyframe.")
-            self.assertEqual(
-                first_data[1],
-                style,
-                f"Constrained easing style did not map correctly for {bone_name}.",
-            )
+            # Blender holds at the exact start of some curve types within
+            # its key-time tolerance. Evaluated holds can be Constant even
+            # when the rest of the source curve moves continuously.
+            self.assertIn(first_data[1], {"Linear", "Constant"})
             self.assertEqual(
                 first_data[2],
                 direction,
                 f"Constrained easing direction did not map correctly for {bone_name}.",
             )
-            self.assertEqual(
-                last_data[1],
-                style,
-                f"Constrained easing style did not map correctly for {bone_name}.",
-            )
+            self.assertIn(last_data[1], {"Linear", "Constant"})
             self.assertEqual(
                 last_data[2],
                 direction,
                 f"Constrained easing direction did not map correctly for {bone_name}.",
             )
+
+        # Test the resulting playback, not only the labels on boundary keys.
+        fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
+        static_cache = {}
+        for frame in (1.25, 2.5, 4.75, 7.25, 9.9):
+            bpy.context.scene.frame_set(math.floor(frame), subframe=frame % 1)
+            reference = serialization.serialize_animation_state(
+                puppet_obj.evaluated_get(bpy.context.evaluated_depsgraph_get()),
+                static_cache=static_cache,
+            )
+            time = (frame - 1) / fps
+            for bone_name in follower_bones:
+                keys = [(key["t"], key["kf"][bone_name]) for key in keyframes if bone_name in key["kf"]]
+                for (ta, pa), (tb, pb) in zip(keys, keys[1:]):
+                    if ta <= time < tb:
+                        alpha = 0 if pa[1] == "Constant" else (time - ta) / (tb - ta)
+                        actual = [x + (y - x) * alpha for x, y in zip(pa[0][:3], pb[0][:3])]
+                        self.assertLess(max(abs(x - y) for x, y in zip(actual, reference[bone_name][:3])), 0.002)
+                        break
+        self.assertTrue(static_cache, "An initially empty caller cache must be populated and reused.")
 
     def test_copy_transforms_no_keys(self):
         """

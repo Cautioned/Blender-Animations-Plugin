@@ -144,6 +144,17 @@ def _apply_mesh_custom_normals(mesh, vertices):
     if not loop_count or getattr(mesh, "is_editmode", False):
         return False
 
+    # FileMesh triangles can repeat a vertex. Blender 5.2's normal fan
+    # builder leaves corner-space entries unset for these invalid faces,
+    # and the custom-normal setter then access-violates (not catchable in
+    # Python). Validate topology before entering that native routine.
+    # UVs already exist here; Blender remaps their corner data as it removes
+    # invalid faces. Keep valid custom data and the original vertex indexing.
+    mesh.validate(clean_customdata=False)
+    if len(mesh.vertices) != len(normals) or not mesh.loops:
+        return False
+    loop_count = len(mesh.loops)
+
     if hasattr(mesh, "use_auto_smooth"):
         mesh.use_auto_smooth = True
     if hasattr(mesh, "normals_split_custom_set_from_vertices"):
