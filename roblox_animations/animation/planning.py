@@ -27,6 +27,91 @@ _ROBLOX_MAPPED_INTERPOLATIONS = {
 FRAME_KEY_PRECISION = 6
 
 
+def constant_dependency_frames(armature, frame_start, frame_end):
+    """Return step times only when the entire rig dependency graph is stepped.
+
+    Unkeyed helper bones and static setup keys do not describe the motion of
+    a constrained output. Follow object dependencies, including parent rigs,
+    and prove that all animation inputs hold between keys. Otherwise retain
+    the normal sampled export path; never freeze a mixed/continuous rig.
+    """
+    pending, seen, frames = [armature], set(), set()
+    while pending:
+        obj = pending.pop()
+        if obj in seen:
+            continue
+        seen.add(obj)
+        if obj.parent:
+            pending.append(obj.parent)
+        for owner in (obj, obj.data):
+            animation = getattr(owner, "animation_data", None)
+            if not animation:
+                continue
+            if animation.drivers or any(
+                not track.mute and len(track.strips) for track in animation.nla_tracks
+            ):
+                return None
+            action = animation.action
+            if not action:
+                continue
+            for curve in get_action_fcurves(
+                action, slot=get_animation_data_action_slot(animation, action=action)
+            ):
+                if curve.mute:
+                    continue
+                modifiers = [modifier for modifier in curve.modifiers if not modifier.mute]
+                if any(modifier.type != "CYCLES" or modifier.use_restricted_range
+                       or (modifier.use_influence and modifier.influence != 1.0)
+                       or modifier.mode_before == "MIRROR" or modifier.mode_after == "MIRROR"
+                       for modifier in modifiers) or len(modifiers) > 1:
+                    return None
+                keys = list(curve.keyframe_points)
+                if not keys:
+                    return None
+                if curve.extrapolation != "CONSTANT":
+                    return None
+                # A single setup key is static regardless of its easing.
+                if any(key.interpolation != "CONSTANT" for key in keys[:-1]):
+                    return None
+                frames.update(_norm_frame(key.co.x) for key in keys)
+                if modifiers and len(keys) > 1:
+                    cycle = modifiers[0]
+                    start, end = keys[0].co.x, keys[-1].co.x
+                    duration = end - start
+                    if duration <= 0:
+                        return None
+                    for index in range(math.floor((frame_start - start) / duration),
+                                       math.ceil((frame_end - start) / duration) + 1):
+                        if index == 0:
+                            continue
+                        mode = cycle.mode_before if index < 0 else cycle.mode_after
+                        count = cycle.cycles_before if index < 0 else cycle.cycles_after
+                        if mode == "NONE" or (count and abs(index) > count):
+                            continue
+                        for key in keys:
+                            offset = end - key.co.x if mode == "MIRROR" and index % 2 else key.co.x - start
+                            frame = start + index * duration + offset
+                            if frame_start <= frame <= frame_end:
+                                frames.add(_norm_frame(frame))
+        constraints = list(obj.constraints)
+        if obj.type == "ARMATURE":
+            constraints.extend(c for bone in obj.pose.bones for c in bone.constraints)
+        for constraint in constraints:
+            if constraint.mute:
+                continue
+            # These can move with scene time without ordinary action curves.
+            if constraint.type in {"FOLLOW_PATH", "CLAMP_TO", "TRANSFORM_CACHE"}:
+                return None
+            for attr in ("target", "pole_target"):
+                target = getattr(constraint, attr, None)
+                if target:
+                    pending.append(target)
+            for target in getattr(constraint, "targets", ()):
+                if target.target:
+                    pending.append(target.target)
+    return frames or None
+
+
 def _adaptive_curve_frames(curve, start, end, tolerance=0.0005):
     """Refine curved samples where a frame-wide linear chord loses motion.
 

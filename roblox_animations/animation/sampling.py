@@ -45,7 +45,7 @@ def serialize_animation_state(
 
     # Local bindings for speed.
     pose_bones = ao.pose.bones
-    cache: Dict[str, Dict[str, Any]] = static_cache or {}
+    cache: Dict[str, Dict[str, Any]] = static_cache if static_cache is not None else {}
 
     def ensure_cache(name: str) -> Dict[str, Any]:
         entry = cache.get(name)

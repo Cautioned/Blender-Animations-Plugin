@@ -12,7 +12,7 @@ Pipeline stages:
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import bpy
@@ -35,6 +35,7 @@ from .face_controls import (
 from .ir import KeyframePayload, PoseEntry, keyframes_equivalent, pose_entries_equivalent
 from .planning import (
     build_bake_plan,
+    constant_dependency_frames,
     frame_in_set,
     lookup_interp_for_frame,
 )
@@ -497,6 +498,8 @@ class ExportAnalysis:
     has_constraints: bool
     has_drivers: bool
     has_constraint_target_action: bool
+    visual_samples: Dict[float, Dict[str, List[float]]] = field(default_factory=dict)
+    visual_keyframes: Set[float] = field(default_factory=set)
 
 
 def _analyze_export(
@@ -698,6 +701,7 @@ def _bake_full(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]]:
             shared_cache,
             analysis.excluded_face_bones,
         )
+        analysis.visual_samples[float(i)] = dict(state)
         face_state, _ = _serialize_face_control_state_for_frame(
             ao,
             analysis.face_export_context,
@@ -831,7 +835,14 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
     # per-channel easing reduces to per-pose easing.
     frame_start = ctx.scene.frame_start
     frame_end = ctx.scene.frame_end
+    stepped_dependency_frames = (
+        constant_dependency_frames(ao, frame_start, frame_end) if has_constraints_local else None
+    )
     keyframe_times = {frame_start, frame_end}
+    if stepped_dependency_frames is not None:
+        keyframe_times.update(
+            frame for frame in stepped_dependency_frames if frame_start <= frame <= frame_end
+        )
     keyframe_times.update(face_export_context.get("keyed_frames") or set())
 
     all_fcurves = []
@@ -854,6 +865,7 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
         has_constraints_local,
         getattr(ctx.scene, "frame_step", 1) or 1,
     )
+    analysis.visual_keyframes.update(plan.keyframe_times)
 
     # 3. Single baking pass: sample -> reduce -> collect.
     collected: List[KeyframePayload] = []
@@ -888,6 +900,7 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
                 excluded_face_bones,
             )
         )
+        analysis.visual_samples[float(frame)] = dict(current_full_pose)
 
         if analysis.is_skinned_rig and last_baked_states:
             for bone_name in last_baked_states:
@@ -923,6 +936,7 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
                 frame_in_set(bone_keyframes, frame)
                 or frame_in_set(set(constraint_keyframes.keys()) if constraint_keyframes else None, frame)
                 or is_cyclic_key
+                or frame_in_set(stepped_dependency_frames, frame)
                 or is_cyclic_boundary
             ):
                 # If an animated bone is at its rest pose on an explicit keyframe,
@@ -1045,6 +1059,12 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
                 cached_constraint = lookup_interp_for_frame(plan.constraint_target_easing[bone_name], frame)
                 if cached_constraint:
                     interpolation, easing = cached_constraint
+
+            # The evaluated rig holds between every dependency key. A static
+            # setup key or an unkeyed helper target must not turn those holds
+            # into linear ramps immediately before the next stepped pose.
+            if stepped_dependency_frames is not None and (is_constrained or is_non_inheriting):
+                interpolation, easing = "CONSTANT", "EASE_OUT"
 
             if interpolation:
                 roblox_style, roblox_direction = map_blender_to_roblox_easing(
@@ -1252,6 +1272,44 @@ def _serialize_evaluated(ao, target_bone_rest=None):
         else:
             duration, collected = _bake_single_frame(analysis)
 
+        # Constraint/driver inputs do not describe the interpolation of the
+        # evaluated output. Fit that output, including subframe IK motion and
+        # holds whose controls live behind drivers or unkeyed helper bones.
+        visual_bones = get_all_constrained_bones(ao) | get_all_driven_bones(ao)
+        visual_bones.update(b.name for b in ao.pose.bones if not b.bone.use_inherit_rotation)
+        if analysis.use_nla_bake:
+            visual_bones.update(name for key in collected for name in key.poses)
+        if analysis.is_skinned_rig:
+            visual_bones = get_deform_descendant_bones(ao, visual_bones)
+        visual_diagnostics = {}
+        if visual_bones:
+            from .visual_bake import refine_visual_bake
+
+            sample_cache = {}
+
+            def sample_visual(frame):
+                whole = math.floor(frame)
+                ctx.scene.frame_set(whole, subframe=frame - whole)
+                return serialize_combined_animation_state(
+                    ao, ao.evaluated_get(analysis.depsgraph), analysis.run_deform_path,
+                    analysis.is_skinned_rig, analysis.back_trans_cached,
+                    analysis.world_transform_cached, analysis.scale_factor_cached,
+                    sample_cache, analysis.excluded_face_bones,
+                )
+
+            collected = refine_visual_bake(
+                collected, visual_bones, sample_visual, ctx.scene.frame_start,
+                ctx.scene.frame_end, analysis.desired_fps, visual_diagnostics,
+                seed_samples=analysis.visual_samples,
+                keyframes=analysis.visual_keyframes,
+            )
+            if visual_diagnostics.get("limited_segments"):
+                print(
+                    "Blender Addon: Visual bake reached its sampling limit for "
+                    f"{visual_diagnostics['limited_segments']} segments. "
+                    "Check exported playback for this rig."
+                )
+
         result = {
             "t": duration,
             "kfs": [keyframe.to_payload() for keyframe in collected],
@@ -1305,6 +1363,7 @@ def _serialize_evaluated(ao, target_bone_rest=None):
             "armature_object_scale": float(_uniform_object_scale(ao) or 1.0),
             "armature_object_scale_axes": [float(value) for value in object_scale_axes],
             "armature_object_scale_uniform": bool(object_scale_uniform),
+            "visual_bake_limited_segments": visual_diagnostics.get("limited_segments", 0),
             "deform_position_scale_reliable": bool(
                 (not auto_deform_scale) or object_scale_uniform
             ),
