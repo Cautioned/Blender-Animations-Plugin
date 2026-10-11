@@ -39,6 +39,12 @@ local function getJointParts(joint: CacheableJoint): (BasePart?, BasePart?)
 		local attachment1 = joint.Attachment1
 		local part0 = attachment0 and attachment0.Parent
 		local part1 = attachment1 and attachment1.Parent
+		while part0 and not part0:IsA("BasePart") do
+			part0 = part0.Parent
+		end
+		while part1 and not part1:IsA("BasePart") do
+			part1 = part1.Parent
+		end
 		if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
 			return part0 :: BasePart, part1 :: BasePart
 		end
