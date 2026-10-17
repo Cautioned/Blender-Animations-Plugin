@@ -27,6 +27,57 @@ _ROBLOX_MAPPED_INTERPOLATIONS = {
 FRAME_KEY_PRECISION = 6
 
 
+def nla_source_key_times(animation, frame_start, frame_end):
+    """Map keys in ordinary NLA clips to scene time, including repeats.
+
+    Animated strip time has no fixed source-to-scene mapping; that motion is
+    sampled at the scene frame rate.
+    """
+    result = set()
+    for track in getattr(animation, "nla_tracks", ()):
+        if track.mute:
+            continue
+        for strip in track.strips:
+            if strip.mute or strip.type != "CLIP" or not strip.action:
+                continue
+            lo, hi = max(frame_start, strip.frame_start), min(frame_end, strip.frame_end)
+            if hi < lo:
+                continue
+            result.update(_norm_frame(frame) for frame in (strip.frame_start, strip.frame_end)
+                          if frame_start <= frame <= frame_end)
+            if strip.use_animated_time:
+                continue
+            duration = (strip.action_frame_end - strip.action_frame_start) * strip.scale
+            if duration <= 0:
+                continue
+            curves = get_action_fcurves(strip.action, slot=getattr(strip, "action_slot", None))
+            offsets = set()
+            for curve in curves:
+                if curve.mute:
+                    continue
+                source_times = {key.co.x for key in curve.keyframe_points}
+                for left, right in zip(curve.keyframe_points, curve.keyframe_points[1:]):
+                    if (left.interpolation not in {"LINEAR", "CONSTANT"}
+                            and 0 < (right.co.x - left.co.x) * strip.scale < 1 - 1e-6):
+                        source_times.update(_adaptive_curve_frames(
+                            curve, max(left.co.x, strip.action_frame_start),
+                            min(right.co.x, strip.action_frame_end), split_frames=False,
+                        ))
+                for source in source_times:
+                    if strip.action_frame_start <= source <= strip.action_frame_end:
+                        offset = (strip.action_frame_end - source if strip.use_reverse
+                                  else source - strip.action_frame_start) * strip.scale
+                        offsets.add(offset)
+            first = max(0, math.floor((lo - strip.frame_start) / duration))
+            last = min(math.ceil(strip.repeat) - 1, math.floor((hi - strip.frame_start) / duration))
+            for cycle in range(first, last + 1):
+                for offset in offsets:
+                    frame = strip.frame_start + cycle * duration + offset
+                    if lo <= frame <= hi:
+                        result.add(_norm_frame(frame))
+    return result
+
+
 def constant_dependency_frames(armature, frame_start, frame_end):
     """Return step times only when the entire rig dependency graph is stepped.
 
@@ -112,7 +163,7 @@ def constant_dependency_frames(armature, frame_start, frame_end):
     return frames or None
 
 
-def _adaptive_curve_frames(curve, start, end, tolerance=0.0005):
+def _adaptive_curve_frames(curve, start, end, tolerance=0.0005, split_frames=True):
     """Refine curved samples where a frame-wide linear chord loses motion.
 
     Nonuniform probes detect overshoot that a midpoint-only check can miss.
@@ -139,7 +190,10 @@ def _adaptive_curve_frames(curve, start, end, tolerance=0.0005):
         refine(a, middle, va, values[1], depth + 1)
         refine(middle, b, values[1], vb, depth + 1)
 
-    edges = [start] + list(range(math.floor(start) + 1, math.ceil(end))) + [end]
+    # Compressed NLA segments fit in one scene frame even if they span many
+    # action frames. Fit their whole chord instead of dropping action-frame edges.
+    edges = ([start] + list(range(math.floor(start) + 1, math.ceil(end))) + [end]
+             if split_frames else [start, end])
     for a, b in zip(edges, edges[1:]):
         refine(a, b, evaluate(a), evaluate(b), 0)
     return result
@@ -158,7 +212,7 @@ class BakePlan:
     per_bone_keyframes: Dict[str, Set[float]]
     bone_constant_keyframes: Dict[str, Set[float]]
     bone_non_constant_keyframes: Dict[str, Set[float]]
-    dense_interpolation_segments: Dict[str, Set[Tuple[int, int]]]
+    dense_interpolation_segments: Dict[str, Set[Tuple[float, float]]]
     mixed_interpolation_segments: Dict[str, Set[Tuple[float, float]]]
     constraint_target_easing: Dict[str, Dict[float, Tuple[Optional[str], Optional[str]]]]
     cyclic_bones: Set[str]
@@ -256,7 +310,7 @@ def build_bake_plan(
     # Pre-compile regex for performance.
     bone_name_pattern = re.compile(r'pose\.bones\["(.+?)"\]')
 
-    dense_interpolation_segments: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
+    dense_interpolation_segments: Dict[str, Set[Tuple[float, float]]] = defaultdict(set)
     adaptive_frames = set()
 
     # Interpolations with direct Roblox easing style mappings in this exporter.
@@ -275,7 +329,10 @@ def build_bake_plan(
             if frame_start <= frame <= frame_end:
                 keyframe_times.add(frame)
 
+            # Only motion authored faster than the scene sampling interval
+            # needs extra curve samples. Ordinary frame-keyed IK stays bounded.
             if (i + 1 < len(fcurve.keyframe_points)
+                    and 0 < fcurve.keyframe_points[i + 1].co.x - kp.co.x < 1 - 1e-6
                     and kp.interpolation not in {"LINEAR", "CONSTANT"}
                     and (has_constraints_local or easing_requires_bake(kp.interpolation, kp.easing))):
                 adaptive_frames.update(_adaptive_curve_frames(
@@ -290,11 +347,11 @@ def build_bake_plan(
                 and i + 1 < len(fcurve.keyframe_points)
             ):
                 next_kp = fcurve.keyframe_points[i + 1]
-                start_bezier_frame = int(kp.co.x + 0.5)
-                end_bezier_frame = int(next_kp.co.x + 0.5)
+                start_bezier_frame = float(kp.co.x)
+                end_bezier_frame = float(next_kp.co.x)
 
                 # Only densify if the segment actually curves.
-                if end_bezier_frame - start_bezier_frame > 1:
+                if end_bezier_frame > start_bezier_frame:
                     if bone_name_for_curve:
                         dense_interpolation_segments[bone_name_for_curve].add(
                             (
@@ -735,7 +792,7 @@ def build_bake_plan(
         for seg_start, seg_end in bone_segs:
             dense_interpolation_frames.update(
                 frame
-                for frame in range(seg_start + 1, seg_end)
+                for frame in range(math.floor(seg_start) + 1, math.ceil(seg_end))
                 if frame_start <= frame <= frame_end
             )
     mixed_dense_frames = set()

@@ -24,6 +24,7 @@ from ..animation.serialization import (
     resolve_export_frame_range,
 )
 from ..animation.import_export import import_animation_preserve_ik
+from ..animation.import_easing import sample_import_keyframes
 from .live_sync_delta import animation_revision, create_delta
 
 
@@ -343,7 +344,7 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
             )
 
         # Live preview deliberately samples dense/baked curves at 15 fps. A
-        # normal import remains lossless; this temporary scene value is restored.
+        # normal import uses the selected sampling mode; this value is restored.
         if live_preview:
             preview_step = max(1, int(round(desired_fps / 15.0)))
             context_scene.frame_step = max(context_scene.frame_step, preview_step)
@@ -478,7 +479,7 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
             scene = bpy.context.scene
             scene.frame_start = 0
-            scene.frame_end = int(animation_data["t"] * fps)
+            scene.frame_end = math.ceil(round(animation_data["t"] * fps, 6))
 
             is_deform_rig = animation_data.get("is_deform_bone_rig", False)
 
@@ -510,8 +511,8 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                             }
                         }
 
-            for kf_data in animation_data["kfs"]:
-                frame = int(kf_data["t"] * fps)
+            for kf_data in sample_import_keyframes(animation_data["kfs"], fps):
+                frame = kf_data["t"] * fps
                 state = kf_data["kf"]
 
                 bones_to_process = []
@@ -538,6 +539,7 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                 # current frame has already been set.
                 for pose_bone, source_bone_name in bones_to_process:
                     bone_name = pose_bone.name
+                    pose_bone.rotation_mode = "QUATERNION"
                     pose_data = state.get(source_bone_name)
                     if not pose_data:
                         continue
@@ -665,6 +667,13 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
 
             for bone_name, frame_data in all_bone_data.items():
                 sorted_frames = sorted(frame_data.keys())
+                # Blender interpolates quaternion components; keep adjacent signs
+                # aligned so equivalent q/-q values cannot introduce a flip.
+                for previous, current in zip(sorted_frames, sorted_frames[1:]):
+                    a = frame_data[previous]["rotation_quaternion"]
+                    b = frame_data[current]["rotation_quaternion"]
+                    if a.dot(b) < 0:
+                        b.negate()
 
                 channelbag = utils.get_action_channelbag(action)
                 if channelbag is None or not hasattr(channelbag, "fcurves"):
@@ -772,23 +781,6 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     for i in range(3)
                 ]
 
-                # Most Roblox easings map to their corresponding interpolation type in Blender.
-                interpolation_map = {
-                    "Linear": "LINEAR",
-                    "Constant": "CONSTANT",
-                    "Elastic": "ELASTIC",
-                    "Bounce": "BOUNCE",
-                    "Sine": "SINE",
-                    "Quad": "QUAD",
-                    "Cubic": "CUBIC",
-                    "CubicV2": "CUBIC",
-                    "Quart": "QUART",
-                    "Quint": "QUINT",
-                    "Expo": "EXPO",
-                    "Circular": "CIRC",
-                    "Back": "BACK",
-                }
-
                 num_frames = len(sorted_frames)
                 if num_frames == 0:
                     continue
@@ -801,45 +793,32 @@ def execute_import_animation(task_id, animation_data, target_armature=None):
                     loc = transforms["location"]
                     rot = transforms["rotation_quaternion"]
                     scl = transforms["scale"]
+                    interpolation = (
+                        "CONSTANT" if transforms.get("easingStyle") == "Constant"
+                        else "LINEAR"
+                    )
 
                     for axis in range(3):
                         kp = loc_fcurves[axis].keyframe_points[idx]
                         kp.co = (frame, loc[axis])
+                        kp.interpolation = interpolation
                         kp.handle_left_type = kp.handle_right_type = "AUTO"
                     for axis in range(4):
                         kp = rot_fcurves[axis].keyframe_points[idx]
                         kp.co = (frame, rot[axis])
+                        kp.interpolation = interpolation
                         kp.handle_left_type = kp.handle_right_type = "AUTO"
                     for axis in range(3):
                         kp = scale_fcurves[axis].keyframe_points[idx]
                         kp.co = (frame, scl[axis])
+                        kp.interpolation = interpolation
                         kp.handle_left_type = kp.handle_right_type = "AUTO"
 
-                if num_frames > 1:
-                    for idx in range(num_frames - 1):
-                        current_frame_time = sorted_frames[idx]
-                        current_transforms = frame_data[current_frame_time]
-                        easing_style = current_transforms.get("easingStyle", "Linear")
-                        easing_direction = current_transforms.get("easingDirection", "In")
-
-                        for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                            kp_current = fcurve.keyframe_points[idx]
-                            kp_current.interpolation = interpolation_map.get(
-                                easing_style, "LINEAR"
-                            )
-
-                            if kp_current.interpolation not in ["LINEAR", "CONSTANT"]:
-                                if easing_direction == "In":
-                                    kp_current.easing = "EASE_IN"
-                                elif easing_direction == "Out":
-                                    kp_current.easing = "EASE_OUT"
-                                elif easing_direction == "InOut":
-                                    kp_current.easing = "EASE_IN_OUT"
-                            else:
-                                kp_current.easing = "AUTO"
-
+                # Keys were allocated in sorted order and only use LINEAR or
+                # CONSTANT interpolation. FCurve.update() would deduplicate close
+                # fractional keys and erase immediate Constant In jumps.
                 for fcurve in loc_fcurves + rot_fcurves + scale_fcurves:
-                    fcurve.update()
+                    fcurve.keyframe_points.handles_recalc()
 
             pending_responses[task_id] = (True, "Animation imported successfully")
 

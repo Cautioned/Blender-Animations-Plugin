@@ -2469,6 +2469,13 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
             # Neither is skeleton (two accessories connected) — convention
             child_edges.append((part0_ref, part1_ref, joint, True))
 
+    # A rigid cross-link must not replace a part's animation joint. Roblox
+    # permits redundant welds across an existing Motor6D skeleton; Blender
+    # needs one parent for each bone.
+    deform_children = {c for _, c, joint, _ in child_edges if joint.class_name in _DEFORM_JOINTS}
+    child_edges = [edge for edge in child_edges
+                   if edge[2].class_name in _DEFORM_JOINTS or edge[1] not in deform_children]
+
     # Root = a part that is a parent (Part0) but never a child (Part1).
     child_refs = {c for _, c, _, _ in child_edges}
     parent_refs = {p for p, _, _, _ in child_edges}
@@ -2513,7 +2520,7 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
             "hasSkinnedMesh": bool(_first_prop(part, "HasSkinnedMesh")),
         }
 
-    def build(part_ref: int, parent_ref: Optional[int], joint: Optional[_Instance], parent_is_part0: bool) -> dict:
+    def build_node(part_ref: int, parent_ref: Optional[int], joint: Optional[_Instance], parent_is_part0: bool) -> dict:
         node = node_for(part_ref)
         if parent_ref is not None and joint is not None:
             parent = instances.get(parent_ref)
@@ -2538,9 +2545,29 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
                 else:
                     node["jointtransform0"] = c1
                     node["jointtransform1"] = c0
-        for child_ref, child_joint, child_pip0 in adjacency.get(part_ref, []):
-            node["children"].append(build(child_ref, part_ref, child_joint, child_pip0))
         return node
+
+    def build_joint_tree(root_ref: int) -> dict:
+        # The source is a graph, not a tree: weld loops and multiple links to
+        # one accessory are valid. Visit each part once, in the existing DFS
+        # order, without consuming Python's call stack or duplicating bones.
+        root = build_node(root_ref, None, None, True)
+        seen = {root_ref}
+        stack = [(root, iter(adjacency.get(root_ref, [])))]
+        while stack:
+            parent_node, children = stack[-1]
+            edge = next(children, None)
+            if edge is None:
+                stack.pop()
+                continue
+            child_ref, joint, parent_is_part0 = edge
+            if child_ref in seen:
+                continue
+            seen.add(child_ref)
+            child_node = build_node(child_ref, parent_node["inst_ref"], joint, parent_is_part0)
+            parent_node["children"].append(child_node)
+            stack.append((child_node, iter(adjacency.get(child_ref, []))))
+        return root
 
     # Attach skinned-mesh Bone instances. Bones are not joints — they parent
     # directly to a BasePart (or another Bone) and carry only a CFrame — so
@@ -2643,7 +2670,7 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
         root["pname"] = instances[root_ref].name
     else:
         root_ref = root_candidates[0]
-        root = build(root_ref, None, None, True)
+        root = build_joint_tree(root_ref)
         root["pname"] = instances[root_ref].name
 
     attach_bones(root)
