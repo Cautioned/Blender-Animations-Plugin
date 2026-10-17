@@ -396,25 +396,9 @@ class TestAnimationSerialization(unittest.TestCase):
 
         keyframes = result["kfs"]
 
-        # In this specific test, the IK target is always moving, so every constrained bone
-        # should have a key on every frame. This means the hybrid bake will produce a full
-        # 20 keyframes, but ONLY the constrained bones will be in all of them.
-        self.assertEqual(
-            len(keyframes),
-            20,
-            "Expected a full 20 keyframes because the IK target is always moving.",
-        )
-
-        # 2. Check that constrained bones are fully baked.
-        ik_bones = {"UpperLeg", "LowerLeg", "Foot"}
-        for i in range(len(keyframes)):
-            kf = keyframes[i]
-            for bone_name in ik_bones:
-                self.assertIn(
-                    bone_name,
-                    kf["kf"],
-                    f"IK bone '{bone_name}' missing from fully baked frame {i + 1}",
-                )
+        self.assert_frame_coverage(keyframes, 20)
+        for name in ("UpperLeg", "LowerLeg", "Foot"):
+            self.assert_frame_coverage([kf for kf in keyframes if name in kf["kf"]], 20)
 
         # 3. Check that the unconstrained bone is sparsely baked.
         unconstrained_bone_name = "Unconstrained"
@@ -446,14 +430,8 @@ class TestAnimationSerialization(unittest.TestCase):
         result = serialize(self.armature_obj)
         keyframes = result["kfs"]
 
-        ik_bones = {"Root", "UpperLeg", "LowerLeg", "Foot"}
-        for i, kf in enumerate(keyframes):
-            for bone_name in ik_bones:
-                self.assertIn(
-                    bone_name,
-                    kf["kf"],
-                    f"IK chain_count=0 bone '{bone_name}' missing from frame {i + 1}",
-                )
+        for name in ("Root", "UpperLeg", "LowerLeg", "Foot"):
+            self.assert_frame_coverage([kf for kf in keyframes if name in kf["kf"]], 20)
 
     def test_unconstrained_rig_is_sparse(self):
         """Tests that a simple rig with no constraints uses sparse baking."""
@@ -872,13 +850,11 @@ class TestAnimationSerialization(unittest.TestCase):
         )
 
         constrained_bones = {"BoneA", "BoneB", "BoneC"}
+        # Each constrained track retains whole-frame samples; another bone's
+        # adaptive subframe does not require a redundant key on this track.
+        for bone_name in constrained_bones:
+            self.assert_frame_coverage([kf for kf in keyframes if bone_name in kf["kf"]], 20)
         for kf in keyframes:
-            for bone_name in constrained_bones:
-                self.assertIn(
-                    bone_name,
-                    kf["kf"],
-                    f"Constrained bone '{bone_name}' should be in every frame.",
-                )
             self.assertNotIn(
                 "Root",
                 kf["kf"],
@@ -985,22 +961,8 @@ class TestAnimationSerialization(unittest.TestCase):
         constrained_bones = {"L_UpperArm", "L_LowerArm", "R_UpperArm", "R_LowerArm"}
         sparse_bone = "Torso"
 
-        torso_keyframe_count = 0
-        for kf in keyframes:
-            if sparse_bone in kf["kf"]:
-                torso_keyframe_count += 1
-        for bone_name in constrained_bones:
+        for bone_name in constrained_bones | {sparse_bone}:
             self.assert_frame_coverage([kf for kf in keyframes if bone_name in kf["kf"]], 20)
-
-        # With full-range bake defaulting to True, expect all frames
-        expected_torso_frames = (
-            bpy.context.scene.frame_end - bpy.context.scene.frame_start + 1
-        )
-        self.assertEqual(
-            torso_keyframe_count,
-            len(keyframes),
-            f"Expected {expected_torso_frames} keyframes for full-range baked 'Torso' bone, but found {torso_keyframe_count}.",
-        )
 
     def test_nla_tracks_force_full_bake(self):
         """Tests that having active NLA tracks forces a full, simple bake."""
@@ -1080,18 +1042,9 @@ class TestAnimationSerialization(unittest.TestCase):
             len(keyframes), 20, "Expected every frame plus evaluated NLA subframes."
         )
 
-        # Check that data from both strips is present in the bake
-        mid_frame_kf = keyframes[10]["kf"]
-        self.assertIn(
-            "BoneA",
-            mid_frame_kf,
-            "Bone from first NLA track not found in baked keyframe.",
-        )
-        self.assertIn(
-            "BoneB",
-            mid_frame_kf,
-            "Bone from second NLA track not found in baked keyframe.",
-        )
+        # Both tracks cover the bake independently of inserted sibling keys.
+        for bone_name in ("BoneA", "BoneB"):
+            self.assert_frame_coverage([kf for kf in keyframes if bone_name in kf["kf"]], 20)
 
     def test_nla_single_strip_uses_hybrid_easing(self):
         """Tests that a single NLA strip uses hybrid bake and respects easing."""
@@ -1568,7 +1521,7 @@ class TestAnimationSerialization(unittest.TestCase):
             driver_pose.location = (0, 0, 0)
             driver_pose.keyframe_insert(data_path="location", frame=1)
             driver_pose.location = (0, 0, 3 + i)
-            driver_pose.keyframe_insert(data_path="location", frame=10)
+            driver_pose.keyframe_insert(data_path="location", frame=1.75)
 
         self.set_action_interpolation(master_action, "LINEAR")
 
@@ -1632,7 +1585,7 @@ class TestAnimationSerialization(unittest.TestCase):
         puppet_obj.animation_data.action = puppet_action
 
         bpy.context.scene.frame_start = 1
-        bpy.context.scene.frame_end = 10
+        bpy.context.scene.frame_end = 2
         invalidate_armature_cache()
 
         # --- EXECUTION ---
@@ -1642,7 +1595,7 @@ class TestAnimationSerialization(unittest.TestCase):
         # --- ASSERTION ---
         self.assertTrue(result, "Serialization returned no result for constrained easing test.")
         keyframes = result["kfs"]
-        self.assertGreaterEqual(len(keyframes), 10, "Expected every frame plus curved subframe samples.")
+        self.assertGreaterEqual(len(keyframes), 10, "Expected automatic samples for the subframe control segment.")
 
         first_kf = keyframes[0]["kf"]
         last_kf = keyframes[-1]["kf"]
@@ -1679,7 +1632,7 @@ class TestAnimationSerialization(unittest.TestCase):
         # Test the resulting playback, not only the labels on boundary keys.
         fps = bpy.context.scene.render.fps / bpy.context.scene.render.fps_base
         static_cache = {}
-        for frame in (1.25, 2.5, 4.75, 7.25, 9.9):
+        for frame in (1.1, 1.25, 1.4, 1.6, 1.74):
             bpy.context.scene.frame_set(math.floor(frame), subframe=frame % 1)
             reference = serialization.serialize_animation_state(
                 puppet_obj.evaluated_get(bpy.context.evaluated_depsgraph_get()),
@@ -1766,30 +1719,19 @@ class TestAnimationSerialization(unittest.TestCase):
         )
         keyframes = result["kfs"]
 
-        # Because one bone is constrained, a full 20 frames will be sampled.
-        # The optimization step will preserve all frames containing the constrained bone.
-        self.assertEqual(
-            len(keyframes), 20, "Expected a full 20 frames due to the constraint."
-        )
+        self.assert_frame_coverage(keyframes, 20)
+        self.assert_frame_coverage([kf for kf in keyframes if "Follower" in kf["kf"]], 20)
 
-        follower_kf_count = 0
         driver_kf_count = 0
         independent_kf_count = 0
 
         for kf in keyframes:
             kf_bones = kf["kf"].keys()
-            if "Follower" in kf_bones:
-                follower_kf_count += 1
             if "Driver" in kf_bones:
                 driver_kf_count += 1
             if "Independent" in kf_bones:
                 independent_kf_count += 1
 
-        self.assertEqual(
-            follower_kf_count,
-            20,
-            "Constrained 'Follower' bone should be baked on every frame.",
-        )
         self.assertEqual(
             driver_kf_count,
             2,
@@ -3922,9 +3864,8 @@ class TestAnimationSerialization(unittest.TestCase):
         result = serialize(armature_obj)
 
         self.assert_frame_coverage(result["kfs"], 3)
-        for keyframe in result["kfs"]:
-            self.assertIn("Control", keyframe["kf"])
-            self.assertIn("DeformChild", keyframe["kf"])
+        for name in ("Control", "DeformChild"):
+            self.assert_frame_coverage([kf for kf in result["kfs"] if name in kf["kf"]], 3)
 
     def test_skinned_non_inheriting_parent_bakes_deform_leg_descendant(self):
         """leg descendants under non-inheriting pelvis bones need dense samples."""
@@ -4006,14 +3947,13 @@ class TestAnimationSerialization(unittest.TestCase):
 
         self.assertNotIn("deform_rest_world", result)
         self.assert_frame_coverage(result["kfs"], 3)
+        for name in ("LowerTorso", "UpperLeg.L", "LowerLeg.L", "Foot.L"):
+            self.assert_frame_coverage([kf for kf in result["kfs"] if name in kf["kf"]], 3)
         lower_torso_samples = []
         for keyframe in result["kfs"]:
-            self.assertIn("LowerTorso", keyframe["kf"])
-            self.assertIn("UpperLeg.L", keyframe["kf"])
-            self.assertIn("LowerLeg.L", keyframe["kf"])
-            self.assertIn("Foot.L", keyframe["kf"])
             self.assertNotIn("deform_world", keyframe)
-            lower_torso_samples.append(keyframe["kf"]["LowerTorso"][0])
+            if "LowerTorso" in keyframe["kf"]:
+                lower_torso_samples.append(keyframe["kf"]["LowerTorso"][0])
         self.assertTrue(
             any(sample != serialization.identity_cf for sample in lower_torso_samples),
             "LowerTorso should emit non-inherit compensation when UpperTorso rotates.",

@@ -4,6 +4,7 @@ build_export_case also produces expected world poses for replay in Studio.
 """
 
 import bpy
+import copy
 import json
 import pathlib
 import unittest
@@ -132,8 +133,8 @@ def templates():
 
 
 class TestStudioTemplateRoundtrip(unittest.TestCase):
-    def check_template(self, name):
-        fixture = templates()[name]
+    def check_template(self, name, fixture=None):
+        fixture = templates()[name] if fixture is None else fixture
         case = build_export_case(name, fixture)
         joints = fixture["joints"] + [
             {
@@ -172,3 +173,24 @@ class TestStudioTemplateRoundtrip(unittest.TestCase):
 
     def test_r15_weapon_import_and_animation_roundtrip(self):
         self.check_template("TemplateR15")
+
+    def check_rotated_joint_bases(self, name):
+        # #71 reports wrong rotation directions. Exercise joint axes that differ
+        # from the stock templates while keeping the same visible rest pose.
+        fixture = copy.deepcopy(templates()[name])
+        for index, joint in enumerate(fixture["joints"]):
+            basis = (
+                Matrix.Rotation(0.7 + index * 0.13, 4, "X")
+                @ Matrix.Rotation(-1.1 + index * 0.07, 4, "Y")
+                @ Matrix.Rotation(1.57, 4, "Z")
+            )
+            # P0*C0*C1^-1 remains unchanged, but animation axes rotate.
+            joint["c0"] = mat_to_cf(cf_to_mat(joint["c0"]) @ basis)
+            joint["c1"] = mat_to_cf(cf_to_mat(joint["c1"]) @ basis)
+        self.check_template(name, fixture)
+
+    def test_r6_rotated_joint_bases_preserve_exported_rotation(self):
+        self.check_rotated_joint_bases("TemplateR6")
+
+    def test_r15_rotated_joint_bases_preserve_exported_rotation(self):
+        self.check_rotated_joint_bases("TemplateR15")

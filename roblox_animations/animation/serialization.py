@@ -36,6 +36,7 @@ from .ir import KeyframePayload, PoseEntry, keyframes_equivalent, pose_entries_e
 from .planning import (
     build_bake_plan,
     constant_dependency_frames,
+    nla_source_key_times,
     frame_in_set,
     lookup_interp_for_frame,
 )
@@ -500,6 +501,7 @@ class ExportAnalysis:
     has_constraint_target_action: bool
     visual_samples: Dict[float, Dict[str, List[float]]] = field(default_factory=dict)
     visual_keyframes: Set[float] = field(default_factory=set)
+    visual_bones: Set[str] = field(default_factory=set)
 
 
 def _analyze_export(
@@ -687,8 +689,13 @@ def _bake_full(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]]:
 
     collected: List[KeyframePayload] = []
     shared_cache: Dict[str, Dict[str, Any]] = {}
-    for i in range(frame_start, frame_end + 1, frame_step):
-        ctx.scene.frame_set(i)
+    source_times = nla_source_key_times(analysis.animation_data, frame_start, frame_end)
+    analysis.visual_keyframes.update(source_times)
+    sample_frames = sorted(set(range(frame_start, frame_end + 1, frame_step)) |
+                           source_times | {frame_end})
+    for i in sample_frames:
+        whole = math.floor(i)
+        ctx.scene.frame_set(whole, subframe=i - whole)
         ao_eval_for_frame = ao.evaluated_get(analysis.depsgraph)
         state = serialize_combined_animation_state(
             ao,
@@ -1255,6 +1262,11 @@ def _serialize_evaluated(ao, target_bone_rest=None):
     original_frame = ctx.scene.frame_current
     original_subframe = ctx.scene.frame_subframe
     analysis = _analyze_export(ao, target_bone_rest)
+    visual_bones = get_all_constrained_bones(ao) | get_all_driven_bones(ao)
+    visual_bones.update(b.name for b in ao.pose.bones if not b.bone.use_inherit_rotation)
+    if analysis.is_skinned_rig:
+        visual_bones = get_deform_descendant_bones(ao, visual_bones)
+    analysis.visual_bones = visual_bones
 
     try:
         if (
@@ -1273,35 +1285,34 @@ def _serialize_evaluated(ao, target_bone_rest=None):
             duration, collected = _bake_single_frame(analysis)
 
         # Constraint/driver inputs do not describe the interpolation of the
-        # evaluated output. Fit that output, including subframe IK motion and
+        # evaluated output. Preserve sampled output and authored subframe keys,
         # holds whose controls live behind drivers or unkeyed helper bones.
-        visual_bones = get_all_constrained_bones(ao) | get_all_driven_bones(ao)
-        visual_bones.update(b.name for b in ao.pose.bones if not b.bone.use_inherit_rotation)
         if analysis.use_nla_bake:
             visual_bones.update(name for key in collected for name in key.poses)
         if analysis.is_skinned_rig:
             visual_bones = get_deform_descendant_bones(ao, visual_bones)
         visual_diagnostics = {}
         if visual_bones:
-            from .visual_bake import refine_visual_bake
+            from .visual_bake import bake_at_frame_rate
 
             sample_cache = {}
 
-            def sample_visual(frame):
+            def sample_visual(frame, bone_names=None):
                 whole = math.floor(frame)
                 ctx.scene.frame_set(whole, subframe=frame - whole)
                 return serialize_combined_animation_state(
                     ao, ao.evaluated_get(analysis.depsgraph), analysis.run_deform_path,
                     analysis.is_skinned_rig, analysis.back_trans_cached,
                     analysis.world_transform_cached, analysis.scale_factor_cached,
-                    sample_cache, analysis.excluded_face_bones,
+                    sample_cache, analysis.excluded_face_bones, bone_names=bone_names,
                 )
 
-            collected = refine_visual_bake(
+            collected = bake_at_frame_rate(
                 collected, visual_bones, sample_visual, ctx.scene.frame_start,
                 ctx.scene.frame_end, analysis.desired_fps, visual_diagnostics,
                 seed_samples=analysis.visual_samples,
                 keyframes=analysis.visual_keyframes,
+                sample_subset=sample_visual,
             )
             if visual_diagnostics.get("limited_segments"):
                 print(
@@ -1363,6 +1374,8 @@ def _serialize_evaluated(ao, target_bone_rest=None):
             "armature_object_scale": float(_uniform_object_scale(ao) or 1.0),
             "armature_object_scale_axes": [float(value) for value in object_scale_axes],
             "armature_object_scale_uniform": bool(object_scale_uniform),
+            "sampling_mode": "AUTO",
+            "visual_bake_evaluated_samples": visual_diagnostics.get("evaluated_samples", 0),
             "visual_bake_limited_segments": visual_diagnostics.get("limited_segments", 0),
             "deform_position_scale_reliable": bool(
                 (not auto_deform_scale) or object_scale_uniform

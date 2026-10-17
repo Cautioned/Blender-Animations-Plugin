@@ -28,10 +28,37 @@ from .scale import (
 )
 
 
+# Shared only for the duration of one export. Store names, never evaluated
+# pose-bone references: Blender may replace evaluated data after frame_set.
+_SAMPLING_LAYOUT = object()
+
+
+def _sampling_layout(ao, cache):
+    layout = cache.get(_SAMPLING_LAYOUT)
+    if layout is not None:
+        return layout
+    motor, deform, worldspace = [], [], {}
+    for bone in ao.pose.bones:
+        if is_face_control_bone(bone):
+            continue
+        if all(key in bone.bone for key in ("transform", "transform1", "nicetransform")):
+            motor.append(bone.name)
+        else:
+            deform.append(bone.name)
+        if bone.bone.get("worldspace_bone"):
+            parent = bone.bone.get("worldspace_original_parent", "")
+            if parent:
+                worldspace[bone.name] = parent
+    layout = {"motor": motor, "deform": deform, "worldspace": worldspace}
+    cache[_SAMPLING_LAYOUT] = layout
+    return layout
+
+
 def serialize_animation_state(
     ao: "bpy.types.Object",
     back_trans_cached: Optional[Matrix] = None,
     static_cache: Optional[Dict[str, Dict[str, Any]]] = None,
+    bone_names: Optional[Set[str]] = None,
 ) -> Dict[str, List[float]]:
     """Serialize Motor6D animation state into a fresh state dict."""
     state: Dict[str, List[float]] = {}
@@ -62,19 +89,12 @@ def serialize_animation_state(
             bcache[key] = mat
         return mat
 
-    # Build a lookup for world-space bones and their original parents.
-    worldspace_bones: Dict[str, str] = {}  # bone_name -> original_parent_name
-    for bone in pose_bones:
-        if is_face_control_bone(bone):
+    layout = _sampling_layout(ao, cache)
+    worldspace_bones = layout["worldspace"]
+    for bone_name in layout["motor"]:
+        if bone_names is not None and bone_name not in bone_names:
             continue
-        if bone.bone.get("worldspace_bone"):
-            original_parent = bone.bone.get("worldspace_original_parent", "")
-            if original_parent:
-                worldspace_bones[bone.name] = original_parent
-
-    for bone in pose_bones:
-        if is_face_control_bone(bone):
-            continue
+        bone = pose_bones[bone_name]
         has_motor6d_props = (
             "transform" in bone.bone
             and "transform1" in bone.bone
@@ -215,6 +235,7 @@ def serialize_deform_animation_state(
     scale_factor_cached: Optional[float] = None,
     static_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     excluded_bones: Optional[Set[str]] = None,
+    bone_names: Optional[Set[str]] = None,
 ) -> Dict[str, List[float]]:
     """Serialize Deform Bone animation state into a fresh state dict."""
     # Use cached transforms or compute once.
@@ -239,8 +260,21 @@ def serialize_deform_animation_state(
     state: Dict[str, List[float]] = {}
     bone_cache: Dict[str, Tuple[Matrix, Matrix]] = {}
 
-    deform_chain_bones: Set[str] = set()
-    if is_skinned_rig:
+    cache = static_cache if static_cache is not None else {}
+    layout = _sampling_layout(ao, cache)
+    bones_to_process = [ao.pose.bones[name] for name in layout["deform"]
+                        if not excluded_bones or name not in excluded_bones]
+    if bone_names is not None:
+        bones_to_process = [bone for bone in bones_to_process
+                            if bone.bone.get("rbx_source_name", bone.name) in bone_names]
+    # A skinned rig may contain only Motor6D channels. Do not walk its
+    # ancestry on every fractional sample when this sampler emits nothing.
+    if not bones_to_process:
+        return state
+
+    deform_chain_bones = layout.get("deform_chain")
+    if is_skinned_rig and deform_chain_bones is None:
+        deform_chain_bones = set()
         for pose_bone in ao.pose.bones:
             if is_face_control_bone(pose_bone) or not pose_bone.bone.use_deform:
                 continue
@@ -249,40 +283,11 @@ def serialize_deform_animation_state(
                 if not is_face_control_bone(current_bone):
                     deform_chain_bones.add(current_bone.name)
                 current_bone = current_bone.parent
+        layout["deform_chain"] = deform_chain_bones
 
-    # Pre-populate cache for deform/helper bones to simplify parent lookups.
-    bones_to_process = []
-    for bone in ao.pose.bones:
-        if is_face_control_bone(bone):
-            continue
-        if excluded_bones and bone.name in excluded_bones:
-            continue
-        # Exclude Motor6D bones from deform serialization.
-        if (
-            "transform" in bone.bone
-            and "transform1" in bone.bone
-            and "nicetransform" in bone.bone
-        ):
-            continue
-        bones_to_process.append(bone)
-
-    # Fast bail-out: nothing to serialize on deform path.
-    if not bones_to_process:
-        return state
-
-    # Cache for motor6d parent transforms to avoid repeated to_matrix/inverted work per frame.
     motor_parent_cache: Dict[str, Tuple[Matrix, Matrix]] = {}
-
-    worldspace_bones: Dict[str, str] = {}
-    for bone in ao.pose.bones:
-        if is_face_control_bone(bone):
-            continue
-        if excluded_bones and bone.name in excluded_bones:
-            continue
-        if bone.bone.get("worldspace_bone"):
-            original_parent = bone.bone.get("worldspace_original_parent", "")
-            if original_parent:
-                worldspace_bones[bone.name] = original_parent
+    worldspace_bones = {name: parent for name, parent in layout["worldspace"].items()
+                       if not excluded_bones or name not in excluded_bones}
 
     def get_bone_space_transforms(space_bone):
         if not space_bone:
@@ -329,7 +334,17 @@ def serialize_deform_animation_state(
 
         return get_bone_space_transforms(bone.parent)
 
-    for bone in bones_to_process:
+    # Local output needs the selected bones and their immediate space parents,
+    # not every channel in the rig. Read fresh evaluated bones on every call.
+    space_bones = {bone.name: bone for bone in bones_to_process}
+    if bone_names is not None:
+        deform_names = set(layout["deform"])
+        for bone in bones_to_process:
+            parent = (ao.pose.bones.get(worldspace_bones[bone.name])
+                      if bone.name in worldspace_bones else bone.parent)
+            if parent and parent.name in deform_names and (not excluded_bones or parent.name not in excluded_bones):
+                space_bones[parent.name] = parent
+    for bone in space_bones.values():
         # For deform and new bones alike, use Blender-space matrices converted once to Roblox space.
         current_matrix = _orthonormalized_transform(world_transform @ bone.matrix)
         rest_matrix = _orthonormalized_transform(
@@ -421,6 +436,7 @@ def serialize_combined_animation_state(
     scale_factor_cached: Optional[float] = None,
     static_cache: Optional[Dict[str, Dict[str, Any]]] = None,
     excluded_deform_bones: Optional[Set[str]] = None,
+    bone_names: Optional[Set[str]] = None,
 ) -> Dict[str, List[float]]:
     """Sample both Motor6D and deform paths and merge into one state dict.
 
@@ -435,6 +451,7 @@ def serialize_combined_animation_state(
         ao_eval,
         back_trans_cached,
         static_cache,
+        bone_names,
     )
     state.update(motor_state)
 
@@ -446,6 +463,7 @@ def serialize_combined_animation_state(
             scale_factor_cached,
             static_cache,
             excluded_deform_bones,
+            bone_names,
         )
         state.update(deform_state)
 

@@ -1755,9 +1755,9 @@ def _get_blender_draco_dll_paths() -> List[Path]:
     The glTF importer ships the decoder as ``io_scene_gltf2/extern_draco.*``
     next to its python module, but the layout varies across versions
     (standard, portable, Blender Launcher, extensions platform).  Blender
-    5.2 replaced the extern_draco shim with ``bf_intern_draco_bridge``,
-    which sits in the same addon directory, so both names are probed for
-    every io_scene_gltf2 directory below.
+    5.2 replaced the extern_draco shim with ``bf_intern_draco_bridge``;
+    5.2.2 portable Unix builds moved it into the application lib directory.
+    Ask glTF first, then probe resource and executable-relative layouts.
     """
     lib_name = _draco_lib_name()
     bridge_name = _draco_bridge_lib_name()
@@ -1776,19 +1776,26 @@ def _get_blender_draco_dll_paths() -> List[Path]:
         add(gltf_dir / lib_name)
         add(gltf_dir / bridge_name)
 
-    # 1. The glTF module itself knows where its DLL lives (pre-5.2).
-    try:
-        module = importlib.import_module("io_scene_gltf2.io.com.draco")
+    # Match glTF's explicit override, including when glTF cannot be imported.
+    add(os.environ.get("BLENDER_EXTERN_DRACO_LIBRARY_PATH"))
+
+    # glTF renamed this module after the pre-4.2 Python/site-packages layout.
+    # Ask both versions instead of depending on sys.executable being python.
+    for module_name in (
+        "io_scene_gltf2.io.com.draco",
+        "io_scene_gltf2.io.com.gltf2_io_draco_compression_extension",
+    ):
         try:
-            add(module.dll_path())
+            module = importlib.import_module(module_name)
+            try:
+                add(module.dll_path())
+            except Exception:
+                pass
+            module_file = getattr(module, "__file__", None)
+            if module_file:
+                add_gltf_dir(Path(module_file).resolve().parents[2])
         except Exception:
             pass
-        module_file = getattr(module, "__file__", None)
-        if module_file:
-            # .../io_scene_gltf2/io/com/draco.py -> .../io_scene_gltf2/
-            add(Path(module_file).resolve().parents[2] / lib_name)
-    except Exception:
-        pass
 
     # 1b. Blender 5.2 removed the extern_draco shim but kept the decoder
     # as bf_intern_draco_bridge, exposed through io.com.library.
@@ -1803,13 +1810,33 @@ def _get_blender_draco_dll_paths() -> List[Path]:
     try:
         import bpy  # noqa: PLC0415
 
-        local = bpy.utils.resource_path("LOCAL")
-        if local:
-            for scripts_name in ("scripts",):
-                for addons_name in ("addons_core", "addons"):
-                    add_gltf_dir(
-                        Path(local) / scripts_name / addons_name / "io_scene_gltf2"
-                    )
+        roots = []
+        # SYSTEM_LIBS is used by newer split-library builds. Older Blender
+        # versions reject that enum, so query each resource independently.
+        for kind in ("LOCAL", "SYSTEM", "SYSTEM_LIBS"):
+            try:
+                resource = bpy.utils.resource_path(kind)
+                if resource:
+                    roots.append(Path(resource))
+            except Exception:
+                pass
+        binary = getattr(bpy.app, "binary_path", "")
+        if binary:
+            binary_dir = Path(binary).resolve().parent
+            version_dir = f"{bpy.app.version[0]}.{bpy.app.version[1]}"
+            roots.extend((binary_dir / version_dir,
+                          binary_dir.parent / "Resources" / version_dir))
+        py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        for root in roots:
+            for addons_name in ("addons_core", "addons"):
+                add_gltf_dir(root / "scripts" / addons_name / "io_scene_gltf2")
+            for site_base in (Path("lib") / "site-packages",
+                              Path("lib") / py_version / "site-packages"):
+                add(root / "python" / site_base / lib_name)
+            # 5.2.2 portable Unix builds moved the bridge next to Blender's
+            # other shared libraries, outside the glTF add-on directory.
+            if sys.platform not in ("win32", "darwin"):
+                add(root.parent / "lib" / bridge_name)
         for scripts_dir in bpy.utils.script_paths():
             for addons_name in ("addons_core", "addons"):
                 add_gltf_dir(Path(scripts_dir) / addons_name / "io_scene_gltf2")
@@ -1861,9 +1888,10 @@ def _load_blender_draco_dll():
     if _DRACO_DLL is not _DRACO_DLL_UNINITIALIZED and _DRACO_DLL is not None:
         return _DRACO_DLL
 
-    last_error = "blender draco library was not found"
-    for dll_path in _get_blender_draco_dll_paths():
-        if not dll_path.exists():
+    candidates = _get_blender_draco_dll_paths()
+    errors = []
+    for dll_path in candidates:
+        if not dll_path.is_file():
             continue
         dll = None
         try:
@@ -1891,14 +1919,18 @@ def _load_blender_draco_dll():
             dll.decoderCopyIndices.restype = None
             dll.decoderCopyIndices.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         except Exception as exc:
-            last_error = f"failed to load {dll_path}: {exc}"
+            errors.append(f"failed to load {dll_path}: {exc}")
             continue
 
         _DRACO_LOAD_ERROR = None
         _DRACO_DLL = dll
         return dll
 
-    _DRACO_LOAD_ERROR = last_error
+    if errors:
+        _DRACO_LOAD_ERROR = "; ".join(errors)
+    else:
+        searched = "; ".join(str(path) for path in candidates)
+        _DRACO_LOAD_ERROR = f"blender draco library was not found; searched: {searched or '(no candidate paths)'}"
     return None
 
 
