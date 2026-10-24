@@ -1724,9 +1724,11 @@ def _build_source_topology_binding(binding, target_faces=None):
 
 def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
     rig_names = set(_iter_rig_node_names(meta_loaded.get("rig") or {}))
-    # Prefer the authoritative meshToBone map built by rbxm.py (identity: part→bone
-    # when both use the same names). Fall back to the heuristic part→bone map for
-    # FBX-export rigs where part names differ from joint names.
+    from ..core.rbxm import _derive_mesh_to_bone_refs
+    reference_mapping = meta_loaded.get("meshToBoneRefs") or _derive_mesh_to_bone_refs(meta_loaded.get("rig"))
+    # Names still resolve authored skin-weight channels and legacy FBX metadata.
+    # Rigid MeshParts (including welded clothes) must use instance references:
+    # duplicate names in this map do not identify their animation owner.
     part_to_bone_map = meta_loaded.get("meshToBone") or _build_part_to_bone_map(meta_loaded.get("rig") or {})
     bindings = {}
     wrap_target_snapshot = _build_wrap_target_snapshot(meta_loaded, parts_collection)
@@ -1890,6 +1892,20 @@ def _prepare_skinned_mesh_bindings(meta_loaded, parts_collection):
             continue
 
         if not direct_binding:
+            ref = entry.get("inst_ref")
+            if reference_mapping and ref is not None and mesh_obj.get("RBXInstRef") is not None:
+                owner = reference_mapping.get(str(ref), reference_mapping.get(ref))
+                if owner is None:
+                    print(f"[RigCreate] WARNING: MeshPart #{ref} has no animation owner; no name fallback")
+                    continue
+                # An unweighted MeshPart is a rigid clothes follower, not a
+                # skinned mesh. Leave it out of bindings so the authoritative
+                # reference constraint pass handles it after bone creation
+                # (and after relocation when attaching an internal weapon rig).
+                # Otherwise this pass excludes it from that constraint pass
+                # and the legacy name map can choose another clothes part's bone.
+                _log_binding_mode(mesh_obj, binding, f"deferred rigid follow (animation node #{owner})")
+                continue
             # Accessories that ship without per-vertex weights (classic
             # texture meshes like ears/hats) cannot be skinned; bind them
             # rigidly to the bone their part maps to instead of falling
@@ -2215,6 +2231,11 @@ def load_rigbone(
         bone_name = f"__RBX_STRUCTURAL__{source_name}"
 
     bone = amt.edit_bones.new(bone_name)
+    if rigsubdef.get("inst_ref") is not None:
+        # Blender may suffix duplicate names. Resolve authoritative targets
+        # through the actual created bone, never the source display name.
+        match_ctx.setdefault("bone_names_by_ref", {})[int(rigsubdef["inst_ref"])] = bone.name
+        bone["rbx_inst_ref"] = int(rigsubdef["inst_ref"])
     bone["rbx_source_name"] = source_name
     joint_type = rigsubdef.get("jointType") or "Motor6D"
     original_parent_bone = rigsubdef.get("originalParentBone")
@@ -2251,7 +2272,9 @@ def load_rigbone(
         bone.use_deform = skinned and not structural
 
     if "jointtransform0" not in rigsubdef:
-        # Rig root
+        # WeldConstraint has no C0/C1. Its structural bone still belongs in
+        # the hierarchy, even though clothing follows the animation owner.
+        bone.parent = parent_bone
         bone.head = (t2b @ mat).to_translation()
         bone.tail = (t2b @ mat) @ Vector((0, 0.01, 0))
         bone["transform0"] = _matrix_to_idprop(Matrix())
@@ -2347,13 +2370,15 @@ def load_rigbone(
     # Process PRIMARY pname FIRST — every bone should claim its own mesh
     # before its AUX list takes leftovers.
     p_name = rigsubdef.get("pname")
-    if p_name:
+    if p_name and not (match_ctx.get("reference_mapping") and rigsubdef.get("inst_ref") is not None):
         found_primary = _find_matching_part(
             p_name, None, match_ctx, inst_ref=rigsubdef.get("inst_ref")
         )
 
         # Fallback: simple lookup in collection if _find_matching_part fails
-        if not found_primary and parts_collection:
+        if (not found_primary and parts_collection
+                and (rigsubdef.get("inst_ref") is None
+                     or not any(obj.get("RBXInstRef") is not None for obj in parts_collection.objects))):
             found_primary = parts_collection.objects.get(p_name)
             if found_primary and found_primary in match_ctx["used"]:
                 found_primary = None
@@ -2597,7 +2622,31 @@ def create_rig(rigging_type, rig_meta_obj_name, target_armature=None):
     # tells us which mesh belongs to which bone. Essential for duplicate-named
     # parts like two "GLOVE" accessories that would otherwise swap randomly.
     mesh_to_bone = meta_loaded.get("meshToBone") or {}
-    if mesh_to_bone:
+    from ..core.rbxm import _derive_mesh_to_bone_refs
+    reference_mapping = meta_loaded.get("meshToBoneRefs")
+    if not reference_mapping:
+        # Older RBXM metadata already retained referents in its rig tree.
+        reference_mapping = _derive_mesh_to_bone_refs(meta_loaded.get("rig"))
+    referenced_objects = [obj for obj in parts_collection.objects
+                          if obj.type == "MESH" and obj.get("RBXInstRef") is not None]
+    if reference_mapping and referenced_objects:
+        match_ctx["reference_mapping"] = True
+        pending_refs = match_ctx.setdefault("pending_constraint_refs", [])
+        objects_by_ref = {}
+        for obj in referenced_objects:
+            ref = int(obj["RBXInstRef"])
+            objects_by_ref.setdefault(ref, []).append(obj)
+            # Reserve even unresolved authoritative meshes. A name fallback
+            # must not silently bind clothes to an unrelated structural bone.
+            match_ctx["used"].add(obj)
+        for ref, objects in objects_by_ref.items():
+            owner = reference_mapping.get(str(ref), reference_mapping.get(ref))
+            if owner is None or len(objects) != 1:
+                print(f"[RigCreate] WARNING: unresolved/ambiguous mesh reference #{ref}; no name fallback")
+                continue
+            pending_refs.append((objects[0], int(owner)))
+            print(f"[RigCreate] Mesh #{ref} '{objects[0].name}' -> animation node #{owner}")
+    elif mesh_to_bone:
         print(f"[RigCreate] meshToBone mapping present ({len(mesh_to_bone)} entries), pre-constraining...")
 
         # Build an inst_ref -> bone_name map from the rig tree so rbxm-sourced
@@ -2755,6 +2804,24 @@ def create_rig(rigging_type, rig_meta_obj_name, target_armature=None):
     # These should NOT be touched by auto_constraint_parts
     authoritatively_constrained = set()
 
+    # Clothing is many meshes to one animation bone. Resolve bone referents
+    # only after creation, when Blender's actual (possibly suffixed) names exist.
+    protected_objects = set()
+    for obj, owner_ref in match_ctx.get("pending_constraint_refs", []):
+        protected_objects.add(obj)
+        bone_name = match_ctx.get("bone_names_by_ref", {}).get(owner_ref)
+        bone = ao.data.bones.get(bone_name) if bone_name else None
+        if bone is None:
+            print(f"[RigCreate] WARNING: animation node #{owner_ref} missing for '{obj.name}'; no name fallback")
+            continue
+        if obj in skinned_mesh_bindings:
+            continue
+        link_object_to_bone_rigid(obj, ao, bone)
+        authoritatively_constrained.add(obj)
+        print(f"[RigCreate] Mesh #{obj['RBXInstRef']} '{obj.name}' -> '{ao.name}' / '{bone.name}'")
+    if match_ctx.get("reference_mapping"):
+        protected_objects.update(referenced_objects)
+
     pending = match_ctx.get("pending_constraints", [])
     print(f"[RigCreate] Applying {len(pending)} pending constraints...")
 
@@ -2771,6 +2838,7 @@ def create_rig(rigging_type, rig_meta_obj_name, target_armature=None):
     # This handles any parts that weren't in the fingerprint map (legacy/fallback)
     bpy.context.view_layer.update()
     skip_objects = set(authoritatively_constrained)
+    skip_objects.update(protected_objects)
     skip_objects.update(skinned_mesh_bindings.keys())
     ok, msg = auto_constraint_parts(
         ao.name,
@@ -2786,7 +2854,8 @@ def create_rig(rigging_type, rig_meta_obj_name, target_armature=None):
 
         def _retry_auto_constraint():
             try:
-                auto_constraint_parts(_ao_name, skip_objects=_skip_set)
+                auto_constraint_parts(_ao_name, skip_objects=_skip_set,
+                                      inst_ref_to_bone=match_ctx.get("inst_ref_to_bone"))
             except Exception:
                 pass
             return None
