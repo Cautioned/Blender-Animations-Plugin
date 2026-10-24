@@ -3506,6 +3506,7 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                 weapon_rigs = [{
                     "rig": whole_rig,
                     "meshToBone": meta_loaded.get("meshToBone") or {},
+                    "meshToBoneRefs": meta_loaded.get("meshToBoneRefs") or {},
                 }]
         rig_by_root_name = {}
         for weapon_rig in weapon_rigs:
@@ -3652,7 +3653,8 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                     except Exception as exc:
                         print(f"[RbxmWeapon] internal rig build failed: {exc}")
                 _safe_mode_set("OBJECT", armature)
-                root_bone_name = rig_def.get("jname")
+                group["bone_names_by_ref"] = dict(match_ctx.get("bone_names_by_ref", {}))
+                root_bone_name = group["bone_names_by_ref"].get(rig_def.get("inst_ref"), rig_def.get("jname"))
                 if root_bone_name and armature.data.bones.get(root_bone_name):
                     group["created_bone"] = root_bone_name
 
@@ -3716,16 +3718,36 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                     ref = obj.get("RBXInstRef")
                     if isinstance(ref, int):
                         obj_by_ref[ref] = obj
-                for part_name, mapped_bone in (weapon_rig.get("meshToBone") or {}).items():
-                    ref = name_to_ref.get(part_name)
-                    obj = obj_by_ref.get(ref) if ref is not None else None
-                    if obj is None or obj in skinned_bound or obj in handled:
-                        continue
-                    mapped = armature.data.bones.get(mapped_bone)
-                    if mapped is None:
-                        continue
-                    link_object_to_bone_rigid(obj, armature, mapped)
-                    handled.add(obj)
+                from ..core.rbxm import _derive_mesh_to_bone_refs
+                ref_mapping = weapon_rig.get("meshToBoneRefs") or _derive_mesh_to_bone_refs(weapon_rig.get("rig"))
+                if ref_mapping and obj_by_ref:
+                    # Internal weapon rigs can also carry many welded clothes
+                    # or detail meshes per bone. Keep file-local identities
+                    # until matching finishes; names can repeat across groups.
+                    for ref, obj in obj_by_ref.items():
+                        if obj in skinned_bound or obj in handled:
+                            continue
+                        owner = ref_mapping.get(str(ref), ref_mapping.get(ref))
+                        if owner is None:
+                            continue  # Outside this internal rig: use the grip.
+                        handled.add(obj)
+                        target_name = group.get("bone_names_by_ref", {}).get(int(owner))
+                        target = armature.data.bones.get(target_name) if target_name else None
+                        if target is None:
+                            print(f"[RbxmWeapon] WARNING: mesh #{ref} animation node #{owner} missing; no name fallback")
+                            continue
+                        link_object_to_bone_rigid(obj, armature, target)
+                else:
+                    for part_name, mapped_bone in (weapon_rig.get("meshToBone") or {}).items():
+                        ref = name_to_ref.get(part_name)
+                        obj = obj_by_ref.get(ref) if ref is not None else None
+                        if obj is None or obj in skinned_bound or obj in handled:
+                            continue
+                        mapped = armature.data.bones.get(mapped_bone)
+                        if mapped is None:
+                            continue
+                        link_object_to_bone_rigid(obj, armature, mapped)
+                        handled.add(obj)
             for obj in group_meshes:
                 if obj in handled or obj in skinned_bound:
                     continue
@@ -4927,6 +4949,7 @@ def _create_rbxl_scene_rig_scaffolds(scene_rigs, part_entries, parent_collection
             "rigName": rig_name,
             "rig": rig_def,
             "meshToBone": scene_rig.get("meshToBone") or {},
+            "meshToBoneRefs": scene_rig.get("meshToBoneRefs") or {},
             "partAux": [entries_by_ref[ref] for ref in refs if ref in entries_by_ref],
             "source": "rbxm",
         }

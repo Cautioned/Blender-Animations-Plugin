@@ -123,6 +123,8 @@ def _find_parts_object_for_entry(parts_collection, entry):
                     return candidate
             except Exception:
                 continue
+        if any(candidate.get("RBXInstRef") is not None for candidate in parts_collection.objects):
+            return None
     idx = entry.get("idx")
     if idx is not None:
         idx = int(idx)
@@ -194,6 +196,11 @@ def _refresh_match_context(match_ctx):
         "intentionally_missing_parts",
         "skinned_mesh_bindings",
         "pending_constraints",
+        "pending_constraint_refs",
+        "reference_mapping",
+        "bone_names_by_ref",
+        "inst_ref_to_bone",
+        "_pending_dedup",
     ):
         if key in match_ctx:
             refreshed[key] = match_ctx[key]
@@ -231,6 +238,11 @@ def _find_matching_part(aux_name, aux_cf, match_ctx, inst_ref=None):
                         return candidate
                 except Exception:
                     continue
+
+            # When this import carries referents, a missing/used referent is
+            # not permission to steal another identically named clothes mesh.
+            if any(obj.get("RBXInstRef") is not None for obj in parts_collection.objects):
+                return None
 
     t2b = match_ctx.get("t2b") or get_transform_to_blender()
     mesh_centers = match_ctx.get("mesh_centers", {})

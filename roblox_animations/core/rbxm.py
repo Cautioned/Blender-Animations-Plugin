@@ -20,12 +20,15 @@ Format references:
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import struct
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schema import CF12, WeaponGrip
+
+_LOG = logging.getLogger(__name__)
 
 
 FILE_MAGIC = b"<roblox!"
@@ -2347,8 +2350,9 @@ _PROPS_CLASSES = frozenset({
 
 def _joint_parts(joint: _Instance) -> Tuple[Optional[int], Optional[int]]:
     """Return (Part0, Part1) referents for a joint instance."""
-    part0 = _first_prop(joint, "Part0", "Attachment0")
-    part1 = _first_prop(joint, "Part1", "Attachment1")
+    part0 = _first_prop(joint, "Part0", "Part0Internal", "Attachment0")
+    part1 = _first_prop(joint, "Part1", "Part1Internal", "Attachment1")
+    _LOG.debug("Joint #%s %s endpoints: %s -> %s", joint.referent, joint.class_name, part0, part1)
     return (
         part0 if isinstance(part0, int) else None,
         part1 if isinstance(part1, int) else None,
@@ -2453,21 +2457,45 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
         skeleton_parts.add(p)
         skeleton_parts.add(c)
 
-    for part0_ref, part1_ref, joint in rigid_edges:
-        p0_in_skel = part0_ref in skeleton_parts
-        p1_in_skel = part1_ref in skeleton_parts
-        if p0_in_skel and not p1_in_skel:
-            # Part0 is skeleton, Part1 is accessory → Part0 is parent
-            child_edges.append((part0_ref, part1_ref, joint, True))
-        elif p1_in_skel and not p0_in_skel:
-            # Part1 is skeleton, Part0 is accessory → Part1 is parent
-            child_edges.append((part1_ref, part0_ref, joint, False))
-        elif p0_in_skel and p1_in_skel:
-            # Both are skeleton parts — treat Part0 as parent (convention)
-            child_edges.append((part0_ref, part1_ref, joint, True))
-        else:
-            # Neither is skeleton (two accessories connected) — convention
-            child_edges.append((part0_ref, part1_ref, joint, True))
+    # Clothes often contain several welded parts, with arbitrary endpoint
+    # directions. Orient the whole rigid graph outwards from the skeleton,
+    # rather than orienting each weld independently and losing reversed chains.
+    from collections import deque
+    rigid_adjacency = {}
+    for p0, p1, joint in rigid_edges:
+        rigid_adjacency.setdefault(p0, []).append((p1, joint, True))
+        rigid_adjacency.setdefault(p1, []).append((p0, joint, False))
+        if p0 in skeleton_parts and p1 in skeleton_parts:
+            child_edges.append((p0, p1, joint, True))
+    reached = set(skeleton_parts)
+    rigid_owners = {ref: ref for ref in skeleton_parts}
+    warned_joints = set()
+
+    def grow_rigid_tree(seeds):
+        queue = deque(seeds)
+        while queue:
+            parent_ref = queue.popleft()
+            for child_ref, joint, pip0 in rigid_adjacency.get(parent_ref, []):
+                if child_ref in reached:
+                    if (rigid_owners.get(child_ref) != rigid_owners.get(parent_ref)
+                            and not {parent_ref, child_ref} <= skeleton_parts
+                            and joint.referent not in warned_joints):
+                        warned_joints.add(joint.referent)
+                        _LOG.warning("Ambiguous rigid link #%s between animation owners #%s and #%s; keeping first graph assignment",
+                                     joint.referent, rigid_owners.get(parent_ref), rigid_owners.get(child_ref))
+                    continue
+                reached.add(child_ref)
+                rigid_owners[child_ref] = rigid_owners.get(parent_ref, parent_ref)
+                child_edges.append((parent_ref, child_ref, joint, pip0))
+                queue.append(child_ref)
+
+    grow_rigid_tree(sorted(skeleton_parts))
+    # Weld-only assemblies still need structural bones for reconstruction.
+    for p0, p1, joint in rigid_edges:
+        if p0 not in reached:
+            reached.add(p0)
+            rigid_owners[p0] = p0
+            grow_rigid_tree([p0])
 
     # A rigid cross-link must not replace a part's animation joint. Roblox
     # permits redundant welds across an existing Motor6D skeleton; Blender
@@ -2526,6 +2554,7 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
             parent = instances.get(parent_ref)
             node["pname"] = parent.name if parent is not None else None
             node["jointType"] = joint.class_name
+            _LOG.debug("Rig edge #%s -> #%s (%s)", parent_ref, part_ref, joint.class_name)
             if joint.class_name in _ATTACHMENT_JOINT_CLASSES:
                 # Constraint joints: the attachments' part-space CFrames are
                 # the joint transforms (Attachment0 on the parent side,
@@ -2709,6 +2738,7 @@ def _scene_rigs(instances: Dict[int, _Instance], roots: Dict[int, _Instance]) ->
             "part_refs": sorted(part_refs),
             "rig": rig,
             "meshToBone": mapping,
+            "meshToBoneRefs": _derive_mesh_to_bone_refs(rig),
         })
     return rigs
 
@@ -2831,19 +2861,20 @@ def _model_rigs(instances: Dict[int, _Instance], roots: Dict[int, _Instance]) ->
             "part_refs": refs,
             "rig": rig,
             "meshToBone": mapping,
+            "meshToBoneRefs": _derive_mesh_to_bone_refs(rig),
         })
     return rigs
 
 
 def _derive_mesh_to_bone(rig: Optional[dict]) -> Dict[str, str]:
-    """Build an authoritative part-name -> bone-name map from the rig tree.
+    """Build the legacy name map used by older imports and wrap-layer fitting.
 
-    Since the .rbxm preserves the actual Motor6D graph, each BasePart's bone is
-    simply its own jname (the joint node shares the part's name). Emitting this
-    lets creation.py pre-constrain meshes without any name-matching heuristics.
+    Motor6D-driven parts map to their own jname; welded accessories inherit
+    the nearest animation owner's name.
 
-    Accessories attached via Weld / RigidConstraint (no Motor6D) do not create
-    their own bones — they should follow their parent bone instead.
+    Duplicate display names can collide here. RBXM object constraints must use
+    _derive_mesh_to_bone_refs instead. Accessories may retain structural bones
+    for reconstruction, but their meshes should follow the animation owner.
     """
     mapping: Dict[str, str] = {}
     if not rig:
@@ -2870,6 +2901,29 @@ def _derive_mesh_to_bone(rig: Optional[dict]) -> Dict[str, str]:
     # Root is always a deform bone (HumanoidRootPart)
     root_bone = rig.get("jname") if isinstance(rig, dict) else None
     walk(rig, root_bone)
+    return mapping
+
+
+def _derive_mesh_to_bone_refs(rig: Optional[dict]) -> Dict[str, int]:
+    """Map part referents to owning animation-node referents (JSON-safe keys).
+
+    Many clothes meshes may be welded to one animated part. Structural weld
+    bones remain useful for rig reconstruction, but are not independent motion
+    targets for those meshes. Names and partAux array indices are not identities.
+    Non-weld hierarchies keep their own targets for older reconstruction paths.
+    """
+    mapping = {}
+    stack = [(rig, None)] if rig else []
+    while stack:
+        node, owner = stack.pop()
+        ref = node.get("inst_ref")
+        rigid = node.get("jointType") in ("Weld", "WeldConstraint", "RigidConstraint", "Snap")
+        if not rigid or node.get("isDeformBone") or owner is None:
+            owner = ref
+        if ref is not None and owner is not None:
+            mapping[str(ref)] = owner
+            _LOG.debug("Mesh #%s -> animation node #%s", ref, owner)
+        stack.extend((child, owner) for child in node.get("children") or [])
     return mapping
 
 
@@ -3119,6 +3173,7 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
     rig = _build_rig_tree(instances, roots)
     if rig is not None:
         meta["rig"] = rig
+        meta["meshToBoneRefs"] = _derive_mesh_to_bone_refs(rig)
         mesh_to_bone = _derive_mesh_to_bone(rig)
         if mesh_to_bone:
             meta["meshToBone"] = mesh_to_bone
