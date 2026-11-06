@@ -1,5 +1,8 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from ..animation import planning
 
 from ..animation.planning import build_bake_plan
 
@@ -83,3 +86,40 @@ class TestBakePlanning(unittest.TestCase):
         stepped.evaluate = lambda frame: self.fail("Constant segment was refined")
         plan = self.plan([stepped], 2)
         self.assertIn(1.25, plan.frames)
+
+    def test_extreme_dense_segments_are_clipped_before_iteration(self):
+        extreme = 1.1233726106467041e18
+        for mixed in (False, True):
+            for start, end in ((-extreme, extreme), (-extreme, -10), (200, extreme)):
+                with self.subTest(mixed=mixed, start=start, end=end):
+                    styles = ("CONSTANT", "LINEAR") if mixed else ("BEZIER",)
+                    curves = [curve([(start, style), (end, style)]) for style in styles]
+
+                    case = self
+
+                    class RangeGuard(type):
+                        def __call__(cls, *args):
+                            frames = range(*args)
+                            case.assertLessEqual(len(frames), 103,
+                                                 "Planner iterated outside the export range")
+                            return frames
+
+                        def __instancecheck__(cls, value):
+                            return isinstance(value, range)
+
+                    class BoundedRange(metaclass=RangeGuard):
+                        pass
+
+                    # Fail immediately on the old bug instead of hanging the test.
+                    with patch.object(planning, "range", BoundedRange, create=True):
+                        plan = self.plan(curves, 103)
+                    expected = list(range(1, 104)) if start < 1 < end else [1, 103]
+                    self.assertEqual(plan.frames, expected)
+
+    def test_dense_segments_preserve_fractional_endpoints(self):
+        for styles in (("BEZIER",), ("CONSTANT", "LINEAR")):
+            with self.subTest(styles=styles):
+                plan = self.plan([
+                    curve([(1.5, style), (4.5, style)]) for style in styles
+                ], 6)
+                self.assertEqual(plan.frames, [1, 1.5, 2, 3, 4, 4.5, 6])

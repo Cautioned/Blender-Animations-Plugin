@@ -18,6 +18,29 @@ from .mesh_surface import (
 )
 
 
+def _set_curved_primitive_normals(mesh, entries):
+    """Keep cube-patch seams smooth without smoothing cylinder cap edges."""
+    if not entries:return
+    shape=entries[0].get('shape')
+    if shape not in ('ball',0,'cylinder',2) or any(e.get('shape')!=shape for e in entries):return
+    count=294 if shape in ('ball',0) else 114
+    if len(mesh.vertices)!=count*len(entries):return
+    from mathutils import Vector
+    normals=[]
+    basis=get_transform_to_blender()
+    for index,entry in enumerate(entries):
+        transform=basis @ (cf_to_mat(entry['part_cf']) if entry.get('part_cf') else Matrix.Identity(4))
+        inverse=transform.inverted_safe()
+        half=[float(x)*.5 for x in entry.get('part_size',(1,1,1))]
+        for j,vertex in enumerate(mesh.vertices[index*count:(index+1)*count]):
+            point=inverse @ vertex.co
+            if shape in ('ball',0):normal=Vector(tuple(point[k]/max(half[k]**2,1e-12) for k in range(3)))
+            elif j<58:normal=Vector((1 if point.x>0 else -1,0,0))
+            else:normal=Vector((0,point.y,point.z))
+            normals.append(tuple((transform.to_3x3() @ normal).normalized()))
+    mesh.normals_split_custom_set_from_vertices(normals)
+
+
 def _build_primitive_mesh_data(entry, include_surface_data=True):
     """Generate synthetic mesh_data from a Roblox primitive Part shape.
 
@@ -39,8 +62,8 @@ def _build_primitive_mesh_data(entry, include_surface_data=True):
     def _emit_quad(v0, v1, v2, v3):
         i = len(positions)
         positions.extend([v0, v1, v2, v3])
-        faces.append((i, i+1, i+2))
-        faces.append((i, i+2, i+3))
+        faces.append((i, i+1, i+3))
+        faces.append((i+1, i+2, i+3))
 
     # ── Block (Roblox Shape 1, default Part) ──────────────────────────
     if shape in ("block", 1):
@@ -57,85 +80,65 @@ def _build_primitive_mesh_data(entry, include_surface_data=True):
 
     # ── Cylinder (Roblox Shape 2) ─────────────────────────────────────
     elif shape in ("cylinder", 2):
-        # Caps at ±X, circular cross-section in YZ.  Circle is always 1:1
-        # (Roblox does not stretch it); radius is the smaller cross-section
-        # dimension.  16 segments = 2 + 2×16 verts, 16×2 + 16×2×2 = 96 tris.
-        segs = 16
-        r = min(hy, hz)  # circular cross-section, not elliptical
-        # +X cap center
-        pc = len(positions)
-        positions.append((hx, 0, 0))
-        # +X cap ring
-        for i in range(segs):
-            a = 2.0 * _math.pi * i / segs
-            positions.append((hx, r * _math.cos(a), r * _math.sin(a)))
-        # +X cap fans
-        for i in range(segs):
-            ni = (i + 1) % segs
-            faces.append((pc, pc + 1 + i, pc + 1 + ni))
-        # -X cap center
-        nc = len(positions)
-        positions.append((-hx, 0, 0))
-        # -X cap ring
-        for i in range(segs):
-            a = 2.0 * _math.pi * i / segs
-            positions.append((-hx, r * _math.cos(a), r * _math.sin(a)))
-        # -X cap fans (reverse winding)
-        for i in range(segs):
-            ni = (i + 1) % segs
-            faces.append((nc, nc + 1 + ni, nc + 1 + i))
-        # Side quads (wound outward: +X ring vertex -> -X ring vertex -> next -X).
-        for i in range(segs):
-            ni = (i + 1) % segs
-            t0 = pc + 1 + i
-            t1 = pc + 1 + ni
-            b0 = nc + 1 + i
-            b1 = nc + 1 + ni
-            faces.append((t0, b0, b1))
-            faces.append((t0, b1, t1))
+        # Four normalized square-edge patches, six cells each (Studio OBJ).
+        # Caps keep separate vertices, so cap/side shading and UVs never mix.
+        r = min(hy, hz)
+        patches=[]
+        for face in (1,2,4,5):
+            ring=[]
+            for step in range(7):
+                t=1-step/3.0
+                y,z={1:(1,t),2:(t,1),4:(-1,-t),5:(t,-1)}[face]
+                length=_math.hypot(y,z)
+                ring.append((r*y/length,r*z/length))
+            patches.append(ring)
+        # Clockwise boundary viewed from +X; each patch duplicates its seam.
+        boundary=[(y,z) for j in (3,2,1,0) for y,z in
+                  (reversed(patches[j]) if j==1 else patches[j])]
+        for x,reverse in ((hx,True),(-hx,False)):
+            start=len(positions);positions.append((x,0,0))
+            positions.extend((x,y,z) for y,z in boundary)
+            for patch in range(4):
+                for cell in range(6):
+                    a=start+1+patch*7+cell;b=a+1
+                    faces.append((start,b,a) if reverse else (start,a,b))
+        for patch_index,ring in enumerate(patches):
+            start=len(positions)
+            for y,z in ring:positions.extend(((-hx,y,z),(hx,y,z)))
+            for cell in range(6):
+                a=start+cell*2
+                triangles=((a,a+1,a+3),(a,a+3,a+2)) if patch_index==1 else ((a,a+1,a+2),(a+1,a+3,a+2))
+                p0,p1,p2=(positions[k] for k in triangles[0])
+                cross_y=-(p1[0]-p0[0])*(p2[2]-p0[2])
+                cross_z=(p1[0]-p0[0])*(p2[1]-p0[1])
+                reverse=cross_y*(p0[1]+p2[1])+cross_z*(p0[2]+p2[2])<0
+                faces.extend(tuple(reversed(t)) if reverse else t for t in triangles)
 
     # ── Ball / Sphere (Roblox Shape 0) ────────────────────────────────
     elif shape in ("ball", 0):
-        # Sphere is always 1:1:1 — Roblox does not stretch it.  Radius is
-        # the smallest half-extent so the sphere is inscribed in the bounding
-        # box. The latitude rings intentionally stop short of the poles, so
-        # add explicit pole vertices and triangle fans; without them balls
-        # have two open caps.
-        rings, segs = 14, 21
-        r = min(hx, hy, hz)
-        south_pole = len(positions)
-        positions.append((-r, 0.0, 0.0))
-        for ring in range(rings):
-            phi = _math.pi * (ring + 0.5) / rings - _math.pi / 2.0
-            cos_phi = _math.cos(phi)
-            sin_phi = _math.sin(phi)
-            for s in range(segs):
-                theta = 2.0 * _math.pi * s / segs
-                x = r * sin_phi
-                y = r * cos_phi * _math.cos(theta)
-                z = r * cos_phi * _math.sin(theta)
-                positions.append((x, y, z))
-        north_pole = len(positions)
-        positions.append((r, 0.0, 0.0))
-        # South pole faces wind outward along -X.
-        for s in range(segs):
-            current = 1 + s
-            next_index = 1 + (s + 1) % segs
-            faces.append((south_pole, next_index, current))
-        for ring in range(rings - 1):
-            for s in range(segs):
-                a = 1 + ring * segs + s
-                b = 1 + ring * segs + (s + 1) % segs
-                c = 1 + (ring + 1) * segs + (s + 1) % segs
-                d = 1 + (ring + 1) * segs + s
-                faces.append((a, b, c))
-                faces.append((a, c, d))
-        # North pole faces wind outward along +X.
-        last_ring = 1 + (rings - 1) * segs
-        for s in range(segs):
-            current = last_ring + s
-            next_index = last_ring + (s + 1) % segs
-            faces.append((north_pole, current, next_index))
+        # Studio uses six normalized cube-face grids, six cells per side.
+        # Keep the seams: each face has its own full decal UV patch.
+        bases = (
+            ((1,0,0),(0,0,-1),(0,1,0)),
+            ((0,1,0),(-1,0,0),(0,0,1)),
+            ((0,0,1),(1,0,0),(0,1,0)),
+            ((-1,0,0),(0,0,1),(0,1,0)),
+            ((0,-1,0),(-1,0,0),(0,0,-1)),
+            ((0,0,-1),(-1,0,0),(0,1,0)),
+        )
+        for normal, axis_u, axis_v in bases:
+            start = len(positions)
+            for row in range(7):
+                v = row / 3.0 - 1.0
+                for col in range(7):
+                    u = col / 3.0 - 1.0
+                    direction = tuple(normal[k]+axis_u[k]*u+axis_v[k]*v for k in range(3))
+                    length = _math.sqrt(sum(x*x for x in direction))
+                    positions.append(tuple((hx,hy,hz)[k]*direction[k]/length for k in range(3)))
+            for row in range(6):
+                for col in range(6):
+                    a = start + row*7 + col
+                    faces.extend(((a,a+1,a+7),(a+1,a+8,a+7)))
 
     # ── Wedge (Shape 3 / WedgePart) ────────────────────────────────────
     elif shape == "wedge":
@@ -236,6 +239,13 @@ def _build_primitive_mesh_data(entry, include_surface_data=True):
                 if i3 < n:
                     normals[i3] = fn
 
+        if shape in ("ball", 0):
+            normals = [tuple(Vector(tuple(p[k]/max((hx,hy,hz)[k]**2,1e-12) for k in range(3))).normalized()) for p in positions]
+
+        if shape in ('cylinder',2):
+            normals=[(1.0 if p[0]>0 else -1.0,0.0,0.0) if i<58 else
+                     tuple(Vector((0,p[1],p[2])).normalized()) for i,p in enumerate(positions)]
+
         if shape in ("block", 1):
             # Blocks carry Roblox's canonical per-face UVs (its OBJ export),
             # not a derived projection: u/v in band space, 64px/stud.
@@ -266,6 +276,8 @@ def _build_primitive_mesh_data(entry, include_surface_data=True):
         "normals": normals,
         "uvs": uvs,
         "loop_uvs": loop_uvs,
+        "material_loop_uvs": (_sphere_material_uvs(positions, faces, size, 1.0)
+                              if include_surface_data and shape in ("ball", 0) else None),
         # Per-triangle Roblox surface types, for textures.apply_part_material's
         # per-face material assignment.
         "face_surface_types": face_surface_types,
@@ -544,6 +556,29 @@ def _block_canonical_stud_uvs(point, nx, ny, nz, hx, hy, hz):
     return (hz + point[2], hy - point[1])  # -X: U=+Z
 
 
+def _sphere_material_uvs(positions, faces, size, units):
+    """Native sphere material charts use the cube before normalization.
+
+    Undo radial rounding in part-local, size-normalized coordinates. A
+    planar projection of the rounded vertices shrinks each chart toward
+    its corners and incorrectly enlarges the visible material pattern.
+    """
+    half = [max(abs(float(v)) * .5, 1e-12) for v in size]
+    normalized = [tuple(float(p[k]) / half[k] for k in range(3)) for p in positions]
+    cube = [tuple(float(p[k]) / max(max(abs(v) for v in q), 1e-12)
+                  for k in range(3)) for p,q in zip(positions,normalized)]
+    result=[]
+    for face in faces:
+        center=[sum(normalized[int(i)][k] for i in face) for k in range(3)]
+        axis=max(range(3),key=lambda k:abs(center[k]))
+        sign=1 if center[axis]>=0 else -1
+        au,av,us,vs = ((2,1,-sign,1) if axis==0 else
+                       (0,2,-1,sign) if axis==1 else (0,1,sign,1))
+        result.extend(((cube[int(i)][au]*us+half[au])*units,
+                       (cube[int(i)][av]*vs+half[av])*units) for i in face)
+    return result
+
+
 def _primitive_face_projection_axes(pts):
     """Pick the two dominant in-plane world axes for a polygonal face.
 
@@ -661,15 +696,19 @@ def _create_batched_static_primitives(parts_collection, batch_name, entries, mat
             tuple(offset + int(vertex_index) for vertex_index in face[:3])
             for face in entry_faces
         )
-        if needs_material_uv:
+        if needs_material_uv and entry.get("shape") in ("ball", 0):
+            uvs.extend(_sphere_material_uvs(raw_positions, entry_faces, entry.get("part_size") or (4,1,2), units))
+        elif needs_material_uv:
+            bounds_min = [min(p[axis] for p in raw_positions) for axis in range(3)]
+            bounds_max = [max(p[axis] for p in raw_positions) for axis in range(3)]
             for face in entry_faces:
                 idxs = [int(index) for index in face[:3] if 0 <= int(index) < len(raw_positions)]
                 pts = [raw_positions[index] for index in idxs]
                 if len(pts) < 3:
                     continue
                 ax_u, ax_v, u_sign, _ = _primitive_face_projection_axes(pts)
-                origin_u = min(point[ax_u] * u_sign for point in pts)
-                origin_v = min(point[ax_v] for point in pts)
+                origin_u = bounds_min[ax_u] if u_sign > 0 else -bounds_max[ax_u]
+                origin_v = bounds_min[ax_v]
                 uvs.extend(
                     (
                         (point[ax_u] * u_sign - origin_u) * units,
@@ -691,11 +730,14 @@ def _create_batched_static_primitives(parts_collection, batch_name, entries, mat
     mesh_obj["RBXSynthesizedPart"] = True
     mesh_obj["RBXStaticBatch"] = True
     mesh_obj["RBXStaticPartCount"] = len(entries)
+    if len(entries) == 1 and entries[0].get("inst_ref") is not None:
+        mesh_obj["RBXInstRef"] = int(entries[0]["inst_ref"])
     _set_mesh_smooth_shading(mesh)
+    _set_curved_primitive_normals(mesh, entries)
     if needs_material_uv and uvs:
         try:
             uv_layer = mesh.uv_layers.new(name=uv_layer_name)
-            _bulk_set(uv_layer.data, "uv", uvs)
+            _bulk_set(uv_layer.data, "uv", [value for uv in uvs for value in uv])
         except Exception:
             pass
     if material is not None:
@@ -769,11 +811,19 @@ def _primitive_shape_template(np, shape):
             continue
         signed_u = points[:, ax_u] * u_sign
         uv_coeffs[face_index * 3:face_index * 3 + 3, 0] = (
-            signed_u - signed_u.min()
+            signed_u - (unit_positions[:, ax_u].min() if u_sign > 0 else -unit_positions[:, ax_u].max())
         )
         uv_coeffs[face_index * 3:face_index * 3 + 3, 1] = (
-            points[:, ax_v] - points[:, ax_v].min()
+            points[:, ax_v] - unit_positions[:, ax_v].min()
         )
+    if shape in ("ball", 0):
+        uv_coeffs[:] = np.asarray(_sphere_material_uvs(
+            unit_positions, template_faces, (1,1,1), 1), dtype=np.float64)
+        # Cube-chart axes, rather than the stretched triangle's normal.
+        for row,face in enumerate(template_faces):
+            center=unit_positions[face].mean(axis=0)
+            axis=int(np.abs(center).argmax())
+            corner_axes[row]=(2,1) if axis==0 else (0,2) if axis==1 else (0,1)
     if shape in ("block", 1):
         # Roblox's canonical block UVs, in studs per unit-size: loop UVs of a
         # unit block in band space, divided by the band units (u 0.5/stud,
@@ -818,17 +868,19 @@ def _static_primitive_part_arrays(
     ).astype(np.float32)
     face_np = np.asarray(entry_faces, dtype=np.int64)[:, :3] + vertex_offset
     uv_flat = None
-    if needs_material_uv:
+    if needs_material_uv and entry.get("shape") in ("ball", 0):
+        uv_flat = np.asarray(_sphere_material_uvs(raw_positions, entry_faces, entry.get("part_size") or (4,1,2), units), dtype=np.float32)
+    elif needs_material_uv:
         uv_flat = np.empty((len(face_np) * 3, 2), dtype=np.float32)
         for row, face in enumerate(face_np):
             points = pos_np[face - vertex_offset, :3]
             ax_u, ax_v, u_sign, _ = _primitive_face_projection_axes(points)
             signed_u = points[:, ax_u] * u_sign
             uv_flat[row * 3:row * 3 + 3, 0] = (
-                signed_u - signed_u.min()
+                signed_u - (pos_np[:, ax_u].min() if u_sign > 0 else -pos_np[:, ax_u].max())
             ) * units
             uv_flat[row * 3:row * 3 + 3, 1] = (
-                points[:, ax_v] - points[:, ax_v].min()
+                points[:, ax_v] - pos_np[:, ax_v].min()
             ) * units
     return world, face_np, uv_flat
 
@@ -908,7 +960,9 @@ def _create_batched_static_primitives_np(
         translations = (
             np.einsum("ij,nj->ni", b_linear, cfs[:, :3]) + b_translation
         )
-        local = unit_positions[None, :, :] * sizes[:, None, :]
+        geometry_sizes=sizes.copy()
+        if shape in ('cylinder',2):geometry_sizes[:,1:]=sizes[:,1:].min(axis=1)[:,None]
+        local = unit_positions[None, :, :] * geometry_sizes[:, None, :]
         world = (
             np.einsum("nij,nvj->nvi", combined, local)
             + translations[:, None, :]
@@ -945,7 +999,10 @@ def _create_batched_static_primitives_np(
         mesh_obj["RBXSynthesizedPart"] = True
         mesh_obj["RBXStaticBatch"] = True
         mesh_obj["RBXStaticPartCount"] = len(entries)
+        if len(entries) == 1 and entries[0].get("inst_ref") is not None:
+            mesh_obj["RBXInstRef"] = int(entries[0]["inst_ref"])
         _set_mesh_smooth_shading(mesh)
+        _set_curved_primitive_normals(mesh, entries)
         if needs_material_uv and parts_uv:
             uv_layer = mesh.uv_layers.new(name=uv_layer_name)
             _bulk_set(uv_layer.data, "uv", np.concatenate(parts_uv).reshape(-1))

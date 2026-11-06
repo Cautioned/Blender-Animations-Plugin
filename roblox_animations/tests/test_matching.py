@@ -2192,6 +2192,215 @@ class TestFindMatchingPart(unittest.TestCase):
 # test: inst_ref-based resolution (rbxm authoritative matching)
 # ---------------------------------------------------------------------------
 
+class TestWeldedClothesConstraints(unittest.TestCase):
+    def setUp(self):
+        _cleanup()
+        self.master = bpy.data.collections.new("Clothes.model")
+        bpy.context.scene.collection.children.link(self.master)
+        self.parts = bpy.data.collections.new("Clothes.model Parts")
+        self.master.children.link(self.parts)
+
+    def tearDown(self):
+        _cleanup()
+
+    def assertMatrixClose(self, actual, expected):
+        self.assertLess(max(abs(actual[r][c] - expected[r][c]) for r in range(4) for c in range(4)), 2e-4)
+
+    def test_many_clothes_per_bone_preserve_world_transform_and_follow_pose(self):
+        from mathutils import Matrix
+        ao = _make_armature_with_bones([("Beak", (1, 2, 3), (1, 3, 3))], collection=self.master)
+        ao.matrix_world = Matrix.Translation((4, -2, 5)) @ Matrix.Rotation(0.3, 4, "Z")
+        ao.pose.bones["Beak"].rotation_mode = "XYZ"
+        ao.pose.bones["Beak"].rotation_euler.z = 0.4
+        meshes = []
+        for i, ref in enumerate((42, 305, 700)):
+            obj = _make_mesh_obj("Part", location=(i + 3, 4, 5), collection=self.parts)
+            obj["RBXInstRef"] = ref
+            obj.rotation_euler.y = 0.2
+            meshes.append(obj)
+        bpy.context.view_layer.update()
+        before = {obj: obj.matrix_world.copy() for obj in meshes}
+        mapping = {42: "Beak", 305: "Beak", 700: "Beak"}
+        for _ in range(2):
+            self.assertTrue(auto_constraint_parts(ao.name, inst_ref_to_bone=mapping)[0])
+            bpy.context.view_layer.update()
+            for obj in meshes:
+                cs = [c for c in obj.constraints if c.type == "CHILD_OF"]
+                self.assertEqual(len(cs), 1)
+                self.assertEqual(cs[0].target, ao)
+                self.assertEqual(cs[0].subtarget, "Beak")
+                self.assertMatrixClose(obj.matrix_world, before[obj])
+        target_before = ao.matrix_world @ ao.pose.bones["Beak"].matrix
+        ao.pose.bones["Beak"].rotation_euler.z += 0.5
+        bpy.context.view_layer.update()
+        delta = (ao.matrix_world @ ao.pose.bones["Beak"].matrix) @ target_before.inverted()
+        for obj in meshes:
+            self.assertMatrixClose(obj.matrix_world, delta @ before[obj])
+
+    def test_missing_authoritative_target_cannot_fall_back_to_structural_bone(self):
+        ao = _make_armature_with_bones([("Part", (0, 0, 0), (0, 1, 0))], collection=self.master)
+        obj = _make_mesh_obj("Part", collection=self.parts)
+        obj["RBXInstRef"] = 42
+        auto_constraint_parts(ao.name, inst_ref_to_bone={42: "Missing"})
+        self.assertEqual(len(obj.constraints), 0)
+        ctx = _build_match_context(self.parts)
+        self.assertIsNone(_find_matching_part("Part", None, ctx, inst_ref=700))
+
+    def test_rebinding_existing_constraint_preserves_current_world_transform(self):
+        from ..rig.constraints import link_object_to_bone_rigid
+        ao = _make_armature_with_bones([
+            ("Beak", (0, 0, 0), (0, 1, 0)), ("UpperDoor", (2, 0, 0), (2, 1, 0))
+        ], collection=self.master)
+        obj = _make_mesh_obj("Part", location=(3, 4, 5), collection=self.parts)
+        bpy.context.view_layer.update()
+        link_object_to_bone_rigid(obj, ao, ao.data.bones["Beak"])
+        ao.pose.bones["Beak"].rotation_mode = "XYZ"
+        ao.pose.bones["Beak"].rotation_euler.z = 0.5
+        bpy.context.view_layer.update()
+        before = obj.matrix_world.copy()
+        link_object_to_bone_rigid(obj, ao, ao.data.bones["UpperDoor"])
+        bpy.context.view_layer.update()
+        self.assertMatrixClose(obj.matrix_world, before)
+        self.assertEqual(len(obj.constraints), 1)
+        self.assertEqual(obj.constraints[0].subtarget, "UpperDoor")
+
+    def test_reference_state_survives_match_context_refresh(self):
+        obj = _make_mesh_obj("Part", collection=self.parts)
+        ctx = _build_match_context(self.parts)
+        ctx.update(reference_mapping=True, pending_constraint_refs=[(obj, 2)],
+                   inst_ref_to_bone={42: "UpperDoor"}, _pending_dedup={(id(obj), "UpperDoor")})
+        refreshed = _refresh_match_context(ctx)
+        for key in ("reference_mapping", "pending_constraint_refs", "inst_ref_to_bone", "_pending_dedup"):
+            self.assertEqual(refreshed[key], ctx[key])
+
+    def test_reference_mapped_meshpart_retains_authored_skin_weights(self):
+        obj = _make_mesh_obj("Part", collection=self.parts)
+        obj["RBXInstRef"] = 42
+        meta = {"rig": {"jname": "Beak", "inst_ref": 20},
+                "meshToBoneRefs": {"42": 20},
+                "partAux": [{"inst_ref": 42, "name": "Part", "mesh_class": "MeshPart", "mesh_id": "1"}]}
+        weights = [{"Beak": 1.0} for _ in obj.data.vertices]
+        with (mock.patch.object(creation, "fetch_and_parse_filemesh", return_value={
+                "bone_names": ["Beak"], "vertex_weights": weights}),
+              mock.patch.object(creation, "_build_direct_skin_binding", return_value=(
+                  {"mode": "index", "vertex_weights": weights}, "authored"))):
+            bindings = creation._prepare_skinned_mesh_bindings(meta, self.parts)
+        self.assertEqual(bindings[obj]["mode"], "index")
+        self.assertEqual(bindings[obj]["vertex_weights"], weights)
+
+    def test_import_operator_keeps_reference_mapping(self):
+        import json
+        from .test_rbxm_rebuild import import_binary
+        from .test_rbxm_joint_graph import welded_clothes_binary
+        import roblox_animations
+        try:
+            roblox_animations.register()
+        except (RuntimeError, ValueError):
+            pass
+        armature, meta_obj = import_binary("WeldedClothes", welded_clothes_binary())
+        meta = json.loads(meta_obj["RigMeta"])
+        self.assertEqual(meta["meshToBoneRefs"]["42"], 2)
+        objects = {obj.get("RBXInstRef"): obj for obj in bpy.data.objects if obj.type == "MESH"}
+        for ref, expected in ((42, "UpperDoor"), (700, "UpperDoor"), (101, "Beak"), (305, "Beak")):
+            obj = objects[ref]
+            self.assertNotEqual(obj["RBXPartIdx"], ref)
+            cs = [c for c in obj.constraints if c.type == "CHILD_OF"]
+            self.assertEqual(len(cs), 1)
+            self.assertEqual(cs[0].target, armature)
+            self.assertEqual(cs[0].subtarget, expected)
+
+    def test_internal_weapon_rig_uses_reference_targets_after_bone_renaming(self):
+        from types import SimpleNamespace
+        from ..core.rbxm import parse_rbxm
+        from .test_rbxm_joint_graph import welded_clothes_binary
+        import roblox_animations
+        try:
+            roblox_animations.register()
+        except (RuntimeError, ValueError):
+            pass
+        ao = _make_armature_with_bones([
+            (name, (i, 0, 0), (i, 1, 0)) for i, name in enumerate(("Grip", "Root", "Beak", "Part"))
+        ], collection=self.master)
+        utils.invalidate_armature_cache()
+        bpy.context.scene.rbx_anim_settings.rbx_anim_armature = ao.name
+        meta = parse_rbxm(welded_clothes_binary())
+        meta["weaponGrip"] = [{"root": "Root", "bone": "Grip"}]
+        objects = {}
+        for entry in meta["partAux"]:
+            obj = _make_mesh_obj(entry["name"], collection=self.parts)
+            obj["RBXInstRef"] = entry["inst_ref"]
+            obj["RBXPartIdx"] = entry["idx"]
+            objects[entry["inst_ref"]] = obj
+        operator = SimpleNamespace(report=mock.Mock())
+        result = import_ops.OBJECT_OT_ApplyWeaponImport._apply_rbxm_weapon(
+            operator, bpy.context, meta, list(objects.values()))
+        self.assertEqual(result, {"FINISHED"})
+        names = {int(b["rbx_inst_ref"]): b.name for b in ao.data.bones if "rbx_inst_ref" in b}
+        for ref, obj in objects.items():
+            cs = [c for c in obj.constraints if c.type == "CHILD_OF"]
+            self.assertEqual(len(cs), 1)
+            self.assertEqual(cs[0].target, ao)
+            self.assertEqual(cs[0].subtarget, names[meta["meshToBoneRefs"][str(ref)]])
+            self.assertNotIn("RBXInstRef", obj, "File-local weapon refs must be removed after attachment")
+
+    def test_binary_to_rig_constraints_use_actual_bone_names(self):
+        import json
+        from ..core.rbxm import parse_rbxm
+        from .test_rbxm_joint_graph import welded_clothes_binary
+        from ..core.utils import cf_to_mat
+        from ..rig.creation import create_rig
+        import roblox_animations
+        try:
+            roblox_animations.register()
+        except (RuntimeError, ValueError):
+            pass
+        # Exercise new metadata and older RBXM metadata with only tree refs.
+        for legacy, meshparts in ((False, False), (True, False), (False, True), (True, True)):
+            with self.subTest(legacy=legacy, meshparts=meshparts):
+                meta = parse_rbxm(welded_clothes_binary())
+                if legacy:
+                    meta.pop("meshToBoneRefs")
+                if meshparts:
+                    # Unweighted MeshParts enter the skin-binding preparation
+                    # pass even though they must remain rigid clothes followers.
+                    for entry in meta["partAux"]:
+                        entry.update(class_name="MeshPart", mesh_class="MeshPart", mesh_id="rbxassetid://1")
+                meta["rigName"] = "Clothes"
+                rig_coll = bpy.data.collections.new("Clothes.model Rig")
+                self.master.children.link(rig_coll)
+                meta_obj = bpy.data.objects.new("ClothesMeta", None)
+                rig_coll.objects.link(meta_obj)
+                meta_obj["RigMeta"] = json.dumps(meta)
+                objects = {}
+                for entry in meta["partAux"]:
+                    obj = _make_mesh_obj(entry["name"], collection=self.parts)
+                    obj.matrix_world = constants.get_transform_to_blender() @ cf_to_mat(entry["part_cf"])
+                    obj["RBXInstRef"] = entry["inst_ref"]
+                    obj["RBXPartIdx"] = entry["idx"]
+                    objects[entry["inst_ref"]] = obj
+                bpy.context.view_layer.update()
+                before = {ref: obj.matrix_world.copy() for ref, obj in objects.items()}
+                with mock.patch.object(creation, "fetch_and_parse_filemesh", return_value={"vertex_weights": []}):
+                    create_rig("RAW", meta_obj.name)
+                ao = next(obj for obj in bpy.data.objects if obj.type == "ARMATURE")
+                bone_names = {int(b["rbx_inst_ref"]): b.name for b in ao.data.bones if "rbx_inst_ref" in b}
+                expected = {1: 1, 2: 2, 20: 20, 42: 2, 101: 20, 305: 20, 700: 2, 1200: 1200, 1300: 1300}
+                bpy.context.view_layer.update()
+                for ref, obj in objects.items():
+                    cs = [c for c in obj.constraints if c.type == "CHILD_OF"]
+                    self.assertEqual(len(cs), 1, f"mesh #{ref}")
+                    self.assertEqual(cs[0].target, ao)
+                    self.assertEqual(cs[0].subtarget, bone_names[expected[ref]])
+                    self.assertMatrixClose(obj.matrix_world, before[ref])
+                self.assertNotEqual(bone_names[1200], bone_names[1300])
+                self.assertEqual(ao.data.bones[bone_names[42]].parent.name, bone_names[2])
+                for obj in list(self.parts.objects):
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.data.objects.remove(ao, do_unlink=True)
+                bpy.data.objects.remove(meta_obj, do_unlink=True)
+                bpy.data.collections.remove(rig_coll)
+
+
 class TestInstRefResolution(unittest.TestCase):
     """RBXM instance referents should resolve parts regardless of name collisions."""
 

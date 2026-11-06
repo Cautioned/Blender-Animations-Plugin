@@ -195,8 +195,7 @@ class MaterialPipelineTests(unittest.TestCase):
         # Non-Color copy of its own.
         entry = _entry(color=(0.9, 0.1, 0.2), material=256)
         entry["surface_appearances"] = [
-            {"color_map": "rbxassetid://111", "alpha_mode": 0},
-            {"normal_map": "rbxassetid://111"},
+            {"color_map": "rbxassetid://111", "alpha_mode": 0, "normal_map": "rbxassetid://111"},
         ]
         material = self._build(entry, name="rbx_test_shared_cs")
         color_node = material.node_tree.nodes.get("RBX ColorMap")
@@ -402,8 +401,8 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertIsNotNone(baked_attr)
         self.assertEqual(baked_attr.type, "RGB")
         default = baked_attr.outputs["Color"].default_value
-        self.assertAlmostEqual(default[0], 0.2, places=4)
-        self.assertAlmostEqual(default[2], 0.9, places=4)
+        self.assertAlmostEqual(default[0], 0.03310477, places=4)
+        self.assertAlmostEqual(default[2], 0.78741229, places=4)
 
     def test_lazy_builtin_tint_uses_one_object_color_material(self):
         first_entry = _entry(color=(0.2, 0.4, 0.9), material=848)
@@ -422,9 +421,9 @@ class MaterialPipelineTests(unittest.TestCase):
         bpy.context.collection.objects.link(obj)
         try:
             textures.set_object_rbx_tint(obj, second_entry)
-            self.assertAlmostEqual(obj.color[0], 0.8, places=5)
-            self.assertAlmostEqual(obj.color[1], 0.1, places=5)
-            self.assertAlmostEqual(obj.color[2], 0.3, places=5)
+            self.assertAlmostEqual(obj.color[0], 0.60382734, places=5)
+            self.assertAlmostEqual(obj.color[1], 0.01002283, places=5)
+            self.assertAlmostEqual(obj.color[2], 0.07323896, places=5)
         finally:
             bpy.data.objects.remove(obj, do_unlink=True)
             bpy.data.meshes.remove(mesh)
@@ -449,7 +448,11 @@ class MaterialPipelineTests(unittest.TestCase):
         # The sweep hydrates it once the bytes are available.
         self.assertEqual(textures.hydrate_pending_baked_materials(), 1)
         self.assertTrue(baked.get("RBXTextureHydrated", False))
-        self.assertIs(color_node.image, self._image)
+        self.assertIsNotNone(color_node.image)
+        self.assertEqual(color_node.image.alpha_mode, "CHANNEL_PACKED")
+        self.assertEqual(tuple(color_node.image.size), tuple(self._image.size))
+        for actual, expected in zip(color_node.image.pixels[:], self._image.pixels[:]):
+            self.assertAlmostEqual(actual, expected, places=5)
         # Already-hydrated materials are not processed again.
         self.assertEqual(textures.hydrate_pending_baked_materials(), 0)
 
@@ -477,8 +480,8 @@ class MaterialPipelineTests(unittest.TestCase):
             "RBX ColorMap",
         )
         a_default = textures._socket_by_type(mix, "input", "A", "RGBA").default_value
-        self.assertAlmostEqual(a_default[0], 0.2, places=3)
-        self.assertAlmostEqual(a_default[2], 0.9, places=3)
+        self.assertAlmostEqual(a_default[0], 0.03310477, places=3)
+        self.assertAlmostEqual(a_default[2], 0.78741229, places=3)
         principled = next(
             n for n in material.node_tree.nodes if n.type == "BSDF_PRINCIPLED"
         )
@@ -565,8 +568,8 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertFalse(factor_socket.links)
         self.assertAlmostEqual(factor_socket.default_value, 0.0, places=5)
         a_socket = textures._socket_by_type(mix, "input", "A", "RGBA")
-        self.assertAlmostEqual(a_socket.default_value[0], 0.2, places=3)
-        self.assertAlmostEqual(a_socket.default_value[2], 0.9, places=3)
+        self.assertAlmostEqual(a_socket.default_value[0], 0.03310477, places=3)
+        self.assertAlmostEqual(a_socket.default_value[2], 0.78741229, places=3)
 
         # Built-in mapped chain (Brick): the dead texture becomes white so
         # the multiply keeps the tint instead of blacking it out.
@@ -615,8 +618,8 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertNotEqual(a.name, b.name)
         na = a.node_tree.nodes.get("RBX Material ColorAttr")
         nb = b.node_tree.nodes.get("RBX Material ColorAttr")
-        self.assertAlmostEqual(na.outputs["Color"].default_value[0], 0.1, places=3)
-        self.assertAlmostEqual(nb.outputs["Color"].default_value[0], 0.4, places=3)
+        self.assertAlmostEqual(na.outputs["Color"].default_value[0], 0.01002283, places=3)
+        self.assertAlmostEqual(nb.outputs["Color"].default_value[0], 0.13286832, places=3)
 
     def test_baked_cache_ignored_for_sa_entries(self):
         # An SA/TextureID entry shares (material, colour, transparency) with
@@ -700,10 +703,14 @@ class MaterialPipelineTests(unittest.TestCase):
         layer = mesh.color_attributes.get("RBXColor")
         self.assertIsNotNone(layer)
         self.assertEqual(len(layer.data), 3)
-        # Storage is plain sRGB (decode-on-read by the Vertex Color node):
-        # 1.0 stays 1.0, and the raw Color3 value is stored unmodified.
+        # Blender exposes linear values through .color, while color_srgb
+        # must round-trip the authored Color3, including the midtones.
         first_corner = [round(component, 3) for component in layer.data[0].color]
         self.assertEqual(first_corner[0], 1.0)
+        self.assertAlmostEqual(layer.data[0].color[1], 0.21404114, places=2)
+        self.assertAlmostEqual(layer.data[0].color[2], 0.05087609, places=2)
+        if hasattr(layer.data[0], "color_srgb"):
+            self.assertAlmostEqual(layer.data[0].color_srgb[1], 0.5, places=2)
         # A second call OVERWRITES: asset-baked vertex colours must not win
         # over the part colour on plain/builtin tint parts.
         textures.ensure_plain_color_attribute(mesh, (0.0, 0.0, 0.0))
@@ -814,43 +821,18 @@ class MaterialPipelineTests(unittest.TestCase):
                         pass
             self._fetch_patch.start()
 
-    def test_multiple_surface_appearances_composite_in_order(self):
-        # Two stacked SAs (bottom first) must BOTH survive the build: the
-        # first drives Base Color through its mix, the second's mix chains
-        # over it.  Dropping every layer after the first (the old bug)
-        # rendered the stacked trim sheets as one dark, wrong-looking mesh.
-        entry = _entry(color=(0.2, 0.4, 0.9), material=256)
+    def test_last_surface_appearance_replaces_earlier_surface(self):
+        # Native Studio capture 10_surface_controls: the last SA uses the
+        # Part color under its alpha, rather than compositing over the first SA.
+        entry = _entry(color=(0.2,0.4,0.9),material=256)
         entry["surface_appearances"] = [
-            {"color_map": "rbxassetid://111", "alpha_mode": 0},
-            {"color_map": "rbxassetid://222", "alpha_mode": 0},
+            {"color_map":"rbxassetid://111","alpha_mode":0},
+            {"color_map":"rbxassetid://222","alpha_mode":0},
         ]
-        material = self._build(entry)
-        nodes = material.node_tree.nodes
-        first = nodes.get("RBX ColorMap")
-        second = nodes.get("RBX ColorMap.1")
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)
-        mix0 = nodes.get("RBX Overlay Mix")
-        mix1 = nodes.get("RBX Overlay Mix.1")
-        self.assertIsNotNone(mix0)
-        self.assertIsNotNone(mix1)
-        principled = next(
-            n for n in nodes if n.type == "BSDF_PRINCIPLED"
-        )
-        base_source = principled.inputs["Base Color"].links[0].from_socket
-        self.assertEqual(base_source.node.name, "RBX Overlay Mix.1")
-        # Layer 1 composites OVER layer 0: mix1.A = mix0.Result.
-        a_socket = textures._socket_by_type(mix1, "input", "A", "RGBA")
-        self.assertEqual(
-            a_socket.links[0].from_socket,
-            textures._socket_by_type(mix0, "output", "Result", "RGBA"),
-        )
-        # Registry covers both layers for hydration.
-        registry = textures._overlay_layer_registry(material)
-        self.assertEqual(
-            [layer["node"] for layer in registry],
-            ["RBX ColorMap", "RBX ColorMap.1"],
-        )
+        material=self._build(entry);nodes=material.node_tree.nodes
+        self.assertIsNotNone(nodes.get("RBX ColorMap"))
+        self.assertIsNone(nodes.get("RBX ColorMap.1"))
+        self.assertEqual([layer['ref'] for layer in textures._overlay_layer_registry(material)],['rbxassetid://222'])
 
     def test_multiple_texture_instances_stack_over_surface_appearance(self):
         # Texture children draw OVER the SA layers, bottom-first, so their
@@ -909,10 +891,10 @@ class MaterialPipelineTests(unittest.TestCase):
         rough_tex = nodes.get("RBX Surface roughness_map")
         metal_tex = nodes.get("RBX Surface metalness_map")
         normal_tex = nodes.get("RBX NormalMapTex")
-        # Normal/metalness come only from the FIRST layer.
+        # Inactive SAs do not supply missing maps to the active surface.
         self.assertIsNotNone(rough_tex)
-        self.assertIsNotNone(metal_tex)
-        self.assertIsNotNone(normal_tex)
+        self.assertIsNone(metal_tex)
+        self.assertIsNone(normal_tex)
 
     def test_deferred_hydration_assigns_every_layer_and_alpha_factor(self):
         # The deferred pass must hydrate ALL registry layers; the overlay
@@ -930,14 +912,14 @@ class MaterialPipelineTests(unittest.TestCase):
         self._created_materials.append(material)
         nodes = material.node_tree.nodes
         self.assertIsNone(nodes.get("RBX ColorMap").image)
-        self.assertIsNone(nodes.get("RBX ColorMap.1").image)
+        self.assertIsNone(nodes.get("RBX ColorMap.1"))
         textures.hydrate_material_images(material, entry)
         first = nodes.get("RBX ColorMap")
         second = nodes.get("RBX ColorMap.1")
         self.assertIsNotNone(first.image)
-        self.assertIsNotNone(second.image)
+        self.assertIsNone(second)
         # No copy nodes anywhere; each mix factor reads its colour node.
-        for tag, color_node in (("", first), (".1", second)):
+        for tag, color_node in (("", first),):
             self.assertIsNone(nodes.get(f"RBX Overlay Alpha{tag}"))
             mix = nodes.get(f"RBX Overlay Mix{tag}")
             factor = textures._float_factor_socket(mix)
@@ -1263,7 +1245,7 @@ class MaterialPipelineTests(unittest.TestCase):
         self.assertIsNotNone(tint_mix)
         tint_a = textures._socket_by_type(tint_mix, "input", "A", "RGBA")
         self.assertAlmostEqual(tint_a.default_value[0], 1.0)
-        self.assertAlmostEqual(tint_a.default_value[1], 0.5)
+        self.assertAlmostEqual(tint_a.default_value[1], 0.21404114)
         mix = tree.nodes.get("RBX Overlay Mix")
         b_source = textures._socket_by_type(mix, "input", "B", "RGBA").links[0].from_node
         self.assertEqual(b_source.name, "RBX Overlay Tint")
@@ -1572,13 +1554,10 @@ class PolygonFaceIdTests(unittest.TestCase):
         )
 
     def test_cylinder_faces(self):
-        mesh = self._Mesh(64)
+        mesh = self._Mesh(96)
         ids = textures._polygon_face_ids(mesh, {"shape": "cylinder"})
-        self.assertEqual(ids[:32], [(0,)] * 16 + [(3,)] * 16)
-        self.assertEqual(
-            ids[32:],
-            [(1,)] * 4 + [(2,)] * 8 + [(4,)] * 8 + [(5,)] * 8 + [(1,)] * 4,
-        )
+        self.assertEqual(ids[:48], [(0,)] * 24 + [(3,)] * 24)
+        self.assertEqual(ids[48:],[(1,)]*12+[(2,)]*12+[(4,)]*12+[(5,)]*12)
 
     def test_ball_faces(self):
         # Mesh-space centres -> part-local through t2b^-1, where t2b maps

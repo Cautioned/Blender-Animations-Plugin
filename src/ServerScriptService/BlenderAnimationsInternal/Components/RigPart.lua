@@ -33,14 +33,43 @@ local function getConnectedJointParts(joint: ConnectedJoint): (BasePart?, BasePa
 	return joint.Part0, joint.Part1
 end
 
+-- Attachments may be parented under a Bone (itself an Attachment) inside a
+-- MeshPart. Resolve the BasePart that owns the attachment, walking up through
+-- Attachment/Bone ancestors only.
+local function getAttachmentPart(attachment: Attachment?): BasePart?
+	local parent = attachment and attachment.Parent
+	while parent and not parent:IsA("BasePart") do
+		if not parent:IsA("Attachment") then
+			return nil
+		end
+		parent = parent.Parent
+	end
+	return parent :: BasePart?
+end
+
+-- Rest offset of an attachment in its owning part's space. Attachment.CFrame
+-- is relative to its direct parent, which is a Bone for bone-hosted
+-- attachments, so compose up the Bone chain. Bone.CFrame excludes the
+-- animated Bone.Transform, so a posed bone does not leak into the rest offset.
+local function getAttachmentPartCFrame(attachment: Attachment): CFrame
+	local cframe = attachment.CFrame
+	local parent = attachment.Parent
+	while parent and parent:IsA("Attachment") do
+		cframe = (parent :: Attachment).CFrame * cframe
+		parent = parent.Parent
+	end
+	return cframe
+end
+
+RigPart.getAttachmentPart = getAttachmentPart
+RigPart.getAttachmentPartCFrame = getAttachmentPartCFrame
+
 local function getJointParts(joint: CacheableJoint): (BasePart?, BasePart?)
 	if joint:IsA("AnimationConstraint") then
-		local attachment0 = joint.Attachment0
-		local attachment1 = joint.Attachment1
-		local part0 = attachment0 and attachment0.Parent
-		local part1 = attachment1 and attachment1.Parent
-		if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
-			return part0 :: BasePart, part1 :: BasePart
+		local part0 = getAttachmentPart(joint.Attachment0)
+		local part1 = getAttachmentPart(joint.Attachment1)
+		if part0 and part1 then
+			return part0, part1
 		end
 		return nil, nil
 	end
@@ -562,12 +591,15 @@ function RigPart:Encode(handledParts, opts)
 				local attachment0 = (jointInstance :: AnimationConstraint).Attachment0
 				local attachment1 = (jointInstance :: AnimationConstraint).Attachment1
 				if attachment0 and attachment1 then
+					-- Part-relative, also for attachments hosted under a Bone.
+					local offset0 = getAttachmentPartCFrame(attachment0)
+					local offset1 = getAttachmentPartCFrame(attachment1)
 					if self.jointParentIsPart0 then
-						elem.jointtransform0 = { attachment0.CFrame:GetComponents() }
-						elem.jointtransform1 = { attachment1.CFrame:GetComponents() }
+						elem.jointtransform0 = { offset0:GetComponents() }
+						elem.jointtransform1 = { offset1:GetComponents() }
 					else
-						elem.jointtransform0 = { attachment1.CFrame:GetComponents() }
-						elem.jointtransform1 = { attachment0.CFrame:GetComponents() }
+						elem.jointtransform0 = { offset1:GetComponents() }
+						elem.jointtransform1 = { offset0:GetComponents() }
 					end
 				else
 					-- Fallback for malformed constraints: preserve the animated delta only.
