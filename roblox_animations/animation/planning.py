@@ -787,21 +787,26 @@ def build_bake_plan(
     ]
     # Collect per-bone dense frames from bezier and mixed-interpolation
     # segments so only bones that need dense sampling are evaluated there.
+    # Clip before iterating: stray keys can lie arbitrarily far outside export.
     dense_interpolation_frames = set()
     for bone_segs in dense_interpolation_segments.values():
         for seg_start, seg_end in bone_segs:
             dense_interpolation_frames.update(
                 frame
-                for frame in range(math.floor(seg_start) + 1, math.ceil(seg_end))
-                if frame_start <= frame <= frame_end
+                for frame in range(
+                    max(frame_start, math.floor(seg_start) + 1),
+                    min(frame_end + 1, math.ceil(seg_end)),
+                )
             )
     mixed_dense_frames = set()
     for bone_segs in mixed_interpolation_segments.values():
         for seg_start, seg_end in bone_segs:
             mixed_dense_frames.update(
                 frame
-                for frame in range(int(math.floor(seg_start)) + 1, int(math.ceil(seg_end)))
-                if frame_start <= frame <= frame_end
+                for frame in range(
+                    max(frame_start, math.floor(seg_start) + 1),
+                    min(frame_end + 1, math.ceil(seg_end)),
+                )
             )
     if subframe_keys or dense_interpolation_frames or mixed_dense_frames or adaptive_frames:
         frames = sorted(

@@ -268,9 +268,24 @@ class CreationPerfTests(unittest.TestCase):
                         )
                         ref_uvs.append((u_studs * 0.5, v_studs * 0.5))
                     continue
+                if entry.get("shape") in ("ball", 0):
+                    # Spheres use the native cube-chart material UVs in
+                    # every creation path (see _sphere_material_uvs).
+                    from ..rig.primitive_shapes import _sphere_material_uvs
+
+                    ref_uvs.extend(_sphere_material_uvs(
+                        raw, [face], entry.get("part_size") or (4.0, 1.0, 2.0), 0.5
+                    ))
+                    continue
                 ax_u, ax_v, u_sign, _ = creation._primitive_face_projection_axes(points)
-                origin_u = min(point[ax_u] * u_sign for point in points)
-                origin_v = min(point[ax_v] for point in points)
+                # Part-bounds origin, so material textures stay continuous
+                # across a part's faces instead of restarting per triangle.
+                origin_u = (
+                    min(point[ax_u] for point in raw)
+                    if u_sign > 0
+                    else -max(point[ax_u] for point in raw)
+                )
+                origin_v = min(point[ax_v] for point in raw)
                 for point in points:
                     ref_uvs.append(
                         (

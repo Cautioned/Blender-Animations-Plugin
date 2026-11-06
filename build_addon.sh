@@ -36,6 +36,10 @@ fi
 ZIP_NAME3="rbx_anims_${VERSION}_legacy.zip"
 ZIP_NAME4="rbx_anims_${VERSION}.zip"
 
+# Validate before removing any existing package.
+python3 tools/validate_addon_sources.py
+python3 tools/vendor_zstd.py --check
+
 echo "Building $ZIP_NAME3 and $ZIP_NAME4 without tests..."
 
 # Remove existing zip if it exists
@@ -85,6 +89,9 @@ for item in src.rglob('*'):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(item, target)
 PY
+
+# Recheck the staged files too, so a truncated copy cannot enter a ZIP.
+python3 tools/validate_addon_sources.py "temp_build/$ADDON_NAME"
 
 # Create zips for both layouts
 # 1) Blender 3.x: keep roblox_animations as the root folder inside the zip

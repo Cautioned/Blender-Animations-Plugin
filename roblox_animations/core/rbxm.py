@@ -7,9 +7,9 @@ AssetDelivery-served FileMesh, with no FBX/OBJ intermediate.
 
 The implementation is deliberately narrow: it decodes the instance hierarchy
 and the property types needed for ``MeshPart`` / ``WrapLayer`` / ``WrapTarget``
-reconstruction, and skips every chunk/property it does not recognise. It is
-dependency-free (LZ4 block decompression is implemented inline) so it can run
-inside Blender's bundled Python.
+reconstruction, and skips every chunk/property it does not recognise.
+LZ4 block decompression is implemented inline; Zstandard uses a bundled
+decoder wheel (or Python's standard library) for offline Blender imports.
 
 Format references:
   - https://github.com/rojo-rbx/rbx-dom/blob/master/docs/binary.md
@@ -20,12 +20,15 @@ Format references:
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import struct
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .schema import CF12, WeaponGrip
+
+_LOG = logging.getLogger(__name__)
 
 
 FILE_MAGIC = b"<roblox!"
@@ -71,6 +74,7 @@ _TYPE_COLOR3 = 0x07
 # Newer saves write plain float Color3 props (e.g. Texture.Color3) under
 # this distinct type id; the payload is the same planar float32 triple.
 _TYPE_COLOR3F = 0x0C
+_TYPE_VECTOR2 = 0x0D
 _TYPE_VECTOR3 = 0x0E
 _TYPE_CFRAME = 0x10
 _TYPE_ENUM = 0x12
@@ -341,9 +345,12 @@ def _decompress_chunk_body(body: bytes, compressed_len: int, uncompressed_len: i
             raise RbxmError("uncompressed chunk length does not match header")
         return body
     if body[:4] == _ZSTD_MAGIC:
-        raise RbxmError(
-            "zstd-compressed rbxm chunks are not supported (no bundled decoder)"
-        )
+        from .zstd_codec import decompress_frame
+
+        try:
+            return decompress_frame(body, uncompressed_len, _MAX_CHUNK_BYTES)
+        except (ValueError, ImportError, RuntimeError) as exc:
+            raise RbxmError(f"failed to decompress zstd chunk: {exc}") from exc
     return _lz4_block_decompress(body, uncompressed_len)
 
 
@@ -543,6 +550,10 @@ def _read_prop_values(reader: _Reader, type_id: int, count: int):
         return [[rs[i], gs[i], bs[i]] for i in range(count)]
     if type_id == _TYPE_COLOR3F:
         return _read_prop_values(reader, _TYPE_COLOR3, count)
+    if type_id == _TYPE_VECTOR2:
+        xs = _read_interleaved_f32(reader, count)
+        ys = _read_interleaved_f32(reader, count)
+        return [[xs[i], ys[i]] for i in range(count)]
     if type_id == _TYPE_VECTOR3:
         xs = _read_interleaved_f32(reader, count)
         ys = _read_interleaved_f32(reader, count)
@@ -1479,8 +1490,8 @@ def _find_descendant_of_class(inst: _Instance, class_name: str) -> Optional[_Ins
 def _find_descendants_of_class(inst: _Instance, class_name: str) -> List[_Instance]:
     """Every descendant of ``class_name`` in document (layering) order.
 
-    Roblox renders multiple Texture / SurfaceAppearance children as stacked
-    layers, bottom first, so the order of this list IS the composite order.
+    Keep document order: Texture/Decal ties use it for compositing, and
+    Studio selects the last SurfaceAppearance child as its active surface.
     """
     found = []
 
@@ -1548,9 +1559,77 @@ def _content_to_str(value) -> str:
     return ""
 
 
+# Serialized Content names for the asset fields consumed by this importer.
+# Keep the mapping explicit: Sky and temporary wrap fields do not follow the
+# usual Id -> Content pattern. Legacy files continue to use the keys below.
+_CONTENT_PROPERTIES = {
+    "MeshId": "MeshContent",
+    "TextureID": "TextureContent",
+    "TextureId": "TextureContent",
+    "Texture": "TextureContent",
+    "ColorMap": "ColorMapContent",
+    "NormalMap": "NormalMapContent",
+    "MetalnessMap": "MetalnessMapContent",
+    "RoughnessMap": "RoughnessMapContent",
+    "TexturePack": "TexturePackContent",
+    "EmissiveMask": "EmissiveMaskContent",
+    "ShirtTemplate": "ShirtTemplateContent",
+    "PantsTemplate": "PantsTemplateContent",
+    "BaseTextureId": "BaseTextureContent",
+    "OverlayTextureId": "OverlayTextureContent",
+    "ReferenceMeshId": "ReferenceMeshContent",
+    "CageMeshId": "CageMeshContent",
+    "TemporaryReferenceId": "TemporaryReferenceMeshContent",
+    "TemporaryCageMeshId": "TemporaryCageMeshContent",
+    "HSRAssetId": "HSRContent",
+    "SkyboxBk": "SkyboxBackContent",
+    "SkyboxDn": "SkyboxDownContent",
+    "SkyboxFt": "SkyboxFrontContent",
+    "SkyboxLf": "SkyboxLeftContent",
+    "SkyboxRt": "SkyboxRightContent",
+    "SkyboxUp": "SkyboxUpContent",
+}
+
+
+def _surface_image_metadata(instance):
+    """Authored transforms and PBR maps shared by Decal and Texture."""
+    result = {}
+    for source, key in (("ZIndex", "z_index"), ("Rotation", "rotation"),
+                        ("OffsetStudsU", "offset_studs_u"), ("OffsetStudsV", "offset_studs_v"),
+                        ("StudsPerTileU", "studs_per_tile_u"), ("StudsPerTileV", "studs_per_tile_v"),
+                        ("EmissiveStrength", "emissive_strength")):
+        value = _first_prop(instance, source)
+        if isinstance(value, (int, float)):
+            result[key] = float(value)
+    for source, key in (("UVScale", "uv_scale"), ("UVOffset", "uv_offset")):
+        value = _first_prop(instance, source)
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            result[key] = [float(v) for v in value]
+    for source, key in (("NormalMap", "normal_map"), ("MetalnessMap", "metalness_map"),
+                        ("RoughnessMap", "roughness_map"), ("EmissiveMask", "emissive_mask")):
+        value = _content_or_asset_id(instance, source)
+        if value:
+            result[key] = value
+    tint = _vec3(_first_prop(instance, "EmissiveTint"))
+    if tint is not None:
+        result["emissive_tint"] = tint
+    return result
+
+
 def _content_or_asset_id(inst: _Instance, *names) -> str:
-    """Read a texture-ish prop stored as Content/SharedString, or a raw
-    int64 asset id in old saves (CharacterMesh-style encoding)."""
+    """Read an asset URI, preferring Content over legacy string/int64 fields.
+
+    An explicit empty/None/Object Content is authoritative. Falling back to
+    a stale legacy URI would restore a texture or mesh the creator cleared.
+    Object sources have no downloadable URI and decode to an empty string.
+    """
+    content_names = [_CONTENT_PROPERTIES.get(name, name) for name in names]
+    if inst.class_name in ("Decal", "Texture"):
+        # Newer Decal/Texture saves also use the PBR color-map name.
+        content_names.insert(0, "ColorMapContent")
+    for name in content_names:
+        if name in inst.props:
+            return _content_to_str(inst.props[name])
     value = _first_prop(inst, *names)
     if isinstance(value, (int, float)) and value > 0:
         return f"rbxassetid://{int(value)}"
@@ -1646,7 +1725,7 @@ def rbxm_beams(instances, roots, workspace_refs=None) -> List[dict]:
             continue
         beams.append({
             "name": inst.name,
-            "texture": _content_to_str(_first_prop(inst, "Texture")),
+            "texture": _content_or_asset_id(inst, "Texture"),
             "color_seq": clean_seq(_first_prop(inst, "Color")),
             "transparency_seq": clean_seq(_first_prop(inst, "Transparency")),
             "width0": prop_float(inst, "Width0", 0.1),
@@ -1685,7 +1764,7 @@ def _build_wrap_layer(mesh_part: _Instance) -> Optional[Dict[str, Any]]:
         ("temporary_cage_mesh_id", "TemporaryCageMeshId"),
         ("hsr_asset_id", "HSRAssetId"),
     ):
-        text = _content_to_str(_first_prop(wrap, prop))
+        text = _content_or_asset_id(wrap, prop)
         if text:
             data[key] = text
     for key, prop in (
@@ -1714,7 +1793,7 @@ def _build_wrap_target(mesh_part: _Instance) -> Optional[Dict[str, Any]]:
         ("temporary_cage_mesh_id", "TemporaryCageMeshId"),
         ("hsr_asset_id", "HSRAssetId"),
     ):
-        text = _content_to_str(_first_prop(wrap, prop))
+        text = _content_or_asset_id(wrap, prop)
         if text:
             data[key] = text
     for key, prop in (("cage_origin", "CageOrigin"), ("import_origin", "ImportOrigin")):
@@ -1736,30 +1815,16 @@ def _build_character_mesh(character_mesh: _Instance) -> Optional[Dict[str, Any]]
     legacy saves use the int64 asset-id twins (``MeshId`` etc.).
     """
     data: Dict[str, Any] = {}
-    mesh_id = _content_to_str(_first_prop(character_mesh, "MeshContent"))
-    if not mesh_id:
-        legacy_id = _first_prop(character_mesh, "MeshId")
-        if isinstance(legacy_id, (int, float)) and legacy_id > 0:
-            mesh_id = f"rbxassetid://{int(legacy_id)}"
-        else:
-            mesh_id = _content_to_str(legacy_id)
+    mesh_id = _content_or_asset_id(character_mesh, "MeshId")
     if mesh_id:
         data["mesh_id"] = mesh_id
     body_part = _first_prop(character_mesh, "BodyPart")
     if isinstance(body_part, (int, float)):
         data["body_part"] = int(body_part)
-    overlay = _content_to_str(_first_prop(character_mesh, "OverlayTextureContent"))
-    if not overlay:
-        overlay_id = _first_prop(character_mesh, "OverlayTextureId")
-        if isinstance(overlay_id, (int, float)) and overlay_id > 0:
-            overlay = f"rbxassetid://{int(overlay_id)}"
+    overlay = _content_or_asset_id(character_mesh, "OverlayTextureId")
     if overlay:
         data["overlay_texture_id"] = overlay
-    base = _content_to_str(_first_prop(character_mesh, "BaseTextureContent"))
-    if not base:
-        base_id = _first_prop(character_mesh, "BaseTextureId")
-        if isinstance(base_id, (int, float)) and base_id > 0:
-            base = f"rbxassetid://{int(base_id)}"
+    base = _content_or_asset_id(character_mesh, "BaseTextureId")
     if base:
         data["base_texture_id"] = base
     return data or None
@@ -1825,10 +1890,10 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             continue
         material_variants[instance.name] = {
             "base_material": int(base_material),
-            "color_map": _content_to_str(_first_prop(instance, "ColorMap")) or "",
-            "normal_map": _content_to_str(_first_prop(instance, "NormalMap")) or "",
-            "metalness_map": _content_to_str(_first_prop(instance, "MetalnessMap")) or "",
-            "roughness_map": _content_to_str(_first_prop(instance, "RoughnessMap")) or "",
+            "color_map": _content_or_asset_id(instance, "ColorMap") or "",
+            "normal_map": _content_or_asset_id(instance, "NormalMap") or "",
+            "metalness_map": _content_or_asset_id(instance, "MetalnessMap") or "",
+            "roughness_map": _content_or_asset_id(instance, "RoughnessMap") or "",
             "studs_per_tile": _first_prop(instance, "StudsPerTile"),
         }
 
@@ -1906,6 +1971,8 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             "part_size": size,
             "part_cf": part_cf,
         }
+        if isinstance(inst.props.get("CastShadow"), bool):
+            entry["cast_shadow"] = inst.props["CastShadow"]
         if inst.referent in primary_part_refs:
             entry["is_primary_part"] = True
 
@@ -1938,7 +2005,7 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
 
         if inst.class_name == "MeshPart":
             entry["mesh_class"] = "MeshPart"
-            mesh_id = _content_to_str(_first_prop(inst, "MeshId"))
+            mesh_id = _content_or_asset_id(inst, "MeshId")
             if mesh_id:
                 entry["mesh_id"] = mesh_id
             mesh_size = _vec3(_first_prop(inst, "MeshSize"))
@@ -2012,7 +2079,7 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             # (MeshType Head/Torso), which resolve to rbxasset:// builtins.
             special = _find_descendant_of_class(inst, "SpecialMesh")
             if special is not None:
-                mesh_id = _content_to_str(_first_prop(special, "MeshId"))
+                mesh_id = _content_or_asset_id(special, "MeshId")
                 is_builtin_mesh_type = False
                 if not mesh_id:
                     mesh_type = _first_prop(special, "MeshType")
@@ -2115,11 +2182,12 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
         texture_instances = []
         for texture_child in texture_children:
             child_texture = _content_or_asset_id(
-                texture_child, "Texture", "TextureId", "TextureID"
+                texture_child, "ColorMap", "Texture", "TextureId", "TextureID"
             )
             if not child_texture:
                 continue
             instance_data: Dict[str, Any] = {"texture": child_texture}
+            instance_data.update(_surface_image_metadata(texture_child))
             # Roblox draws a Texture child on ONE surface; the default is
             # Front (NormalId 5).  The material builder splits primitive
             # meshes per surface so the instance never bleeds across faces.
@@ -2135,7 +2203,7 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             if tint is not None:
                 try:
                     tint = [float(c) for c in tint[:3]]
-                    if any(c > 1.0 for c in tint):
+                    if "Color3uint8" in texture_child.props:
                         tint = [c / 255.0 for c in tint]
                     instance_data["color"] = tint
                 except (TypeError, ValueError, IndexError):
@@ -2155,22 +2223,31 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
             instance_data["transparency"] = max(0.0, min(1.0, child_transparency))
             texture_instances.append(instance_data)
         if texture_instances:
+            texture_instances.sort(key=lambda layer: layer.get("z_index", 1))
             entry["texture_instances"] = texture_instances
             # Singular key kept for callers/tests built around one layer.
             entry["texture_instance"] = texture_instances[0]
 
         # SurfaceAppearance (PBR color/normal/roughness/metalness maps).
-        # Multiple children stack like Texture layers, bottom-first.
+        # Preserve every child; the last one is the active Studio surface.
         surface_children = _find_descendants_of_class(inst, "SurfaceAppearance")
         surface_appearances = []
         for surface in surface_children:
             alpha_mode = _first_prop(surface, "AlphaMode")
             surface_appearances.append({
-                "color_map": _content_to_str(_first_prop(surface, "ColorMap")),
-                "normal_map": _content_to_str(_first_prop(surface, "NormalMap")),
-                "roughness_map": _content_to_str(_first_prop(surface, "RoughnessMap")),
-                "metalness_map": _content_to_str(_first_prop(surface, "MetalnessMap")),
-                "texture_pack": _content_to_str(_first_prop(surface, "TexturePack")),
+                "color_map": _content_or_asset_id(surface, "ColorMap"),
+                "normal_map": _content_or_asset_id(surface, "NormalMap"),
+                "roughness_map": _content_or_asset_id(surface, "RoughnessMap"),
+                "metalness_map": _content_or_asset_id(surface, "MetalnessMap"),
+                "texture_pack": _content_or_asset_id(surface, "TexturePack"),
+                "resample_mode": _first_prop(surface, "ResampleMode") or 0,
+                "color": _vec3(_first_prop(surface, "Color")) or [1.0, 1.0, 1.0],
+                "emissive_mask": _content_or_asset_id(surface, "EmissiveMask"),
+                "emissive_strength": (
+                    float(surface.props["EmissiveStrength"])
+                    if isinstance(surface.props.get("EmissiveStrength"), (int, float)) else 1.0
+                ),
+                "emissive_tint": _vec3(_first_prop(surface, "EmissiveTint")) or [1.0, 1.0, 1.0],
                 # 0=Overlay (alpha reveals part color), 1=Transparency
                 # (alpha cuts against the world — foliage, fences).
                 "alpha_mode": (
@@ -2180,17 +2257,18 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
         if surface_appearances:
             entry["surface_appearances"] = surface_appearances
             # Singular key kept for callers/tests built around one layer.
-            entry["surface_appearance"] = surface_appearances[0]
+            entry["surface_appearance"] = surface_appearances[-1]
 
         # Decals project a texture onto one named part face. Keep classic head
         # decals on their existing clothing-composite path and preserve all
-        # other decals for the importer to create as projected overlay planes.
+        # other decals for surface compositing with their native mesh/face UVs.
         decals = []
         for decal in _find_descendants_of_class(inst, "Decal"):
-            decal_texture = _content_to_str(_first_prop(decal, "Texture"))
+            decal_texture = _content_or_asset_id(decal, "ColorMap", "Texture")
             if not decal_texture:
                 continue
             decal_data: Dict[str, Any] = {"texture": decal_texture}
+            decal_data.update(_surface_image_metadata(decal))
             face = _first_prop(decal, "Face")
             if isinstance(face, (int, float)):
                 decal_data["face"] = int(face)
@@ -2199,7 +2277,7 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
                 try:
                     tint = [float(component) for component in tint[:3]]
                     decal_data["color"] = [
-                        component / 255.0 if component > 1.0 else component
+                        component / 255.0 if "Color3uint8" in decal.props else component
                         for component in tint
                     ]
                 except (TypeError, ValueError, IndexError):
@@ -2209,6 +2287,7 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
                 decal_data["transparency"] = max(0.0, min(1.0, float(transparency)))
             decals.append(decal_data)
         if decals:
+            decals.sort(key=lambda layer: layer.get("z_index", 1))
             entry["decals"] = decals
             special = _find_descendant_of_class(inst, "SpecialMesh")
             # Classic R6 heads (Part class) render the face decal over the
@@ -2228,24 +2307,25 @@ def rbxm_to_part_aux(data: Optional[bytes] = None, *, instances=None, roots=None
                 and not has_custom_look
             ):
                 entry["face_decal"] = dict(decals[0])
-                # The classic baked head mesh (rbxasset://fonts/head.mesh,
-                # SpecialShape HEAD_MESH) is the ONLY head the engine scales
-                # by (min(sx,sz), sy, min(sx,sz)) / 1.25 with the cylinder-cap
-                # Y extrude.  R15-style heads are FileMesh assets with an
-                # explicit MeshId: the engine scales those by
-                # SpecialMesh.Scale (already reflected in mesh_size), so they
-                # must NOT get the classic treatment.
-                if entry.get("mesh_id") == "rbxasset://fonts/head.mesh":
-                    entry["classic_head_mesh"] = True
-                    if special is not None:
-                        try:
-                            special_scale = _first_prop(special, "Scale")
-                            if isinstance(special_scale, (list, tuple)) and len(special_scale) == 3:
-                                entry["_special_mesh_scale"] = [
-                                    float(component) for component in special_scale
-                                ]
-                        except (TypeError, ValueError):
-                            pass
+        # The classic baked head mesh (rbxasset://fonts/head.mesh,
+        # SpecialShape HEAD_MESH) is the ONLY head the engine scales
+        # by (min(sx,sz), sy, min(sx,sz)) / 1.25 with the cylinder-cap
+        # Y extrude.  R15-style heads are FileMesh assets with an
+        # explicit MeshId: the engine scales those by
+        # SpecialMesh.Scale (already reflected in mesh_size), so they
+        # must NOT get the classic treatment.
+        if entry.get("mesh_id") == "rbxasset://fonts/head.mesh":
+            special = _find_descendant_of_class(inst, "SpecialMesh")
+            entry["classic_head_mesh"] = True
+            if special is not None:
+                try:
+                    special_scale = _first_prop(special, "Scale")
+                    if isinstance(special_scale, (list, tuple)) and len(special_scale) == 3:
+                        entry["_special_mesh_scale"] = [
+                            float(component) for component in special_scale
+                        ]
+                except (TypeError, ValueError):
+                    pass
 
         # AvatarPartScaleType marker (drives HumanoidDescription scaling).
         scale_marker = _find_descendant_of_class(inst, "StringValue")
@@ -2347,8 +2427,9 @@ _PROPS_CLASSES = frozenset({
 
 def _joint_parts(joint: _Instance) -> Tuple[Optional[int], Optional[int]]:
     """Return (Part0, Part1) referents for a joint instance."""
-    part0 = _first_prop(joint, "Part0", "Attachment0")
-    part1 = _first_prop(joint, "Part1", "Attachment1")
+    part0 = _first_prop(joint, "Part0", "Part0Internal", "Attachment0")
+    part1 = _first_prop(joint, "Part1", "Part1Internal", "Attachment1")
+    _LOG.debug("Joint #%s %s endpoints: %s -> %s", joint.referent, joint.class_name, part0, part1)
     return (
         part0 if isinstance(part0, int) else None,
         part1 if isinstance(part1, int) else None,
@@ -2453,21 +2534,45 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
         skeleton_parts.add(p)
         skeleton_parts.add(c)
 
-    for part0_ref, part1_ref, joint in rigid_edges:
-        p0_in_skel = part0_ref in skeleton_parts
-        p1_in_skel = part1_ref in skeleton_parts
-        if p0_in_skel and not p1_in_skel:
-            # Part0 is skeleton, Part1 is accessory → Part0 is parent
-            child_edges.append((part0_ref, part1_ref, joint, True))
-        elif p1_in_skel and not p0_in_skel:
-            # Part1 is skeleton, Part0 is accessory → Part1 is parent
-            child_edges.append((part1_ref, part0_ref, joint, False))
-        elif p0_in_skel and p1_in_skel:
-            # Both are skeleton parts — treat Part0 as parent (convention)
-            child_edges.append((part0_ref, part1_ref, joint, True))
-        else:
-            # Neither is skeleton (two accessories connected) — convention
-            child_edges.append((part0_ref, part1_ref, joint, True))
+    # Clothes often contain several welded parts, with arbitrary endpoint
+    # directions. Orient the whole rigid graph outwards from the skeleton,
+    # rather than orienting each weld independently and losing reversed chains.
+    from collections import deque
+    rigid_adjacency = {}
+    for p0, p1, joint in rigid_edges:
+        rigid_adjacency.setdefault(p0, []).append((p1, joint, True))
+        rigid_adjacency.setdefault(p1, []).append((p0, joint, False))
+        if p0 in skeleton_parts and p1 in skeleton_parts:
+            child_edges.append((p0, p1, joint, True))
+    reached = set(skeleton_parts)
+    rigid_owners = {ref: ref for ref in skeleton_parts}
+    warned_joints = set()
+
+    def grow_rigid_tree(seeds):
+        queue = deque(seeds)
+        while queue:
+            parent_ref = queue.popleft()
+            for child_ref, joint, pip0 in rigid_adjacency.get(parent_ref, []):
+                if child_ref in reached:
+                    if (rigid_owners.get(child_ref) != rigid_owners.get(parent_ref)
+                            and not {parent_ref, child_ref} <= skeleton_parts
+                            and joint.referent not in warned_joints):
+                        warned_joints.add(joint.referent)
+                        _LOG.warning("Ambiguous rigid link #%s between animation owners #%s and #%s; keeping first graph assignment",
+                                     joint.referent, rigid_owners.get(parent_ref), rigid_owners.get(child_ref))
+                    continue
+                reached.add(child_ref)
+                rigid_owners[child_ref] = rigid_owners.get(parent_ref, parent_ref)
+                child_edges.append((parent_ref, child_ref, joint, pip0))
+                queue.append(child_ref)
+
+    grow_rigid_tree(sorted(skeleton_parts))
+    # Weld-only assemblies still need structural bones for reconstruction.
+    for p0, p1, joint in rigid_edges:
+        if p0 not in reached:
+            reached.add(p0)
+            rigid_owners[p0] = p0
+            grow_rigid_tree([p0])
 
     # A rigid cross-link must not replace a part's animation joint. Roblox
     # permits redundant welds across an existing Motor6D skeleton; Blender
@@ -2526,6 +2631,7 @@ def _build_rig_tree(instances: Dict[int, _Instance], roots: Dict[int, _Instance]
             parent = instances.get(parent_ref)
             node["pname"] = parent.name if parent is not None else None
             node["jointType"] = joint.class_name
+            _LOG.debug("Rig edge #%s -> #%s (%s)", parent_ref, part_ref, joint.class_name)
             if joint.class_name in _ATTACHMENT_JOINT_CLASSES:
                 # Constraint joints: the attachments' part-space CFrames are
                 # the joint transforms (Attachment0 on the parent side,
@@ -2709,6 +2815,7 @@ def _scene_rigs(instances: Dict[int, _Instance], roots: Dict[int, _Instance]) ->
             "part_refs": sorted(part_refs),
             "rig": rig,
             "meshToBone": mapping,
+            "meshToBoneRefs": _derive_mesh_to_bone_refs(rig),
         })
     return rigs
 
@@ -2831,19 +2938,20 @@ def _model_rigs(instances: Dict[int, _Instance], roots: Dict[int, _Instance]) ->
             "part_refs": refs,
             "rig": rig,
             "meshToBone": mapping,
+            "meshToBoneRefs": _derive_mesh_to_bone_refs(rig),
         })
     return rigs
 
 
 def _derive_mesh_to_bone(rig: Optional[dict]) -> Dict[str, str]:
-    """Build an authoritative part-name -> bone-name map from the rig tree.
+    """Build the legacy name map used by older imports and wrap-layer fitting.
 
-    Since the .rbxm preserves the actual Motor6D graph, each BasePart's bone is
-    simply its own jname (the joint node shares the part's name). Emitting this
-    lets creation.py pre-constrain meshes without any name-matching heuristics.
+    Motor6D-driven parts map to their own jname; welded accessories inherit
+    the nearest animation owner's name.
 
-    Accessories attached via Weld / RigidConstraint (no Motor6D) do not create
-    their own bones — they should follow their parent bone instead.
+    Duplicate display names can collide here. RBXM object constraints must use
+    _derive_mesh_to_bone_refs instead. Accessories may retain structural bones
+    for reconstruction, but their meshes should follow the animation owner.
     """
     mapping: Dict[str, str] = {}
     if not rig:
@@ -2870,6 +2978,29 @@ def _derive_mesh_to_bone(rig: Optional[dict]) -> Dict[str, str]:
     # Root is always a deform bone (HumanoidRootPart)
     root_bone = rig.get("jname") if isinstance(rig, dict) else None
     walk(rig, root_bone)
+    return mapping
+
+
+def _derive_mesh_to_bone_refs(rig: Optional[dict]) -> Dict[str, int]:
+    """Map part referents to owning animation-node referents (JSON-safe keys).
+
+    Many clothes meshes may be welded to one animated part. Structural weld
+    bones remain useful for rig reconstruction, but are not independent motion
+    targets for those meshes. Names and partAux array indices are not identities.
+    Non-weld hierarchies keep their own targets for older reconstruction paths.
+    """
+    mapping = {}
+    stack = [(rig, None)] if rig else []
+    while stack:
+        node, owner = stack.pop()
+        ref = node.get("inst_ref")
+        rigid = node.get("jointType") in ("Weld", "WeldConstraint", "RigidConstraint", "Snap")
+        if not rigid or node.get("isDeformBone") or owner is None:
+            owner = ref
+        if ref is not None and owner is not None:
+            mapping[str(ref)] = owner
+            _LOG.debug("Mesh #%s -> animation node #%s", ref, owner)
+        stack.extend((child, owner) for child in node.get("children") or [])
     return mapping
 
 
@@ -2978,21 +3109,38 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
                 },
             }
 
+    def number_prop(instance, name, default):
+        value = _first_prop(instance, name)
+        return float(value) if isinstance(value, (int, float)) else default
+
     scene_lights = []
     for instance in instances.values():
         if instance.class_name not in ("PointLight", "SpotLight", "SurfaceLight"):
             continue
         color = _first_prop(instance, "Color") or [1.0, 1.0, 1.0]
+        parent_ref = instance.parent
+        attachment_cf = None
+        parent = instances.get(parent_ref)
+        # Preserve the emitter's local transform through Attachment/Bone
+        # ancestors, and associate it with the owning imported BasePart.
+        while parent is not None and parent.class_name in ("Attachment", "Bone"):
+            local_cf = _cf(_first_prop(parent, "CFrame")) or [
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0
+            ]
+            attachment_cf = _cf_multiply(local_cf, attachment_cf) if attachment_cf else local_cf
+            parent_ref = parent.parent
+            parent = instances.get(parent_ref)
         scene_lights.append(
             {
                 "class_name": instance.class_name,
                 "name": instance.name,
-                "parent_ref": instance.parent,
+                "parent_ref": parent_ref,
+                "attachment_cf": attachment_cf,
                 "enabled": bool(_first_prop(instance, "Enabled")) if _first_prop(instance, "Enabled") is not None else True,
-                "brightness": float(_first_prop(instance, "Brightness") or 1.0),
-                "range": float(_first_prop(instance, "Range") or 16.0),
-                "angle": float(_first_prop(instance, "Angle") or 45.0),
-                "face": int(_first_prop(instance, "Face") or 5),
+                "brightness": number_prop(instance, "Brightness", 1.0),
+                "range": number_prop(instance, "Range", 8.0 if instance.class_name == "PointLight" else 16.0),
+                "angle": number_prop(instance, "Angle", 90.0),
+                "face": int(number_prop(instance, "Face", 5)),
                 "shadows": bool(_first_prop(instance, "Shadows")),
                 "color": [float(component) for component in color[:3]],
             }
@@ -3042,6 +3190,10 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
             "fog_start": lighting_number("FogStart", 0.0),
             "fog_end": lighting_number("FogEnd", 100000.0),
             "technology": _first_prop(instance, "Technology"),
+            "lighting_style": _first_prop(instance, "LightingStyle"),
+            "prioritize_lighting_quality": _first_prop(instance, "PrioritizeLightingQuality"),
+            "color_shift_top": lighting_color("ColorShift_Top", (0.0, 0.0, 0.0)),
+            "color_shift_bottom": lighting_color("ColorShift_Bottom", (0.0, 0.0, 0.0)),
         }
         break
 
@@ -3066,6 +3218,8 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
         break
 
     post_effects = {}
+    blooms = []
+    corrections = []
     for instance in instances.values():
         if instance.class_name not in ("ColorCorrectionEffect", "BloomEffect", "SunRaysEffect"):
             continue
@@ -3077,26 +3231,32 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
                 "saturation": float(_first_prop(instance, "Saturation") or 0.0),
                 "tint": effect_color(instance, "TintColor", (1.0, 1.0, 1.0)),
             }
+            corrections.append(post_effects["color_correction"])
         elif instance.class_name == "BloomEffect":
             post_effects["bloom"] = {
                 "enabled": bool(_first_prop(instance, "Enabled")) if _first_prop(instance, "Enabled") is not None else True,
-                "intensity": float(_first_prop(instance, "Intensity") or 0.0),
-                "size": float(_first_prop(instance, "Size") or 0.0),
-                "threshold": float(_first_prop(instance, "Threshold") or 0.0),
+                "intensity": float(instance.props.get("Intensity",1.0)),
+                "size": float(instance.props.get("Size",24.0)),
+                "threshold": float(instance.props.get("Threshold",.95)),
             }
+            blooms.append(post_effects["bloom"])
         else:
             post_effects["sun_rays"] = {
                 "enabled": bool(_first_prop(instance, "Enabled")) if _first_prop(instance, "Enabled") is not None else True,
                 "intensity": float(_first_prop(instance, "Intensity") or 0.0),
                 "spread": float(_first_prop(instance, "Spread") or 0.0),
             }
+    if corrections:
+        post_effects["color_corrections"] = corrections
+    if blooms:
+        post_effects["blooms"] = blooms
     if post_effects:
         meta["scene_post_effects"] = post_effects
 
     for instance in instances.values():
         if instance.class_name != "MaterialService":
             continue
-        use_2022 = _first_prop(instance, "Use2022Materials")
+        use_2022 = _first_prop(instance, "Use2022MaterialsXml", "Use2022Materials")
         # Only stamp the flag when the file DECLARES a material system;
         # an absent MaterialService leaves the choice to the importer.
         if use_2022 is not None:
@@ -3107,7 +3267,7 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
         if instance.class_name != "Sky":
             continue
         sky = {
-            key: _content_to_str(_first_prop(instance, prop))
+            key: _content_or_asset_id(instance, prop)
             for key, prop in (
                 ("back", "SkyboxBk"), ("down", "SkyboxDn"), ("front", "SkyboxFt"),
                 ("left", "SkyboxLf"), ("right", "SkyboxRt"), ("up", "SkyboxUp"),
@@ -3119,6 +3279,7 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
     rig = _build_rig_tree(instances, roots)
     if rig is not None:
         meta["rig"] = rig
+        meta["meshToBoneRefs"] = _derive_mesh_to_bone_refs(rig)
         mesh_to_bone = _derive_mesh_to_bone(rig)
         if mesh_to_bone:
             meta["meshToBone"] = mesh_to_bone
@@ -3154,13 +3315,9 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
             while stack:
                 child = stack.pop()
                 if shirt_template is None and child.class_name == "Shirt":
-                    shirt_template = _content_to_str(
-                        _first_prop(child, "ShirtTemplate")
-                    ) or None
+                    shirt_template = _content_or_asset_id(child, "ShirtTemplate") or None
                 elif pants_template is None and child.class_name == "Pants":
-                    pants_template = _content_to_str(
-                        _first_prop(child, "PantsTemplate")
-                    ) or None
+                    pants_template = _content_or_asset_id(child, "PantsTemplate") or None
                 elif hd_data is None and child.class_name == "HumanoidDescription":
                     hd_data = _humanoid_description_data(child)
                 stack.extend(child.children)
@@ -3210,11 +3367,11 @@ def parse_rbxm(data: bytes) -> Dict[str, Any]:
     # importer can reconstruct the look.
     for inst in instances.values():
         if inst.class_name == "Shirt":
-            template = _content_to_str(_first_prop(inst, "ShirtTemplate"))
+            template = _content_or_asset_id(inst, "ShirtTemplate")
             if template:
                 meta["shirt_template"] = template
         elif inst.class_name == "Pants":
-            template = _content_to_str(_first_prop(inst, "PantsTemplate"))
+            template = _content_or_asset_id(inst, "PantsTemplate")
             if template:
                 meta["pants_template"] = template
 

@@ -18,12 +18,10 @@ end
 
 local function getJointParts(joint: CacheableJoint): (BasePart?, BasePart?)
 	if joint:IsA("AnimationConstraint") then
-		local attachment0 = joint.Attachment0
-		local attachment1 = joint.Attachment1
-		local part0 = attachment0 and attachment0.Parent
-		local part1 = attachment1 and attachment1.Parent
-		if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
-			return part0 :: BasePart, part1 :: BasePart
+		local part0 = RigPart.getAttachmentPart(joint.Attachment0)
+		local part1 = RigPart.getAttachmentPart(joint.Attachment1)
+		if part0 and part1 then
+			return part0, part1
 		end
 		return nil, nil
 	end
@@ -271,13 +269,11 @@ function Rig:checkCyclicMotor6D(model: Model)
 			end
 		elseif descendant:IsA("AnimationConstraint") then
 			local joint = descendant :: AnimationConstraint
-			local attachment0 = joint.Attachment0
-			local attachment1 = joint.Attachment1
-			local part0 = attachment0 and attachment0.Parent
-			local part1 = attachment1 and attachment1.Parent
-			if part0 and part1 and part0:IsA("BasePart") and part1:IsA("BasePart") then
-				local p0 = part0 :: BasePart
-				local p1 = part1 :: BasePart
+			local part0 = RigPart.getAttachmentPart(joint.Attachment0)
+			local part1 = RigPart.getAttachmentPart(joint.Attachment1)
+			if part0 and part1 then
+				local p0 = part0
+				local p1 = part1
 				if not motor6dGraph[p0] then
 					motor6dGraph[p0] = {}
 					table.insert(allParts, p0)
@@ -433,10 +429,8 @@ function Rig:buildBoneHierarchy(allBones)
 				part0 = joint.Part0
 				part1 = joint.Part1
 			elseif joint:IsA("AnimationConstraint") then
-				local att0 = joint.Attachment0
-				local att1 = joint.Attachment1
-				part0 = att0 and att0.Parent
-				part1 = att1 and att1.Parent
+				part0 = RigPart.getAttachmentPart(joint.Attachment0)
+				part1 = RigPart.getAttachmentPart(joint.Attachment1)
 			end
 
 			-- Find the other part in the joint

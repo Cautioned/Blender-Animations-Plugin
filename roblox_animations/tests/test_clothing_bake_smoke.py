@@ -4,6 +4,13 @@ import sys
 import types
 from pathlib import Path
 
+if __name__ != "__main__":
+    # Discovery matches test_*.py; this script replaces sys.modules entries
+    # for the real add-on package, which breaks every later test.
+    import unittest
+
+    raise unittest.SkipTest("standalone smoke script; run it directly")
+
 ws = Path(__file__).resolve().parents[2]
 pkg_dir = ws / "roblox_animations"
 

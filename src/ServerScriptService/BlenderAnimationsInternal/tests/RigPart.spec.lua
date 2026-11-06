@@ -881,6 +881,57 @@ return function()
 				child:Destroy()
 			end)
 
+			it("should resolve AnimationConstraint attachments hosted under a Bone to part-relative offsets", function()
+				local parent = Instance.new("MeshPart")
+				parent.Name = "ParentBoneAC"
+				parent.Parent = workspace
+
+				local child = Instance.new("Part")
+				child.Name = "ChildBoneAC"
+				child.Parent = workspace
+
+				local bone = Instance.new("Bone")
+				bone.CFrame = CFrame.new(10, 0, 0)
+				bone.Parent = parent
+				-- Posed bone: the animated Transform must not leak into the rest offset.
+				bone.Transform = CFrame.new(0, 50, 0)
+
+				local boneAttachment = Instance.new("Attachment")
+				boneAttachment.CFrame = CFrame.new(1, 2, 3)
+				boneAttachment.Parent = bone
+
+				local childAttachment = Instance.new("Attachment")
+				childAttachment.CFrame = CFrame.new(4, 5, 6)
+				childAttachment.Parent = child
+
+				expect(RigPart.getAttachmentPart(boneAttachment)).to.equal(parent)
+				expect(RigPart.getAttachmentPart(childAttachment)).to.equal(child)
+
+				local joint = Instance.new("AnimationConstraint")
+				joint.Attachment0 = boneAttachment
+				joint.Attachment1 = childAttachment
+				joint.Parent = parent
+
+				local jc = { [parent] = { joint }, [child] = { joint } }
+				local rig = makeRig(jc)
+				local rp = RigPart.new(rig, parent, nil, false)
+
+				local encoded = rp:Encode()
+				local childEncoded = encoded.children[1]
+
+				expect(childEncoded).to.be.ok()
+				expect(childEncoded.jointType).to.equal("AnimationConstraint")
+				-- Bone (10,0,0) * attachment (1,2,3), in the MeshPart's space.
+				expect(childEncoded.jointtransform0[1]).to.be.near(11, 0.001)
+				expect(childEncoded.jointtransform0[2]).to.be.near(2, 0.001)
+				expect(childEncoded.jointtransform0[3]).to.be.near(3, 0.001)
+				expect(childEncoded.jointtransform1[1]).to.be.near(4, 0.001)
+
+				joint:Destroy()
+				parent:Destroy()
+				child:Destroy()
+			end)
+
 			it("should encode deform bones with WorldCFrame", function()
 				local mesh = Instance.new("MeshPart")
 				mesh.Name = "Body"

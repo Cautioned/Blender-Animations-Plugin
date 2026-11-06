@@ -363,6 +363,14 @@ def _lazy_mesh_instance_key(entry, collection=None):
     shares one mesh datablock regardless of its size, color, or texture.
     """
     mesh_id = entry.get("mesh_id")
+    if entry.get('class_name')=='MeshPart':
+        from ..rig import textures as _textures_mod
+        if _textures_mod._entry_texture_instances(entry):
+            # Projected UVs and per-face material indices live on the mesh.
+            # Share only matching surface layouts, dimensions and host tint.
+            return (str(mesh_id),'surface-images',
+                    _textures_mod.part_material_identity(entry),
+                    tuple(entry.get('color') or (1,1,1)))
     return (str(mesh_id),) if mesh_id else ("unique", entry.get("inst_ref"))
 
 
@@ -406,6 +414,12 @@ def _apply_lazy_instance_material(
     try:
         from ..rig import textures as _textures_mod
 
+        if entry.get('class_name')=='MeshPart' and _textures_mod._entry_texture_instances(entry):
+            # This prototype already owns per-face bindings. A single-slot
+            # object override would erase its face selection. Its instances
+            # are grouped by surface layout, size and color above.
+            if material_state is not None:_mark_deferred_material_built(material_state,entry)
+            return
         signature = entry.get("_rbx_lazy_material_signature")
         if _textures_mod.entry_uses_baked_tint(entry):
             # Linked FileMesh instances can have different Roblox colours.
@@ -426,9 +440,11 @@ def _apply_lazy_instance_material(
         print(f"[RbxmImport] Deferred material failed for '{mesh_obj.name}': {exc}")
 
 
-def _remove_lazy_map_identity(mesh_obj):
+def _remove_lazy_map_identity(mesh_obj, entry=None):
     """Drop rig-only metadata from non-rigged place geometry instances."""
     for key in ("RBXPartIdx", "RBXInstRef"):
+        if key == "RBXInstRef" and entry and entry.get("_rbx_local_light_host"):
+            continue
         if key in mesh_obj:
             del mesh_obj[key]
 
@@ -480,7 +496,7 @@ def _apply_lazy_mesh_job_impl(job, object_budget, deadline):
         created = 1
         if base_obj is None:
             return True, created
-        _remove_lazy_map_identity(base_obj)
+        _remove_lazy_map_identity(base_obj, job["entry"])
         # OBJECT-linked override on the prototype too: several jobs can
         # share ONE mesh datablock (same FileMesh asset), and whoever
         # rewrites the data slot last silently swaps every earlier
@@ -506,6 +522,8 @@ def _apply_lazy_mesh_job_impl(job, object_budget, deadline):
         instance = bpy.data.objects.new(_lazy_mesh_object_name(entry), base_obj.data)
         instance.matrix_world = _get_filemesh_native_transform(entry, job["mesh_data"])
         instance["RBXSynthesizedPart"] = True
+        if entry.get("_rbx_local_light_host") and entry.get("inst_ref") is not None:
+            instance["RBXInstRef"] = int(entry["inst_ref"])
         # The common case is a cache hit: the signature cache already holds
         # the material and only the OBJECT slot link is rewritten.  Override
         # unconditionally — a data-linked slot on a shared mesh datablock
@@ -670,7 +688,10 @@ def _process_lazy_place_imports():
                         # lives on the mesh datablock; a shared batched mesh
                         # built from many entries cannot express per-part
                         # material UVs, so keep those instances separate.
-                        batchable = not _textures_mod.builtin_material_texture_refs(entry)
+                        batchable = (not entry.get("_rbx_local_light_host")
+                                     and not _textures_mod.builtin_material_texture_refs(entry)
+                                     and not (entry.get('class_name')=='MeshPart'
+                                              and _textures_mod._entry_texture_instances(entry)))
                         key = (
                             collection_ref.as_pointer(),
                             entry["_rbx_lazy_material_signature"],
@@ -736,6 +757,15 @@ def _process_lazy_place_imports():
         )
         texture_bytes_ready = texture_future is None or texture_future.done()
         terrain_ready = terrain_future is None or terrain_future.done()
+        if texture_future is not None and texture_bytes_ready and not state.get('texture_registry_settled'):
+            error='texture worker ended without publishing a result'
+            if texture_future is not None:
+                try:texture_future.result()
+                except Exception as exc:
+                    error=str(exc)
+                    print(f'[RbxTexture] worker failed: {error}')
+            state['texture_assets'].finish_pending(error)
+            state['texture_registry_settled']=True
         texture_completions = state["texture_assets"].drain_completions()
         state["texture_completion_count"] += len(texture_completions)
         for signature in state["texture_assets"].drain_ready_consumers():
@@ -1098,6 +1128,8 @@ def _process_lazy_place_imports():
                 bpy.context.view_layer.update()
             except Exception:
                 pass
+            callback=state.get('lighting_enable')
+            if callable(callback):callback()
             state["reveal_seconds"] = time.perf_counter() - t_reveal
             elapsed = time.perf_counter() - state["started"]
             pt = state["phase_times"]
@@ -3506,6 +3538,7 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                 weapon_rigs = [{
                     "rig": whole_rig,
                     "meshToBone": meta_loaded.get("meshToBone") or {},
+                    "meshToBoneRefs": meta_loaded.get("meshToBoneRefs") or {},
                 }]
         rig_by_root_name = {}
         for weapon_rig in weapon_rigs:
@@ -3652,7 +3685,8 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                     except Exception as exc:
                         print(f"[RbxmWeapon] internal rig build failed: {exc}")
                 _safe_mode_set("OBJECT", armature)
-                root_bone_name = rig_def.get("jname")
+                group["bone_names_by_ref"] = dict(match_ctx.get("bone_names_by_ref", {}))
+                root_bone_name = group["bone_names_by_ref"].get(rig_def.get("inst_ref"), rig_def.get("jname"))
                 if root_bone_name and armature.data.bones.get(root_bone_name):
                     group["created_bone"] = root_bone_name
 
@@ -3716,16 +3750,36 @@ class OBJECT_OT_ApplyWeaponImport(bpy.types.Operator):
                     ref = obj.get("RBXInstRef")
                     if isinstance(ref, int):
                         obj_by_ref[ref] = obj
-                for part_name, mapped_bone in (weapon_rig.get("meshToBone") or {}).items():
-                    ref = name_to_ref.get(part_name)
-                    obj = obj_by_ref.get(ref) if ref is not None else None
-                    if obj is None or obj in skinned_bound or obj in handled:
-                        continue
-                    mapped = armature.data.bones.get(mapped_bone)
-                    if mapped is None:
-                        continue
-                    link_object_to_bone_rigid(obj, armature, mapped)
-                    handled.add(obj)
+                from ..core.rbxm import _derive_mesh_to_bone_refs
+                ref_mapping = weapon_rig.get("meshToBoneRefs") or _derive_mesh_to_bone_refs(weapon_rig.get("rig"))
+                if ref_mapping and obj_by_ref:
+                    # Internal weapon rigs can also carry many welded clothes
+                    # or detail meshes per bone. Keep file-local identities
+                    # until matching finishes; names can repeat across groups.
+                    for ref, obj in obj_by_ref.items():
+                        if obj in skinned_bound or obj in handled:
+                            continue
+                        owner = ref_mapping.get(str(ref), ref_mapping.get(ref))
+                        if owner is None:
+                            continue  # Outside this internal rig: use the grip.
+                        handled.add(obj)
+                        target_name = group.get("bone_names_by_ref", {}).get(int(owner))
+                        target = armature.data.bones.get(target_name) if target_name else None
+                        if target is None:
+                            print(f"[RbxmWeapon] WARNING: mesh #{ref} animation node #{owner} missing; no name fallback")
+                            continue
+                        link_object_to_bone_rigid(obj, armature, target)
+                else:
+                    for part_name, mapped_bone in (weapon_rig.get("meshToBone") or {}).items():
+                        ref = name_to_ref.get(part_name)
+                        obj = obj_by_ref.get(ref) if ref is not None else None
+                        if obj is None or obj in skinned_bound or obj in handled:
+                            continue
+                        mapped = armature.data.bones.get(mapped_bone)
+                        if mapped is None:
+                            continue
+                        link_object_to_bone_rigid(obj, armature, mapped)
+                        handled.add(obj)
             for obj in group_meshes:
                 if obj in handled or obj in skinned_bound:
                     continue
@@ -4927,6 +4981,7 @@ def _create_rbxl_scene_rig_scaffolds(scene_rigs, part_entries, parent_collection
             "rigName": rig_name,
             "rig": rig_def,
             "meshToBone": scene_rig.get("meshToBone") or {},
+            "meshToBoneRefs": scene_rig.get("meshToBoneRefs") or {},
             "partAux": [entries_by_ref[ref] for ref in refs if ref in entries_by_ref],
             "source": "rbxm",
         }
@@ -5067,7 +5122,13 @@ def _create_equirectangular_sky_image(
             width, height = (int(value) for value in image.size[:2])
             if width < 1 or height < 1:
                 continue
-            face_pixels[key] = (width, height, _srgb_decode_array(image.pixels[:]))
+            try:
+                import numpy as np
+                pixels=np.empty(width*height*4,dtype=np.float32)
+                image.pixels.foreach_get(pixels)
+            except ImportError:
+                pixels=image.pixels[:]
+            face_pixels[key] = (width, height, _srgb_decode_array(pixels))
         except (AttributeError, TypeError, ReferenceError, RuntimeError):
             continue
     if not face_pixels:
@@ -5212,6 +5273,12 @@ def _create_equirectangular_sky_image(
             continue
     image.pixels.foreach_set(output_pixels)
     image.update()
+    # GENERATED images retain their generator settings, not modified pixels,
+    # when a .blend is reopened. Pack the converted sky as float data so a
+    # saved map cannot silently reopen with an all-black environment.
+    image.file_format='OPEN_EXR'
+    image.pack()
+    image['RBXSkyEnvironment']=True
     if timing is not None:
         timing["conversion + upload"] = time.perf_counter() - output_started
     return (image, face_pixels) if return_face_pixels else image
@@ -5267,6 +5334,31 @@ def _set_view_clip_to_extent(collection):
         pass
 
 
+_DEFAULT_RBXL_SKY_IMAGE = None
+
+
+def _create_default_rbxl_sky_environment(collection):
+    """Resolve the engine's installed default sky without downloading assets."""
+    global _DEFAULT_RBXL_SKY_IMAGE
+    if _DEFAULT_RBXL_SKY_IMAGE:
+        image = bpy.data.images.get(_DEFAULT_RBXL_SKY_IMAGE)
+        if image is not None:
+            return image
+    from ..rig.filemesh import _resolve_rbxasset_path
+    refs = {
+        key: f"rbxasset://textures/sky/sky512_{suffix}.tex"
+        for key, suffix in (("back", "bk"), ("down", "dn"), ("front", "ft"),
+                            ("left", "lf"), ("right", "rt"), ("up", "up"))
+    }
+    if not all(_resolve_rbxasset_path(ref) is not None for ref in refs.values()):
+        return None
+    metadata = _create_rbxl_skybox(collection, refs, [])
+    if metadata is None:
+        return None
+    _DEFAULT_RBXL_SKY_IMAGE = metadata.get("rbx_environment_image")
+    return bpy.data.images.get(_DEFAULT_RBXL_SKY_IMAGE)
+
+
 def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=None, post_effects=None):
     """Approximate Roblox Lighting with a Blender World and directional Sun.
 
@@ -5282,9 +5374,11 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
     ambient = lighting.get("ambient") or (0.0, 0.0, 0.0)
     outdoor = lighting.get("outdoor_ambient") or ambient
     clock_time = float(lighting.get("clock_time", 14.0)) % 24.0
-    latitude = math.radians(_clamp(float(lighting.get("geographic_latitude", 41.733)), -89.0, 89.0))
-    hour_angle = math.radians((clock_time - 12.0) * 15.0)
-    altitude = math.asin(math.cos(latitude) * math.cos(hour_angle))
+    from ..core.lighting import sun_direction, fallback_environment_color
+    source_rbx = Vector(sun_direction(clock_time, lighting.get("geographic_latitude", 41.733)))
+    source_blender = get_transform_to_blender().to_3x3() @ source_rbx
+    altitude = math.asin(_clamp(source_rbx.y, -1.0, 1.0))
+    azimuth = math.atan2(source_blender.y, source_blender.x)
     daylight = _clamp(math.sin(altitude), 0.0, 1.0)
     # Blender has one world irradiance.  Most imported place geometry is
     # outdoors, where Roblox uses OutdoorAmbient; retain a little Ambient as
@@ -5352,8 +5446,8 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
             nishita.sky_type = "MULTIPLE_SCATTERING"
         except TypeError:
             nishita.sky_type = "NISHITA"
-        nishita.sun_elevation = math.degrees(altitude)
-        nishita.sun_rotation = math.degrees(hour_angle)
+        nishita.sun_elevation = altitude
+        nishita.sun_rotation = azimuth
         try:
             if atmosphere:
                 nishita.air_density = 1.0 + float(atmosphere.get("density", 0.0)) * 0.5
@@ -5363,7 +5457,48 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
         world.node_tree.links.new(nishita.outputs["Color"], background.inputs["Color"])
         world.node_tree.links.new(nishita.outputs["Color"], glossy_background.inputs["Color"])
         world.node_tree.links.new(nishita.outputs["Color"], camera_background.inputs["Color"])
-    if is_eevee:
+    # Enum.LightingStyle.Realistic = 0. Keep the measured no-Sky fit
+    # scoped to that mode; custom sky images and legacy styles retain their
+    # existing paths until they have their own reference captures.
+    calibrated_fallback = is_eevee and not skybox and lighting.get("lighting_style") == 0
+    if calibrated_fallback:
+        for link in list(background.inputs["Color"].links):
+            world.node_tree.links.remove(link)
+        background.inputs["Color"].default_value = (*fallback_environment_color(lighting, daylight), 1.0)
+        background.inputs["Strength"].default_value = 1.0
+        camera_background.inputs["Strength"].default_value = 1.0
+        # An absent Sky still uses Roblox's installed default cubemap. Use
+        # its real images for the visible backdrop when available, while
+        # keeping ambient/diffuse lighting independent from that picture.
+        default_sky = _create_default_rbxl_sky_environment(collection)
+        if default_sky is not None:
+            environment = nodes.new("ShaderNodeTexEnvironment")
+            environment.name = "RBX Default Sky Environment"
+            environment.image = default_sky
+            # Match the default engine cubemap's facing to Blender's world
+            # lookup. Checked against six cardinal CaptureService samples.
+            coordinates = nodes.new("ShaderNodeTexCoord")
+            coordinates.name = "RBX Default Sky Coordinates"
+            orientation = nodes.new("ShaderNodeVectorMath")
+            orientation.name = "RBX Default Sky Orientation"
+            orientation.operation = "MULTIPLY"
+            orientation.inputs[1].default_value = (-1.0, -1.0, 1.0)
+            world.node_tree.links.new(coordinates.outputs["Generated"], orientation.inputs[0])
+            world.node_tree.links.new(orientation.outputs["Vector"], environment.inputs["Vector"])
+            world.node_tree.links.new(environment.outputs["Color"], camera_background.inputs["Color"])
+            twilight = _clamp((source_rbx.y + 0.10) / 0.15, 0.0, 1.0)
+            twilight = twilight * twilight * (3.0 - 2.0 * twilight)
+            camera_background.inputs["Strength"].default_value = 0.004 + 0.996 * twilight
+        light_path = nodes.new("ShaderNodeLightPath")
+        light_path.name = "RBX EEVEE Camera Ray"
+        mix = nodes.new("ShaderNodeMixShader")
+        mix.name = "RBX Camera / Calibrated Fill"
+        world.node_tree.links.new(light_path.outputs["Is Camera Ray"], mix.inputs[0])
+        world.node_tree.links.new(background.outputs["Background"], mix.inputs[1])
+        world.node_tree.links.new(camera_background.outputs["Background"], mix.inputs[2])
+        world.node_tree.links.new(mix.outputs[0], output.inputs["Surface"])
+        world["rbx_lighting_profile"] = "Realistic no-Sky calibration v1"
+    elif is_eevee:
         # Eevee stores world lighting in an internal indirect-light probe.  It
         # cannot evaluate the Cycles Light Path ray split below, which left
         # imported HDR skies visibly present but absent from surface lighting.
@@ -5410,9 +5545,23 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
         world.node_tree.links.new(environment_mix.outputs["Shader"], camera_mix.inputs[1])
         world.node_tree.links.new(camera_background.outputs["Background"], camera_mix.inputs[2])
         world.node_tree.links.new(camera_mix.outputs["Shader"], output.inputs["Surface"])
+    # Only keep branches used by this renderer's World Output. In EEVEE,
+    # the Cycles-only reflection/camera backgrounds otherwise remain loose.
+    reachable={output};pending=[output]
+    while pending:
+        node=pending.pop()
+        for socket in node.inputs:
+            for link in socket.links:
+                if link.from_node not in reachable:
+                    reachable.add(link.from_node);pending.append(link.from_node)
+    for node in list(nodes):
+        if node not in reachable:nodes.remove(node)
     world["rbx_ambient"] = list(ambient[:3])
     world["rbx_outdoor_ambient"] = list(outdoor[:3])
-    world["rbx_environment_fill_color"] = list(world_color)
+    world["rbx_global_shadows"] = bool(lighting.get("global_shadows", True))
+    world["rbx_environment_fill_color"] = (
+        list(background.inputs["Color"].default_value[:3]) if calibrated_fallback else list(world_color)
+    )
     world["rbx_environment_diffuse_scale"] = diffuse
     world["rbx_environment_specular_scale"] = specular
     world["rbx_fog_color"] = list((lighting.get("fog_color") or (0.75, 0.75, 0.75))[:3])
@@ -5436,315 +5585,66 @@ def _create_rbxl_global_lighting(collection, lighting, skybox=None, atmosphere=N
             "OpenGL if imported parts look black."
             % (bpy.app.version[0], bpy.app.version[1])
         )
-    # Shadows, AO, and their resolutions are deliberately left alone: forcing
-    # 4096 cascades and 2048 cube shadows per light blew GPU memory on
-    # place-sized scenes, and forced GTAO doubled up on the world probe's
-    # contact shading. Only ray-tracing options are tuned, and only when the
-    # user already has ray tracing enabled.
-    if eevee is not None:
-        if is_eevee and hasattr(eevee, "use_raytracing"):
-            # Ray tracing is deliberately left to the user: enabling it on
-            # import made the viewport sluggish on modest GPUs and surprised
-            # people who had it off. Only tune when already opted in.
-            if eevee.use_raytracing:
-                try:
-                    if hasattr(eevee, "ray_tracing_method"):
-                        eevee.ray_tracing_method = "SCREEN"
-                except (TypeError, ValueError):
-                    pass
-                options = getattr(eevee, "ray_tracing_options", None)
-                if options is not None:
-                    for name, value in (
-                        ("resolution_scale", "1"),
-                        ("screen_trace_quality", 0.75),
-                        ("screen_trace_thickness", 0.5),
-                        # Rough Roblox Plastic should use Fast GI's ambient-
-                        # occlusion fallback. A max roughness of 1.0 traces
-                        # every BSDF and disables that fallback completely.
-                        ("trace_max_roughness", 0.65),
-                        ("use_denoise", True),
-                    ):
-                        if hasattr(options, name):
-                            try:
-                                setattr(options, name, value)
-                            except (TypeError, ValueError):
-                                pass
-                # Screen traces retain accurate glossy/smoother surfaces;
-                # Fast GI supplies the missing diffuse contact occlusion for
-                # rough parts.  Blender 5.2 rebalanced Fast GI energy
-                # conservation (projects.blender.org issues/161472, PR
-                # 156597): the settings tuned against 5.1 render noticeably
-                # darker there.  The sanctioned mitigation is higher step/ray
-                # counts; parity with the 5.1 look is not guaranteed by
-                # design.
-                gi_is_52 = getattr(bpy.app, "version", (0,)) >= (5, 2, 0)
-                gi_ray_count = 12 if gi_is_52 else 8
-                gi_step_count = 32 if gi_is_52 else 16
-                gi_quality = 1.0 if gi_is_52 else 0.75
-                for name, value in (
-                    ("use_fast_gi", True),
-                    ("fast_gi_method", "AMBIENT_OCCLUSION_ONLY"),
-                    ("fast_gi_resolution", "1"),
-                    ("fast_gi_ray_count", gi_ray_count),
-                    ("fast_gi_step_count", gi_step_count),
-                    ("fast_gi_quality", gi_quality),
-                    # Keep this as local contact occlusion. Large thickness
-                    # values make distant map geometry over-block the
-                    # environment light.
-                    ("fast_gi_distance", 12.0),
-                    ("fast_gi_thickness_near", 0.12),
-                    ("fast_gi_thickness_far", 0.45),
-                ):
-                    if hasattr(eevee, name):
-                        try:
-                            setattr(eevee, name, value)
-                        except (TypeError, ValueError):
-                            pass
-            world["rbx_eevee_raytracing"] = bool(eevee.use_raytracing)
+    # Sampling quality stays at the user's existing values. The ordinary
+    # EEVEE occlusion pass is configured below after the source lighting.
+    if eevee is not None and hasattr(eevee,'use_raytracing'):
+        world['rbx_eevee_raytracing']=bool(eevee.use_raytracing)
 
     # Brightness drives direct-light strength.  Do not add a global display
     # exposure offset here: a Crossroads-specific sweep improved that map but
     # overexposed the controlled fixture, proving it is not a general mapping.
-    correction = (post_effects or {}).get("color_correction") or {}
-    # Studio's ExposureCompensation and ColorCorrection.Brightness are both
-    # stop-like offsets that Blender's scene exposure reproduces 1:1, so the
-    # values pass through unchanged.  Contrast/saturation stay metadata:
-    # Blender's scene color management cannot apply them to the interactive
-    # material-preview path without taking over the user's compositor.
+    # ColorCorrection brightness is additive in display space; it is not
+    # an exposure stop. The managed post stage applies all four controls.
     exposure = float(lighting.get("exposure_compensation", 0.0))
-    if correction.get("enabled", True):
-        exposure += float(correction.get("brightness", 0.0))
     scene.view_settings.exposure = _clamp(exposure, -10.0, 10.0)
-    # Khronos PBR Neutral renders the imported PBR materials the way they
-    # were authored, with Medium Contrast for a tame highlight rolloff.
-    # Fall back to Standard on older bundled OCIO configs that lack it.
+    # The measured no-Sky Realistic fit uses Standard without an extra
+    # contrast look. Other profiles retain their existing PBR view transform.
+    # Fall back to Standard if the bundled OCIO config lacks that transform.
     try:
-        scene.view_settings.view_transform = "Khronos PBR Neutral"
-        scene.view_settings.look = "Medium Contrast"
+        scene.view_settings.view_transform = "Standard" if calibrated_fallback else "Khronos PBR Neutral"
+        scene.view_settings.look = "None" if calibrated_fallback else "Medium Contrast"
     except (TypeError, ValueError):
         try:
             scene.view_settings.view_transform = "Standard"
         except (TypeError, ValueError):
             pass
     for effect_name, effect in (post_effects or {}).items():
+        if not isinstance(effect,dict):
+            continue
         for key, value in effect.items():
             world[f"rbx_{effect_name}_{key}"] = value
 
     data = bpy.data.lights.new("RBX Sun", "SUN")
-    # Anchor Roblox's default Lighting.Brightness (2) to Blender's sensible
-    # daylight Sun strength (1), while retaining intentional brightness edits
-    # as a simple linear scale in either renderer.
-    data.energy = max(0.0, brightness) * 0.5
+    # The no-environment control isolates direct sun from ambient fill.
+    # Its Realistic fit uses 1.5 energy per Brightness unit; other profiles
+    # retain their prior conversion.
+    data.energy = max(0.0, brightness) * (1.5 if calibrated_fallback else 0.5)
     data.use_shadow = bool(lighting.get("global_shadows", True))
     data.angle = math.radians(0.5 + 10.0 * _clamp(float(lighting.get("shadow_softness", 0.0)), 0.0, 1.0))
     sun = bpy.data.objects.new("RBX Sun", data)
     collection.objects.link(sun)
 
-    # An equinox sun model is close enough for Roblox's time-of-day look.
-    # Convert the source direction through the same coordinate basis as parts.
-    from mathutils import Vector
-    source_rbx = Vector((
-        -math.sin(hour_angle) * math.cos(altitude),
-        math.sin(altitude),  # Roblox is Y-up (Blender's Z after conversion).
-        -math.cos(hour_angle) * math.cos(altitude),
-    ))
-    source_blender = get_transform_to_blender().to_3x3() @ source_rbx
-    # Rig import maps Roblox +Z to Blender -Y.  Roblox's time-of-day azimuth
-    # uses the opposite north/south handedness, so mirror only that horizontal
-    # Blender component; do not touch the already-correct vertical Z axis.
-    source_blender.y *= -1.0
+    # Use the same source direction as the procedural sky. Parts and
+    # lights share one coordinate conversion; no extra axis mirror is needed.
     source_blender.normalize()
     sun.rotation_mode = "QUATERNION"
     sun.rotation_quaternion = (-source_blender).to_track_quat("-Z", "Y")
+    if is_eevee and any(mat and mat.get("RBXNeon") for obj in collection.all_objects
+                        if obj.type=='MESH' for mat in obj.data.materials):
+        from ..rig.neon import configure_neon_compositor
+        configure_neon_compositor(scene,post_effects or {})
+    from ..rig.post_processing import configure_post_processing
+    configure_post_processing(scene, post_effects or {})
+    from ..rig.ambient_occlusion import configure_ambient_occlusion
+    configure_ambient_occlusion(scene, lighting.get("global_shadows", True))
+    if eevee is not None and hasattr(eevee, "use_raytracing"):
+        world["rbx_eevee_raytracing"] = bool(eevee.use_raytracing)
     return sun
 
 
 def _create_rbxl_lights(collection, scene_lights, part_entries):
-    from mathutils import Vector
-
-    # Roblox local lights (PointLight and SpotLight) share the same influence
-    # envelope: Range is not a hard photometric cutoff.  The light remains
-    # useful until roughly twice that distance, with the visible falloff
-    # beginning around the configured range.  Blender's custom distance is a
-    # hard outer boundary over its already inverse-square illumination, so the
-    # cutoff is pushed out to where the envelope contributes almost nothing;
-    # the in-range falloff then reads as a smooth fade rather than a hard edge.
-    _BLENDER_RANGE_ENVELOPE_SCALE = 2.0
-
-    def spotlight_brightness_response(brightness):
-        """Map Roblox SpotLight.Brightness to calibrated Blender intensity.
-
-        The two engines do not share a photometric unit or display response.
-        These knots are an empirical fit to the sealed LightingTest.rbxl
-        Brightness sweep (Range=16, Angle=45) at the matching Studio camera.
-        Interpolation keeps normal user values smooth while still preserving a
-        linear high-brightness tail instead of silently crushing bright lights.
-        """
-        knots = (
-            (0.0, 0.0), (0.25, 0.50), (0.5, 0.55), (1.0, 0.65),
-            (2.0, 1.00), (5.0, 2.70), (10.0, 9.50), (20.0, 19.20),
-        )
-        value = max(0.0, float(brightness))
-        for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
-            if value <= x1:
-                return y0 + (y1 - y0) * ((value - x0) / (x1 - x0))
-        # The final two knots establish the high-intensity slope; extrapolate
-        # it rather than clipping valid Brightness values above 20.
-        x0, y0 = knots[-2]
-        x1, y1 = knots[-1]
-        return y1 + (value - x1) * ((y1 - y0) / (x1 - x0))
-
-    def spotlight_range_response(range_studs):
-        """Empirical endpoint-energy correction for Roblox SpotLight.Range.
-
-        Roblox's Range is a filtered influence envelope, whereas Blender uses
-        inverse-square illumination plus a cutoff.  The sealed client-renderer
-        sweep measured the probe exactly one Roblox range from the source.
-        The large high-range multipliers exist because the spot fit was taken
-        with the cone probe at the old 1x cutoff kill-edge; they remain the
-        user-validated spot calibration.
-
-        The short-range knots are floored at 0.15 rather than the raw fit
-        (~0): the sweep only measured at exactly one range from the source,
-        and zeroing the curve there would make short-range lights import as
-        invisible even though they light nearer surfaces in Roblox.
-        """
-        knots = (
-            (0.0, 0.0), (4.0, 0.15), (8.0, 0.15),
-            (16.0, 0.90), (24.0, 12.8), (32.0, 16.8),
-        )
-        value = max(0.0, float(range_studs))
-        for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
-            if value <= x1:
-                return y0 + (y1 - y0) * ((value - x0) / (x1 - x0))
-        return min(20.0, knots[-1][1] + (value - 32.0) * 0.25)
-
-    def pointlight_range_response(range_studs):
-        """Empirical endpoint-energy correction for Roblox PointLight.Range.
-
-        Fitted from an unconfounded EEVEE sweep of the sealed 04_point_range
-        fixture (host parts excluded, 2x cutoff, current energy scale): the
-        client pools read about 1.4x and 1.75x brighter than Blender at Range
-        24 and 32, so the tail rises gently.  Points spread over the full
-        sphere and do not carry the spot cone's concentration, so the
-        multipliers stay far below the spot curve's.
-
-        Short ranges are floored at 0.15 for the same reason as the spot
-        curve: the client sweep reads nearly black at exactly one range for
-        Range <= 8, but zeroing the curve would kill near-field light.
-        """
-        knots = (
-            (0.0, 0.0), (4.0, 0.15), (8.0, 0.15),
-            (16.0, 1.00), (24.0, 1.40), (32.0, 1.80),
-        )
-        value = max(0.0, float(range_studs))
-        for (x0, y0), (x1, y1) in zip(knots, knots[1:]):
-            if value <= x1:
-                return y0 + (y1 - y0) * ((value - x0) / (x1 - x0))
-        return min(4.0, knots[-1][1] + (value - 32.0) * 0.05)
-
-    def spotlight_angle_response(angle_degrees):
-        """Return Blender cone size, energy correction, and edge softness.
-
-        The client-renderer angle fixture (15/30/45/60 degrees, five lateral
-        probes at a 15.75-stud throw) shows Roblox's cone is wider and has a
-        much softer penumbra than Blender's equivalent spot_size.  Roblox's
-        90-degree fixture did not render a stable local-light result, so keep
-        the measured curve bounded at 60 degrees instead of extrapolating a
-        made-up wide-cone response.
-        """
-        knots = (
-            (0.0, 0.0, 0.80),
-            (15.0, 0.38, 0.80),
-            (30.0, 0.78, 1.20),
-            (45.0, 1.12, 1.55),
-            (60.0, 1.50, 1.70),
-        )
-        value = _clamp(float(angle_degrees), 0.0, 60.0)
-        for (x0, size0, energy0), (x1, size1, energy1) in zip(knots, knots[1:]):
-            if value <= x1:
-                t = (value - x0) / (x1 - x0)
-                return size0 + (size1 - size0) * t, energy0 + (energy1 - energy0) * t, 0.70
-        return knots[-1][1], knots[-1][2], 0.70
-
-    # Enum.NormalId: Right, Top, Back, Left, Bottom, Front.
-    face_normals = {
-        0: Vector((1, 0, 0)), 1: Vector((0, 1, 0)), 2: Vector((0, 0, 1)),
-        3: Vector((-1, 0, 0)), 4: Vector((0, -1, 0)), 5: Vector((0, 0, -1)),
-    }
-    entries_by_ref = {entry.get("inst_ref"): entry for entry in part_entries if isinstance(entry, dict)}
-    created = 0
-    for light in scene_lights or []:
-        if not light.get("enabled", True):
-            continue
-        parent = entries_by_ref.get(light.get("parent_ref"))
-        if parent is None:
-            continue
-        kind = light.get("class_name")
-        blender_type = "POINT" if kind == "PointLight" else ("SPOT" if kind == "SpotLight" else "AREA")
-        data = bpy.data.lights.new(light.get("name") or kind, blender_type)
-        data.color = tuple(light.get("color") or (1.0, 1.0, 1.0))
-        brightness = max(0.0, float(light.get("brightness", 1.0)))
-        # Point and spot lights have different Blender emitter models, but the
-        # Roblox-side envelope (Range, Brightness) is shared and the sweeps
-        # were compared against sealed client-renderer captures; the client
-        # lights run slightly brighter and blendier, so the Blender scales
-        # carry a small upward correction.
-        roblox_range = max(0.01, float(light.get("range", 16.0)))
-        roblox_angle = float(light.get("angle", 45.0))
-        spot_size, angle_energy, spot_blend = spotlight_angle_response(roblox_angle)
-        if blender_type == "SPOT":
-            data.energy = (
-                spotlight_brightness_response(brightness)
-                * spotlight_range_response(roblox_range)
-                * angle_energy
-                * 135.0
-            )
-        elif blender_type == "POINT":
-            data.energy = brightness * 850.0 * pointlight_range_response(roblox_range)
-        else:
-            data.energy = brightness * 850.0
-        data.use_shadow = bool(light.get("shadows"))
-        if hasattr(data, "cutoff_distance"):
-            data.cutoff_distance = roblox_range * _BLENDER_RANGE_ENVELOPE_SCALE
-            data.use_custom_distance = True
-        if blender_type == "SPOT":
-            data.spot_size = min(3.14159, max(0.01745, spot_size))
-            data.spot_blend = spot_blend
-            data["rbx_range"] = roblox_range
-            data["rbx_angle"] = roblox_angle
-            data["rbx_cutoff_scale"] = _BLENDER_RANGE_ENVELOPE_SCALE
-        if blender_type == "AREA":
-            data.shape = "DISK"
-            data.size = max(0.01, float(light.get("range", 16.0)))
-        obj = bpy.data.objects.new(light.get("name") or kind, data)
-        try:
-            parent_matrix = get_transform_to_blender() @ cf_to_mat(parent.get("part_cf"))
-            obj.matrix_world = parent_matrix
-            if blender_type in ("SPOT", "AREA"):
-                # Blender emits its Spot/Area light down local -Z.  Reorient it
-                # to Roblox's requested Face after applying the part CFrame.
-                normal_rbx = face_normals.get(int(light.get("face", 5)), face_normals[5])
-                normal_world = (parent_matrix.to_3x3() @ normal_rbx).normalized()
-                # A light parented to a BasePart originates at the selected
-                # face, not in the middle of the part.  Range is measured from
-                # that emitting face, so moving this origin is essential for
-                # lamps, headlights, and wall-mounted spots to agree with
-                # Roblox without arbitrarily altering Range.
-                size = parent.get("part_size") or (0.0, 0.0, 0.0)
-                try:
-                    axis = max(range(3), key=lambda index: abs(normal_rbx[index]))
-                    face_offset = normal_rbx * (max(0.0, float(size[axis])) * 0.5 + 0.001)
-                    obj.location = parent_matrix @ face_offset
-                except (TypeError, ValueError, IndexError):
-                    pass
-                obj.rotation_mode = "QUATERNION"
-                obj.rotation_quaternion = normal_world.to_track_quat("-Z", "Y")
-        except Exception:
-            pass
-        collection.objects.link(obj)
-        created += 1
-    return created
+    from ..rig.local_lights import create_lights
+    return create_lights(collection, scene_lights, part_entries)
 
 
 def _skybox_average_color(images):
@@ -5825,6 +5725,26 @@ def _create_rbxl_skybox(collection, sky, part_entries):
     timing["image bind"] = time.perf_counter() - fetch_started
     if not images:
         return None
+    available={name for name,image in images if image is not None} | set(raw_faces)
+    missing=[name for name in faces if sky.get(name) and name not in available]
+    if missing:
+        print('[RbxSky] Unavailable sky faces: '+', '.join(missing))
+        if not available:
+            # Global lighting will build its procedural sky fallback.
+            return None
+        # Preserve downloaded custom faces, and fill failed directions from
+        # the installed Roblox sky instead of baking black holes into it.
+        suffixes={'right':'rt','left':'lf','front':'ft','back':'bk','up':'up','down':'dn'}
+        for name in missing:
+            fallback=fetch_texture_image(f'rbxasset://textures/sky/sky512_{suffixes[name]}.tex',name=f'sky_fallback_{name}')
+            if fallback is not None:images.append((name,fallback))
+        remaining=[name for name in missing if not any(key==name and image is not None for key,image in images)]
+        if remaining:
+            average=_skybox_average_color_from_pixels(raw_faces)
+            if average is None:
+                encoded=_skybox_average_color(images)
+                average=tuple(_srgb_decode_array((*encoded,1.))[:3]) if encoded else (.42,.55,.82)
+            for name in remaining:raw_faces[name]=(1,1,(*average,1.))
     environment_result = _create_equirectangular_sky_image(
         images, timing=timing, return_face_pixels=True, raw_face_pixels=raw_faces
     )
@@ -5832,6 +5752,9 @@ def _create_rbxl_skybox(collection, sky, part_entries):
         return None
     environment_image, face_pixels = environment_result
     meta = {"rbx_environment_image": environment_image.name}
+    if missing:
+        meta['rbx_missing_sky_faces']=missing
+        environment_image['RBXSkyMissingFaces']=missing
     average_started = time.perf_counter()
     average_color = _skybox_average_color_from_pixels(face_pixels)
     timing["average"] = time.perf_counter() - average_started
@@ -5866,8 +5789,8 @@ def _sample_sequence(seq, t, default):
 
 
 def _create_rbx_decals(collection, part_entries):
-    """Create projected planes for supported Roblox Decal instances."""
-    from ..rig.textures import fetch_texture_image, _color_image_view
+    """Fallback overlays for entries without primitive or native mesh UVs."""
+    from ..rig.textures import fetch_texture_image, _color_image_view, _linear_rgb
 
     # Roblox NormalId enum: Right, Top, Back, Left, Bottom, Front.
     # Each entry is (normal, axis_u, axis_v, normal_axis, size_u_axis,
@@ -5892,7 +5815,11 @@ def _create_rbx_decals(collection, part_entries):
         # build as projected planes here.
         if entry.get("name") == "Head" and entry.get("face_decal"):
             continue
-        for index, decal in enumerate(entry.get("decals") or ()):
+        # Primitives and FileMesh parts composite decals on the host.
+        if entry.get("shape") or entry.get("mesh_id") or entry.get("union_mesh"):
+            continue
+        layers=sorted(entry.get("decals") or (),key=lambda d:d.get("z_index",1))
+        for index, decal in enumerate(layers):
             if not isinstance(decal, dict):
                 continue
             face = faces.get(int(decal.get("face", 5)))
@@ -5908,7 +5835,7 @@ def _create_rbx_decals(collection, part_entries):
                 transform = transform_to_blender @ cf_to_mat(entry["part_cf"])
             except (TypeError, ValueError, IndexError):
                 continue
-            offset = Vector(normal) * (half_n + 0.001)
+            offset = Vector(normal) * (half_n + 0.001*(index+1))
             corners = [
                 offset - Vector(axis_u) * half_u - Vector(axis_v) * half_v,
                 offset + Vector(axis_u) * half_u - Vector(axis_v) * half_v,
@@ -5945,7 +5872,7 @@ def _create_rbx_decals(collection, part_entries):
                 )
             except (TypeError, ValueError, IndexError):
                 tint_vals = (1.0, 1.0, 1.0)
-            tint_mix.inputs["A"].default_value = (*tint_vals, 1.0)
+            tint_mix.inputs["A"].default_value = (*_linear_rgb(tint_vals), 1.0)
             if image is not None:
                 links.new(tex.outputs["Color"], tint_mix.inputs["B"])
             else:
@@ -5968,7 +5895,7 @@ def _create_rbx_decals(collection, part_entries):
             if image is not None:
                 links.new(tex.outputs["Alpha"], alpha_math.inputs[0])
             else:
-                alpha_math.inputs[0].default_value = 1.0
+                alpha_math.inputs[0].default_value = 0.0
             links.new(alpha_math.outputs["Value"], principled.inputs["Alpha"])
             # Decals always sample texture alpha: sorted blending (BLENDED),
             # matching the other transparent materials — dithered sorting
@@ -7038,17 +6965,27 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
             for ref in scene_rig.get("part_refs") or []
         }
 
+        light_parent_refs = {
+            int(light["parent_ref"])
+            for light in meta_loaded.get("scene_lights") or []
+            if light.get("parent_ref") is not None
+        }
+
+        for entry in part_aux:
+            if entry.get("inst_ref") in light_parent_refs:
+                entry["_rbx_local_light_host"] = True
+
         def static_batch_key(entry):
             if not is_place or not entry.get("shape") or entry.get("has_studs"):
                 return None
             if any(entry.get(key) for key in (
                 "mesh_id", "texture_id", "texture_instance", "face_decal",
-                "surface_appearance", "texture_instances", "surface_appearances",
+                "surface_appearance", "texture_instances", "surface_appearances", "decals",
                 "wrap_layer", "wrap_target", "union_mesh",
             )):
                 return None
             try:
-                if int(entry.get("inst_ref", -1)) in rig_part_refs:
+                if int(entry.get("inst_ref", -1)) in rig_part_refs | light_parent_refs:
                     return None
             except (TypeError, ValueError):
                 return None
@@ -7280,6 +7217,11 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                         started = time.perf_counter()
                         try:
                             return func(*args)
+                        except Exception as exc:
+                            # A bad optional rig/effect must not suppress the
+                            # world's sky and every remaining scene light.
+                            print(f'[RbxmImport] Scene step {name} failed: {exc}')
+                            return None
                         finally:
                             finalize_steps[name] = time.perf_counter() - started
 
@@ -7299,20 +7241,15 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                                              parts_collection, part_aux
                                              ) if import_decals else 0
                     state["beam_images_hydrated"] = not state["beam_image_jobs"]
-                    final_step("lighting enable", _enable_imported_scene_lighting, context)
                     light_count = final_step("lights", _create_rbxl_lights,
                                              parts_collection, meta_loaded.get("scene_lights"), part_aux
                                              )
                     try:
                         from ..rig import textures as _textures_mod
 
-                        # Transient prefetch failures finalize materials
-                        # without their images (black texture nodes); give
-                        # each failed asset one retry before hydration.
-                        state["texture_retries"] = final_step(
-                            "texture retries",
-                            _textures_mod.retry_failed_texture_fetches,
-                        )
+                        # Failed deliveries have already retried on workers.
+                        # Only bind ready image data here; never retry CDN
+                        # requests serially on Blender's UI thread.
                         state["baked_hydrated"] += final_step(
                             "baked hydration",
                             _textures_mod.hydrate_pending_baked_materials,
@@ -7345,7 +7282,9 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
                         )
 
                     state["post_texture_finalize"] = finish_texture_scene
-                    state["post_texture_finalized"] = not bool(sky)
+                    # Lighting still needs building when the place has no Sky.
+                    state["post_texture_finalized"] = False
+                    state['lighting_enable']=lambda:_enable_imported_scene_lighting(context)
 
                 state["finalize"] = finalize_place_scene
                 state["finalize_done"] = False
@@ -7394,6 +7333,11 @@ class OBJECT_OT_ImportRbxm(bpy.types.Operator, ImportHelper):
 
         if import_decals:
             _create_rbx_decals(parts_collection, part_aux)
+        # Model exports can contain local lights independently of singleton
+        # place Lighting settings. Preserve the current world's illumination.
+        if meta_loaded.get("scene_lights"):
+            _create_rbxl_lights(parts_collection, meta_loaded["scene_lights"], part_aux)
+            _enable_imported_scene_lighting(context)
 
         # --- Generate armatures + bind, reusing the standard pipeline.
         # Every rig owns a scaffold built during collection setup; each gets

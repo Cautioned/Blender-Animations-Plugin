@@ -12,15 +12,20 @@ from ..core.utils import (
 
 def link_object_to_bone_rigid(obj, ao, bone):
     """Link an object to a bone with rigid transformation"""
+    world_matrix = obj.matrix_world.copy()
     # remove existing
     for constraint in [c for c in obj.constraints if c.type == "CHILD_OF"]:
         obj.constraints.remove(constraint)
+    obj.matrix_world = world_matrix
 
     # create new
     constraint = obj.constraints.new(type="CHILD_OF")
     constraint.target = ao
     constraint.subtarget = bone.name
-    bone_mat = getattr(bone, "matrix_local", None)
+    # Cancel the current target transform so adding the constraint preserves
+    # the clothes mesh's world placement, including on a posed armature.
+    pose_bone = ao.pose.bones.get(bone.name)
+    bone_mat = pose_bone.matrix if pose_bone is not None else getattr(bone, "matrix_local", None)
     if bone_mat is None:
         bone_mat = bone.matrix
     if hasattr(bone_mat, "to_4x4"):
@@ -30,6 +35,10 @@ def link_object_to_bone_rigid(obj, ao, bone):
 
 def _ensure_child_of_constraint(obj, armature, bone_name):
     """Ensure obj has exactly one CHILD_OF constraint targeting the given bone."""
+    if not any(c.type == "CHILD_OF" and c.target == armature and c.subtarget == bone_name
+               for c in obj.constraints):
+        link_object_to_bone_rigid(obj, armature, armature.data.bones[bone_name])
+        return
     correct_constraint_found = False
     for c in list(obj.constraints):
         if c.type == "CHILD_OF":
@@ -39,10 +48,6 @@ def _ensure_child_of_constraint(obj, armature, bone_name):
                 correct_constraint_found = True
             else:
                 obj.constraints.remove(c)
-    if not correct_constraint_found:
-        constraint = obj.constraints.new(type="CHILD_OF")
-        constraint.target = armature
-        constraint.subtarget = bone_name
 
 
 def auto_constraint_parts(armature_name, skip_objects=None, inst_ref_to_bone=None):
@@ -111,9 +116,11 @@ def auto_constraint_parts(armature_name, skip_objects=None, inst_ref_to_bone=Non
             bone_name = inst_ref_to_bone.get(int(ref))
             if not bone_name:
                 continue
-            if bone_name in used_bones:
-                continue
+            # Unlike ambiguous name matching below, explicit mappings are
+            # many-to-one: every welded clothes mesh follows its owning bone.
+            skip_objects.add(obj)
             if bone_name not in armature.data.bones:
+                print(f"[AutoConstraint] WARNING: mesh #{ref} target '{bone_name}' missing; no name fallback")
                 continue
             used_bones.add(bone_name)
             _ensure_child_of_constraint(obj, armature, bone_name)
