@@ -887,14 +887,20 @@ def _resolve_rbxasset_path(content_id: str) -> Optional[Path]:
         return bundled
     basename = os.path.basename(relative)
     for content_dir in _roblox_content_dirs():
-        try:
-            root = content_dir.resolve()
-            candidate = (root / relative).resolve()
-            candidate.relative_to(root)
-        except (OSError, ValueError):
-            continue
-        if candidate.is_file():
-            return candidate
+        # Platform textures (including Studio's default sky) are installed
+        # beside content, not inside it. Keep user/install priority and the
+        # same containment check for every asset root.
+        roots = (content_dir, content_dir.parent / "PlatformContent" / "pc",
+                 content_dir.parent / "ExtraContent")
+        for asset_root in roots:
+            try:
+                root = asset_root.resolve()
+                candidate = (root / relative).resolve()
+                candidate.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            if candidate.is_file():
+                return candidate
         # Fallback: search avatar subtrees for the basename.
         if basename:
             avatar_root = content_dir / "avatar"

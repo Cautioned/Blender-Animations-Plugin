@@ -43,6 +43,35 @@ A powerful Roblox Studio plugin that enables seamless animation workflow between
 - **Live Sync**: Enable real-time synchronization
 - **File Export**: Allow exporting animations to files
 
+## Roblox asset property compatibility
+
+The binary `.rbxm`/`.rbxl` importer accepts both legacy asset ID properties
+and the new `Content` properties used by Studio saves starting November 11,
+2026. This includes meshes, textures, PBR maps, clothing, wrap metadata,
+beams, and skyboxes. Clothing assets fetched as XML support both legacy
+`<url>` values and new `<uri>`/`<null />` values.
+
+When both property names exist, the new Content value takes precedence,
+including an explicitly empty value. Object-backed Content has no asset URI
+and is treated as empty; importing embedded EditableMesh/EditableImage data
+is not supported. Full XML place/model import is not supported.
+
+Development tooling requires Rojo **7.7.1 or later**; `aftman.toml` pins 7.7.1.
+Existing Studio Luau property reads and writes remain compatible. See the
+[Roblox migration announcement](https://devforum.roblox.com/t/upcoming-changes-to-asset-properties-content-property-serialization-switch/4975546).
+
+## Visual matching tests
+
+The importer includes measured EEVEE lighting improvements for Realistic scenes
+without an imported sky image, consistent sRGB color conversion, and support
+for SurfaceAppearance tint/emission and attachment-based lights. This is an
+approximation of Studio's renderer; indoor fill, reflections, atmosphere, and
+post-processing still need further calibration.
+
+See [the visual comparison suite](tools/visual_parity/README.md) to generate
+Studio reference scenes, capture images through CaptureService, render matching
+EEVEE views, and inspect image differences.
+
 ## Troubleshooting
 
 ### Common Issues
@@ -72,3 +101,7 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 ---
 
 **Made with ❤️ for the Roblox and Blender communities**
+
+Material round-trip comparisons: see [the material test workflow](tools/material_parity/README.md) for the 240-sample Studio → native RBXM → EEVEE suite and its limits.
+
+Neon glow comparisons: see [the Neon test workflow](tools/neon_parity/README.md) for the EEVEE viewport/render compositor and source calibration.

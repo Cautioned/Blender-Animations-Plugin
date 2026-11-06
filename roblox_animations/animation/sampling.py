@@ -214,7 +214,16 @@ def serialize_animation_state(
                         # This bone is treated as a root in the context of Motor6D calculations.
                         bone_transform = orig_base_mat.inverted() @ cur_obj_transform
                 else:
-                    bone_transform = orig_base_mat.inverted() @ cur_obj_transform
+                    # Imported root metadata is already in Roblox space. Unlike
+                    # child-relative transforms, a second axis conversion does
+                    # not cancel here and leaks the scene placement into export.
+                    root_rest = orig_base_mat
+                    if bone.bone.get("rbx_source_name"):
+                        root_rest = (
+                            to_matrix(bone.bone["transform"])
+                            @ to_matrix(bone.bone["transform1"])
+                        )
+                    bone_transform = root_rest.inverted() @ cur_obj_transform
 
                 statel = mat_to_cf(bone_transform)
                 if cf_round:

@@ -110,6 +110,34 @@ def _encode_rgb(buf):
     return out
 
 
+def _xml_clothing_template(payload: bytes) -> Optional[str]:
+    """Read legacy <url> and migrated <uri>/<null /> clothing properties."""
+    from xml.etree import ElementTree
+
+    root = ElementTree.fromstring(payload)
+    for class_name, legacy in (("Shirt", "ShirtTemplate"), ("Pants", "PantsTemplate")):
+        for item in root.iter("Item"):
+            if item.get("class") != class_name:
+                continue
+            properties = item.find("Properties")
+            if properties is None:
+                continue
+            by_name = {prop.get("name"): prop for prop in properties}
+            prop = by_name.get(legacy + "Content")
+            if prop is None:
+                prop = by_name.get(legacy)
+            if prop is None or prop.find("null") is not None:
+                continue
+            # Object-backed content has no image URI to download.
+            uri = prop.find("uri")
+            if uri is None:
+                uri = prop.find("url")
+            text = uri.text if uri is not None else prop.text
+            if text and text.strip():
+                return text.strip()
+    return None
+
+
 def resolve_clothing_template_id(asset_id) -> Optional[str]:
     """Resolve a HumanoidDescription clothing asset id (Shirt/Pants) to its
     template content id by fetching the asset and reading its *Template
@@ -159,21 +187,7 @@ def resolve_clothing_template_id(asset_id) -> Optional[str]:
                 print(f"[RbxClothing] template asset rbxm parse failed: {exc}")
         elif stripped.startswith((b"<roblox", b"<?xml")):
             try:
-                import re  # noqa: PLC0415
-
-                text = payload.decode("utf-8", errors="replace")
-                match = re.search(
-                    r"<(?:Content|url)[^>]*name=\"(?:ShirtTemplate|PantsTemplate)\"[^>]*>\s*<?(?:url)?>?([^<\s]+)",
-                    text,
-                )
-                if match is None:
-                    match = re.search(
-                        r"name=\"(?:ShirtTemplate|PantsTemplate)\"[^>]*>.*?(https?://[^<\s]+|rbxasset[^<\s]+)",
-                        text,
-                        re.DOTALL,
-                    )
-                if match:
-                    result = match.group(1).strip()
+                result = _xml_clothing_template(payload)
             except Exception as exc:
                 print(f"[RbxClothing] template asset xml parse failed: {exc}")
 

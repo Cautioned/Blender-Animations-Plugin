@@ -27,6 +27,10 @@ set ZIP_NAME4=rbx_anims_%VERSION%.zip
 
 echo Building %ZIP_NAME3% and %ZIP_NAME4% without tests...
 
+REM Verify bundled decoder wheels before replacing any existing packages.
+powershell -NoProfile -Command "$lock = Get-Content 'roblox_animations/wheels/zstd-lock.json' -Raw | ConvertFrom-Json; $manifest = Get-Content 'roblox_animations/blender_manifest.toml' -Raw; foreach ($entry in $lock.files) { $path = Join-Path 'roblox_animations/wheels' $entry.filename; if (-not (Test-Path -LiteralPath $path)) { Write-Error ('Missing wheel: ' + $path); exit 1 }; if ((Get-Item -LiteralPath $path).Length -ne $entry.size -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower() -ne $entry.sha256 -or -not $manifest.Contains('./wheels/' + $entry.filename)) { Write-Error ('Invalid wheel: ' + $path); exit 1 } }"
+if errorlevel 1 exit /b 1
+
 REM Remove existing zip if it exists
 if exist "%ZIP_NAME3%" del "%ZIP_NAME3%"
 if exist "%ZIP_NAME4%" del "%ZIP_NAME4%"

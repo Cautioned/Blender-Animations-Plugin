@@ -88,6 +88,13 @@ class AssetRegistry:
                 self._key_consumers.setdefault(key, set()).add(consumer)
             return False
 
+    def finish_pending(self, error: str) -> int:
+        """Release consumers after their worker coordinator has stopped."""
+        with self._lock:
+            pending=[key for key,record in self._records.items() if not record.terminal]
+        for key in pending:self.finish(key,error=error)
+        return len(pending)
+
     def drain_completions(self) -> list[AssetRecord]:
         return self._drain(self._completions)
 

@@ -101,6 +101,15 @@ def _clear_child_of_constraints(obj):
 
 
 def _ensure_armature_modifier(obj, armature_obj):
+    # Actual imported weights are authoritative. Classic Part/SpecialMesh heads
+    # can carry skinning even though Studio's MeshPart flag is absent.
+    weighted_groups = set()
+    for vertex in obj.data.vertices:
+        weighted_groups.update(group.group for group in vertex.groups if group.weight > 0)
+    for index in weighted_groups:
+        bone = armature_obj.data.bones.get(obj.vertex_groups[index].name)
+        if bone is not None:
+            bone.use_deform = True
     modifier = None
     for existing in obj.modifiers:
         if existing.type == "ARMATURE":
@@ -599,6 +608,19 @@ def _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallbac
     return None
 
 
+def _resolved_vertex_weights(weights, part_to_bone, available_bones, fallback_bone):
+    """Combine aliases/fallbacks before writing a destination bone's weight."""
+    resolved_weights = {}
+    for name, weight in (weights or {}).items():
+        if weight <= 0:
+            continue
+        resolved = _resolve_binding_bone_name(name, part_to_bone, available_bones, fallback_bone)
+        if resolved is not None:
+            resolved_weights[resolved] = resolved_weights.get(resolved, 0.0) + float(weight)
+    total = sum(resolved_weights.values())
+    return {name: weight / total for name, weight in resolved_weights.items()} if total else {}
+
+
 def _get_position_transfer_vertices(binding):
     predicted_mesh_positions = binding.get("predicted_mesh_positions") or []
     if predicted_mesh_positions:
@@ -720,13 +742,9 @@ def _build_transfer_source_object(mesh_obj, armature_obj, binding):
 
     matched = 0
     for vertex_index, weights in enumerate(vertex_weights):
-        for bone_name, weight in (weights or {}).items():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
+        for resolved, weight in _resolved_vertex_weights(
+            (weights or {}), part_to_bone, available_bones, fallback_bone
+        ).items():
             group = groups.get(resolved)
             if group and weight > 0:
                 group.add([vertex_index], float(weight), "REPLACE")
@@ -1467,8 +1485,9 @@ def _apply_position_bound_weights(mesh_obj, armature_obj, binding):
             continue
 
         weights_src = best_weights if best_weights is not None else (vertex_weights[best_src] or {})
-        for bone_name, weight in weights_src.items():
-            resolved = _resolve_binding_bone_name(bone_name, part_to_bone, available_bones, fallback_bone)
+        for resolved, weight in _resolved_vertex_weights(
+            weights_src, part_to_bone, available_bones, fallback_bone
+        ).items():
             group = groups.get(resolved)
             if group and weight > 0:
                 group.add([tgt_idx], float(weight), "REPLACE")
@@ -1548,13 +1567,9 @@ def _apply_index_bound_weights(mesh_obj, armature_obj, binding):
 
     matched = 0
     for vertex, weights in zip(mesh_obj.data.vertices, binding["mesh_data"].get("vertex_weights") or []):
-        for bone_name, weight in weights.items():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
+        for resolved, weight in _resolved_vertex_weights(
+            weights, part_to_bone, available_bones, fallback_bone
+        ).items():
             group = groups.get(resolved)
             if group and weight > 0:
                 group.add([vertex.index], weight, "REPLACE")
@@ -1604,13 +1619,9 @@ def _apply_uv_map_bound_weights(mesh_obj, armature_obj, binding):
         if target_index < 0 or target_index >= len(mesh_obj.data.vertices):
             continue
         matched_vertices.add(target_index)
-        for bone_name, weight in (vertex_weights[source_index] or {}).items():
-            resolved = _resolve_binding_bone_name(
-                bone_name,
-                part_to_bone,
-                available_bones,
-                fallback_bone=fallback_bone,
-            )
+        for resolved, weight in _resolved_vertex_weights(
+            (vertex_weights[source_index] or {}), part_to_bone, available_bones, fallback_bone
+        ).items():
             group = groups.get(resolved)
             if group and weight > 0:
                 group.add([target_index], weight, "REPLACE")

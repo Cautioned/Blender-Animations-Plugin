@@ -694,7 +694,8 @@ class TestRbxmParsing(unittest.TestCase):
             ["rbxassetid://444", "rbxassetid://555"],
         )
         self.assertEqual([sa["alpha_mode"] for sa in surfaces], [0, 1])
-        self.assertEqual(entry["surface_appearance"], surfaces[0])
+        # The last SurfaceAppearance child is the one Studio renders.
+        self.assertEqual(entry["surface_appearance"], surfaces[-1])
 
     def test_parts_outside_workspace_are_skipped(self):
         # A place keeps geometry under Workspace; parts stored under other
