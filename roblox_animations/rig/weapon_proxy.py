@@ -163,8 +163,11 @@ def _clone_weapon_controls(context, source, controls, bone_names):
                 bone = controls.data.edit_bones.new(
                     name if controls != source else name + "_Control"
                 )
-                bone.matrix = matrix
+                # A new EditBone has no direction until it has length.
+                # Blender's matrix setter preserves that length, so applying
+                # the matrix first would leave the tail at the head.
                 bone.length = max(length, 0.001)
+                bone.matrix = matrix
                 bone.use_deform = False
                 mapping[name] = bone.name
             for name, (_, _, parent) in data.items():
