@@ -166,6 +166,44 @@ class TestWeaponProxy(unittest.TestCase):
             1e-5,
         )
 
+    def test_cloned_chain_keeps_rest_direction_and_roll(self):
+        bpy.context.view_layer.objects.active = self.source
+        self.source.select_set(True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        weapon = self.source.data.edit_bones["Weapon"]
+        weapon.head = (0, 1, 0)
+        weapon.tail = (1, 1, 0)
+        weapon.roll = 0.6
+        tip = self.source.data.edit_bones.new("Tip")
+        tip.head = weapon.tail
+        tip.tail = (1, 1, -0.5)
+        tip.roll = -0.4
+        tip.parent = weapon
+        bpy.ops.object.mode_set(mode="OBJECT")
+        self.control.matrix_world = Matrix.Translation((3, -2, 1)) @ Matrix.Rotation(
+            0.35, 4, "Y"
+        )
+        bpy.context.view_layer.update()
+
+        mapping = clone_weapon_controls(
+            bpy.context, self.source, self.control, {"Weapon", "Tip"}
+        )
+        for name, control_name in mapping.items():
+            source_bone = self.source.data.bones[name]
+            control_bone = self.control.data.bones[control_name]
+            source_rest = self.source.matrix_world @ source_bone.matrix_local
+            control_rest = self.control.matrix_world @ control_bone.matrix_local
+            with self.subTest(bone=name):
+                self.assertAlmostEqual(control_bone.length, source_bone.length, places=5)
+                self.assertLess(
+                    max(abs(a - b) for row_a, row_b in zip(source_rest, control_rest)
+                        for a, b in zip(row_a, row_b)),
+                    1e-5,
+                )
+        self.assertEqual(
+            self.control.data.bones[mapping["Tip"]].parent.name, mapping["Weapon"]
+        )
+
     def test_internal_hand_mapping_wins_over_external_master(self):
         bpy.context.view_layer.objects.active = self.source
         self.source.select_set(True)
