@@ -198,6 +198,30 @@ class TestExportFrameRange(unittest.TestCase):
         b2_start, b2_end = export_with_scene_range(action_b, 100, "task_b2")
         self.assertEqual((b2_start, b2_end), (1, 100))
 
+    def test_server_exports_hidden_rig_driven_by_visible_controls(self):
+        controls = self._make_armature_with_action("VisibleControls", (1, 3))
+        rig = self._make_export_armature_without_action("HiddenExport")
+        self._add_copy_location_constraint(rig, controls)
+        bpy.ops.object.mode_set(mode="OBJECT")
+        bpy.context.view_layer.objects.active = controls
+        scene = bpy.context.scene
+        scene.frame_start, scene.frame_end = 1, 3
+
+        def export(task_id):
+            server_requests.execute_in_main_thread(task_id, rig.name)
+            success, response = server_requests.pending_responses.pop(task_id)
+            self.assertTrue(success, response)
+            return json.loads(zlib.decompress(response))
+
+        visible = export("visible-export")
+        rig.hide_set(True)
+        hidden = export("hidden-export")
+        self.assertEqual(hidden, visible)
+        self.assertTrue(any("Root" in frame["kf"] for frame in hidden["kfs"]))
+        self.assertTrue(rig.hide_get())
+        self.assertEqual(bpy.context.view_layer.objects.active, controls)
+        self.assertEqual(rig.mode, "OBJECT")
+
     def test_motor_only_skin_does_not_repeat_deform_ancestry_checks(self):
         from unittest.mock import patch
         from ..animation import sampling
@@ -217,6 +241,70 @@ class TestExportFrameRange(unittest.TestCase):
                     initial_checks = classify.call_count
                     self.assertGreater(initial_checks, 0)
                 self.assertEqual(classify.call_count, initial_checks)
+
+    def test_export_omits_weld_channels_but_keeps_animated_child(self):
+        from mathutils import Matrix
+        from ..animation.sampling import serialize_animation_state
+        from ..core.constants import get_transform_to_blender
+
+        rig = self._make_export_armature_without_action("WeldExport")
+        bpy.ops.object.mode_set(mode="EDIT")
+        parent = rig.data.edit_bones["Root"]
+        for index, name in enumerate(("Weld", "WeldConstraint", "MovingPart"), 1):
+            bone = rig.data.edit_bones.new(name)
+            bone.head, bone.tail = (0, 0, index), (0, 0, index + 1)
+            bone.parent = parent
+            parent = bone
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        to_roblox = get_transform_to_blender().inverted()
+        identity = [list(row) for row in Matrix.Identity(4)]
+        for name in ("Weld", "WeldConstraint", "MovingPart"):
+            bone = rig.data.bones[name]
+            bone["transform"] = [list(row) for row in to_roblox @ bone.matrix_local]
+            bone["transform1"] = identity
+            bone["nicetransform"] = identity
+            rig.pose.bones[name].location.x = 0.25
+        bpy.context.view_layer.update()
+        baseline = serialize_animation_state(rig)
+        self.assertTrue({"Weld", "WeldConstraint", "MovingPart"} <= baseline.keys())
+
+        for name in ("Weld", "WeldConstraint"):
+            rig.data.bones[name]["rbx_joint_type"] = name
+        rig.data.bones["MovingPart"]["rbx_joint_type"] = "Motor6D"
+        rig.data.update_tag()
+        bpy.context.view_layer.update()
+        self.assertEqual(serialize_animation_state(rig)["MovingPart"], baseline["MovingPart"])
+
+        scene = bpy.context.scene
+        scene.frame_start, scene.frame_end = 1, 3
+
+        def check_payload():
+            payload = serialization.serialize(rig)
+            channels = {name for frame in payload["kfs"] for name in frame["kf"]}
+            self.assertIn("MovingPart", channels)
+            self.assertEqual(channels & {"Weld", "WeldConstraint"}, set())
+
+        with self.subTest(bake="single frame"):
+            check_payload()
+
+        # Dense bakes can add identity poses for constrained bones.
+        target = bpy.data.objects.new("WeldTarget", None)
+        scene.collection.objects.link(target)
+        constraint = rig.pose.bones["Weld"].constraints.new("COPY_LOCATION")
+        constraint.target = target
+        with self.subTest(bake="dense"):
+            check_payload()
+        rig.pose.bones["Weld"].constraints.remove(constraint)
+
+        # Sparse bakes can add identity poses for authored rest keys.
+        for name in ("Weld", "WeldConstraint", "MovingPart"):
+            bone = rig.pose.bones[name]
+            for frame, offset in ((1, 0.0), (3, 0.5)):
+                bone.location.x = offset
+                bone.keyframe_insert(data_path="location", index=0, frame=frame)
+        with self.subTest(bake="sparse"):
+            check_payload()
 
     def test_subset_deform_sampling_keeps_space_parents_and_source_names(self):
         from ..animation import sampling

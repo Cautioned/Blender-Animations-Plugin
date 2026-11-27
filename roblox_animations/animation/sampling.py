@@ -33,6 +33,10 @@ from .scale import (
 _SAMPLING_LAYOUT = object()
 
 
+def is_weld_bone(bone):
+    return bone.get("rbx_joint_type") in ("Weld", "WeldConstraint")
+
+
 def _sampling_layout(ao, cache):
     layout = cache.get(_SAMPLING_LAYOUT)
     if layout is not None:
@@ -42,7 +46,8 @@ def _sampling_layout(ao, cache):
         if is_face_control_bone(bone):
             continue
         if all(key in bone.bone for key in ("transform", "transform1", "nicetransform")):
-            motor.append(bone.name)
+            if not is_weld_bone(bone.bone):
+                motor.append(bone.name)
         else:
             deform.append(bone.name)
         if bone.bone.get("worldspace_bone"):
@@ -362,6 +367,10 @@ def serialize_deform_animation_state(
         bone_cache[bone.name] = (current_matrix, rest_matrix)
 
     for bone in bones_to_process:
+        # A legacy weld without Motor6D metadata can still supply its child's
+        # parent space through bone_cache.
+        if is_weld_bone(bone.bone):
+            continue
         try:
             current_matrix, rest_matrix = bone_cache[bone.name]
 

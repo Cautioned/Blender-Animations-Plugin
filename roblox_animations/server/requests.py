@@ -280,12 +280,6 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
             )
             return
 
-        bpy.context.view_layer.objects.active = ao
-        # Only switch mode if necessary to avoid expensive operations
-        if ao.mode != "POSE":
-            print(f"Blender Addon: Switching to POSE mode for '{armature_name}'...")
-            bpy.ops.object.mode_set(mode="POSE")
-
         desired_fps = get_scene_fps()
         set_scene_fps(desired_fps)
 
@@ -351,6 +345,7 @@ def execute_in_main_thread(task_id, armature_name, target_bone_rest=None, live_p
 
         serialized = None
         try:
+            # The serializer evaluates hidden rigs in its visibility context.
             serialized = serialize(ao, target_bone_rest=target_bone_rest)
         finally:
             if changed_scene_timeline:
