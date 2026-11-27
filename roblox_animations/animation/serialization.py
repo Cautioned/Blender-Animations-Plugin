@@ -41,6 +41,7 @@ from .planning import (
     lookup_interp_for_frame,
 )
 from .sampling import (
+    is_weld_bone,
     serialize_animation_state as serialize_animation_state,
     serialize_combined_animation_state,
     serialize_deform_animation_state as serialize_deform_animation_state,
@@ -487,6 +488,7 @@ class ExportAnalysis:
     action_slots: Dict[Any, Any]
     face_export_context: Dict[str, Any]
     excluded_face_bones: Set[str]
+    weld_bones: Set[str]
     is_skinned_rig: bool
     run_deform_path: bool
     back_trans_cached: Matrix
@@ -647,6 +649,7 @@ def _analyze_export(
         action_slots=action_slots,
         face_export_context=face_export_context,
         excluded_face_bones=excluded_face_bones,
+        weld_bones={bone.name for bone in ao.data.bones if is_weld_bone(bone)},
         is_skinned_rig=is_skinned_rig,
         run_deform_path=run_deform_path,
         back_trans_cached=back_trans_cached,
@@ -680,6 +683,8 @@ def _bake_full(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]]:
             constrained_bones.add(bone.name)
     if analysis.is_skinned_rig:
         constrained_bones = get_deform_descendant_bones(ao, constrained_bones)
+
+    constrained_bones.difference_update(analysis.weld_bones)
 
     frames = ctx.scene.frame_end + 1 - ctx.scene.frame_start
     frame_start = ctx.scene.frame_start
@@ -873,6 +878,12 @@ def _bake_hybrid(analysis: ExportAnalysis) -> Tuple[float, List[KeyframePayload]
         getattr(ctx.scene, "frame_step", 1) or 1,
     )
     analysis.visual_keyframes.update(plan.keyframe_times)
+
+    # Rest-pose keys synthesized during baking are subject to the same channel
+    # filter as sampled transforms. Keep welds in the bake dependency plan.
+    animated_bones.difference_update(analysis.weld_bones)
+    constrained_bones.difference_update(analysis.weld_bones)
+    non_inheriting_bones.difference_update(analysis.weld_bones)
 
     # 3. Single baking pass: sample -> reduce -> collect.
     collected: List[KeyframePayload] = []
@@ -1291,6 +1302,7 @@ def _serialize_evaluated(ao, target_bone_rest=None):
             visual_bones.update(name for key in collected for name in key.poses)
         if analysis.is_skinned_rig:
             visual_bones = get_deform_descendant_bones(ao, visual_bones)
+        visual_bones.difference_update(analysis.weld_bones)
         visual_diagnostics = {}
         if visual_bones:
             from .visual_bake import bake_at_frame_rate
